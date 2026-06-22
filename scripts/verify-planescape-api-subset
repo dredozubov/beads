@@ -1,0 +1,39 @@
+#!/usr/bin/env sh
+set -eu
+
+repo="$(cd "$(dirname "$0")/.." && pwd)"
+tmp="${TMPDIR:-/tmp}/beads-planescape-api-$$"
+
+cleanup() {
+  rm -rf "$tmp"
+}
+trap cleanup EXIT INT TERM
+
+mkdir -p "$tmp"
+cd "$repo"
+
+where_output="$(bd where)"
+where="$(printf '%s\n' "$where_output" | sed -n '1p')"
+case "$where" in
+  "$repo/.beads") ;;
+  *)
+    echo "unexpected bd workspace: $where" >&2
+    exit 1
+    ;;
+esac
+
+bd show bd-planescape-api > "$tmp/epic.txt"
+bd show bd-planescape-api-verify > "$tmp/verify.txt"
+bd show bd-planescape-api --json > "$tmp/epic.json"
+bd create --dry-run --id bd-planescape-api-dry-run --type task --title "Planescape dry-run explicit id" > "$tmp/create-dry-run.txt"
+bd export -o "$tmp/issues.jsonl" > "$tmp/export.log" 2>&1
+
+grep '"id":"bd-planescape-api"' "$tmp/issues.jsonl" >/dev/null
+grep '"id":"bd-planescape-api-verify"' "$tmp/issues.jsonl" >/dev/null
+grep 'types.custom: "agent,event,gate,merge-request,message,molecule,rig,role"' .beads/config.yaml >/dev/null
+
+commit="$(git rev-parse --short HEAD)"
+version="$(bd version | tr '\n' ' ')"
+
+printf '{"ok":true,"repo":"%s","commit":"%s","bd_version":"%s","workspace":"%s","checked":["where","show","show_json","create_dry_run_explicit_id","export_jsonl","custom_types_config"]}\n' \
+  "$repo" "$commit" "$version" "$where"
