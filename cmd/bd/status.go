@@ -1,23 +1,21 @@
 package main
 
 import (
-	"bufio"
-	"encoding/json"
 	"fmt"
 	"os"
-	"os/exec"
-	"strings"
-	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/metrics"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
+	"github.com/steveyegge/beads/issueops"
 )
 
 // StatusOutput represents the complete status output
 type StatusOutput struct {
-	Summary        *types.Statistics      `json:"summary"`
-	RecentActivity *RecentActivitySummary `json:"recent_activity,omitempty"`
+	Summary             *types.Statistics      `json:"summary"`
+	BlockedCountSkipped bool                   `json:"blocked_count_skipped,omitempty"`
+	RecentActivity      *RecentActivitySummary `json:"recent_activity,omitempty"`
 }
 
 // RecentActivitySummary represents activity from git history
@@ -39,7 +37,7 @@ var statusCmd = &cobra.Command{
 	Long: `Show a quick snapshot of the issue database state and statistics.
 
 This command provides a summary of issue counts by state (open, in_progress,
-blocked, closed), ready work, extended statistics (tombstones, pinned issues,
+blocked, closed), ready work, extended statistics (pinned issues,
 average lead time), and recent activity over the last 24 hours from git history.
 
 Similar to how 'git status' shows working tree state, 'bd status' gives you
@@ -50,287 +48,157 @@ Use cases:
   - Onboarding for new contributors
   - Integration with shell prompts or CI/CD
   - Daily standup reference
+  - Fast CI status checks that don't need blocked-count accuracy
 
 Examples:
   bd status                    # Show summary with activity
   bd status --no-activity      # Skip git activity (faster)
+  bd status --no-blocked       # Skip slow blocked-count scan (faster)
+  bd stats --no-blocked --json # JSON output without blocked count
   bd status --json             # JSON format output
   bd status --assigned         # Show issues assigned to current user
   bd stats                     # Alias for bd status`,
-	Run: func(cmd *cobra.Command, args []string) {
-		showAll, _ := cmd.Flags().GetBool("all")
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		evt := metrics.NewCommandEvent("status")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
+
 		showAssigned, _ := cmd.Flags().GetBool("assigned")
 		noActivity, _ := cmd.Flags().GetBool("no-activity")
+		noBlocked, _ := cmd.Flags().GetBool("no-blocked")
 		jsonFormat, _ := cmd.Flags().GetBool("json")
 
-		// Override global jsonOutput if --json flag is set
 		if jsonFormat {
 			jsonOutput = true
 		}
 
-		// Get statistics
-		var stats *types.Statistics
-		var err error
-
-		// Check database freshness before reading (bd-2q6d, bd-c4rq)
-		// Skip check when using daemon (daemon auto-imports on staleness)
-		ctx := rootCtx
-		if daemonClient == nil {
-			if err := ensureDatabaseFresh(ctx); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
+		reporter, err := openStatsReporter()
+		if err != nil {
+			return HandleErrorRespectJSON("%v", err)
 		}
 
-		// If daemon is running, use RPC
-		if daemonClient != nil {
-			resp, rpcErr := daemonClient.Stats()
-			if rpcErr != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", rpcErr)
-				os.Exit(1)
-			}
-
-			if err := json.Unmarshal(resp.Data, &stats); err != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing response: %v\n", err)
-				os.Exit(1)
-			}
-		} else {
-			// Direct mode
-			ctx := rootCtx
-			stats, err = store.GetStatistics(ctx)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
-		}
-
-		// Filter by assignee if requested (overrides stats with filtered counts)
+		var result issueops.StatsResult
 		if showAssigned {
-			stats = getAssignedStatistics(actor)
-			if stats == nil {
-				fmt.Fprintf(os.Stderr, "Error: failed to get assigned statistics\n")
-				os.Exit(1)
+			// --no-blocked is not consulted here, and never was: an
+			// assignee-scoped summary computes both numbers by a route that has
+			// no fast path (issueops.StatsReporter.AssigneeStats).
+			result, err = reporter.AssigneeStats(rootCtx, issueops.AssigneeStatsRequest{Assignee: actor})
+		} else {
+			result, err = reporter.Stats(rootCtx, issueops.StatsRequest{SkipBlocked: noBlocked})
+			if err == nil && noBlocked && result.Summary.BlockedIssues != nil {
+				// Derived from the ANSWER rather than from the route: the two
+				// routes differ on it today (the unit-of-work seam publishes no
+				// no-blocked query), and a backend that gains one stops printing
+				// this without an edit here.
+				fmt.Fprintln(os.Stderr, "warning: this backend has no --no-blocked fast path; the full blocked-count query ran")
 			}
 		}
+		if err != nil {
+			return HandleErrorRespectJSON("%v", err)
+		}
 
-		// Get recent activity from git history (last 24 hours) unless --no-activity
 		var recentActivity *RecentActivitySummary
 		if !noActivity {
 			recentActivity = getGitActivity(24)
 		}
 
-		output := &StatusOutput{
-			Summary:        stats,
-			RecentActivity: recentActivity,
-		}
-
-		// JSON output
-		if jsonOutput {
-			outputJSON(output)
-			return
-		}
-
-		// Human-readable colorized output using semantic ui package
-		fmt.Printf("\n%s Issue Database Status\n\n", ui.RenderAccent("📊"))
-		fmt.Printf("Summary:\n")
-		fmt.Printf("  Total Issues:           %d\n", stats.TotalIssues)
-		fmt.Printf("  Open:                   %s\n", ui.RenderPass(fmt.Sprintf("%d", stats.OpenIssues)))
-		fmt.Printf("  In Progress:            %s\n", ui.RenderWarn(fmt.Sprintf("%d", stats.InProgressIssues)))
-		fmt.Printf("  Blocked:                %s\n", ui.RenderFail(fmt.Sprintf("%d", stats.BlockedIssues)))
-		fmt.Printf("  Closed:                 %d\n", stats.ClosedIssues)
-		fmt.Printf("  Ready to Work:          %s\n", ui.RenderPass(fmt.Sprintf("%d", stats.ReadyIssues)))
-
-		// Extended statistics (only show if non-zero)
-		hasExtended := stats.TombstoneIssues > 0 || stats.PinnedIssues > 0 ||
-			stats.EpicsEligibleForClosure > 0 || stats.AverageLeadTime > 0
-		if hasExtended {
-			fmt.Printf("\nExtended:\n")
-			if stats.TombstoneIssues > 0 {
-				fmt.Printf("  Deleted:                %d (tombstones)\n", stats.TombstoneIssues)
-			}
-			if stats.PinnedIssues > 0 {
-				fmt.Printf("  Pinned:                 %d\n", stats.PinnedIssues)
-			}
-			if stats.EpicsEligibleForClosure > 0 {
-				fmt.Printf("  Epics Ready to Close:   %s\n", ui.RenderPass(fmt.Sprintf("%d", stats.EpicsEligibleForClosure)))
-			}
-			if stats.AverageLeadTime > 0 {
-				fmt.Printf("  Avg Lead Time:          %.1f hours\n", stats.AverageLeadTime)
-			}
-		}
-
-		if recentActivity != nil {
-			fmt.Printf("\nRecent Activity (last %d hours):\n", recentActivity.HoursTracked)
-			fmt.Printf("  Commits:                %d\n", recentActivity.CommitCount)
-			fmt.Printf("  Total Changes:          %d\n", recentActivity.TotalChanges)
-			fmt.Printf("  Issues Created:         %d\n", recentActivity.IssuesCreated)
-			fmt.Printf("  Issues Closed:          %d\n", recentActivity.IssuesClosed)
-			fmt.Printf("  Issues Reopened:        %d\n", recentActivity.IssuesReopened)
-			fmt.Printf("  Issues Updated:         %d\n", recentActivity.IssuesUpdated)
-		}
-
-		// Show hint for more details
-		fmt.Printf("\nFor more details, use 'bd list' to see individual issues.\n")
-		fmt.Println()
-
-		// Suppress showAll flag (it's the default behavior, included for CLI familiarity)
-		_ = showAll
+		return renderStatus(&result.Summary, recentActivity)
 	},
 }
 
-// getGitActivity calculates activity stats from git log of issues.jsonl
-func getGitActivity(hours int) *RecentActivitySummary {
-	activity := &RecentActivitySummary{
-		HoursTracked: hours,
+// openStatsReporter hands back the summary role for whichever route this
+// invocation is on, each through its own capability accessor.
+func openStatsReporter() (issueops.StatsReporter, error) {
+	if usesProxiedServer() {
+		return proxiedStatsReporter()
 	}
-
-	// Run git log to get patches for the last N hours
-	since := fmt.Sprintf("%d hours ago", hours)
-	cmd := exec.Command("git", "log", "--since="+since, "--numstat", "--pretty=format:%H", ".beads/issues.jsonl") // #nosec G204 -- bounded arguments for local git history inspection
-
-	output, err := cmd.Output()
-	if err != nil {
-		// Git log failed (might not be a git repo or no commits)
-		return nil
-	}
-
-	scanner := bufio.NewScanner(strings.NewReader(string(output)))
-	commitCount := 0
-
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		// Empty lines separate commits
-		if line == "" {
-			continue
-		}
-
-		// Commit hash line
-		if !strings.Contains(line, "\t") {
-			commitCount++
-			continue
-		}
-
-		// numstat line format: "additions\tdeletions\tfilename"
-		parts := strings.Split(line, "\t")
-		if len(parts) < 3 {
-			continue
-		}
-
-		// For JSONL files, each added line is a new/updated issue
-		// We need to analyze the actual diff to understand what changed
-	}
-
-	// Get detailed diff to analyze changes
-	cmd = exec.Command("git", "log", "--since="+since, "-p", ".beads/issues.jsonl") // #nosec G204 -- bounded arguments for local git history inspection
-	output, err = cmd.Output()
-	if err != nil {
-		return nil
-	}
-
-	scanner = bufio.NewScanner(strings.NewReader(string(output)))
-	for scanner.Scan() {
-		line := scanner.Text()
-
-		// Look for added lines in diff (lines starting with +)
-		if !strings.HasPrefix(line, "+") || strings.HasPrefix(line, "+++") {
-			continue
-		}
-
-		// Remove the + prefix
-		jsonLine := strings.TrimPrefix(line, "+")
-
-		// Skip empty lines
-		if strings.TrimSpace(jsonLine) == "" {
-			continue
-		}
-
-		// Try to parse as issue JSON
-		var issue types.Issue
-		if err := json.Unmarshal([]byte(jsonLine), &issue); err != nil {
-			continue
-		}
-
-		activity.TotalChanges++
-
-		// Analyze the change type based on timestamps and status
-		// Created recently if created_at is close to now
-		if time.Since(issue.CreatedAt) < time.Duration(hours)*time.Hour {
-			activity.IssuesCreated++
-		} else if issue.Status == types.StatusClosed && issue.ClosedAt != nil {
-			// Closed recently if closed_at is close to now
-			if time.Since(*issue.ClosedAt) < time.Duration(hours)*time.Hour {
-				activity.IssuesClosed++
-			} else {
-				activity.IssuesUpdated++
-			}
-		} else if issue.Status != types.StatusClosed {
-			// Check if this was a reopen (status changed from closed to open/in_progress)
-			// We'd need to look at the removed line to know for sure, but for now
-			// we'll just count it as an update
-			activity.IssuesUpdated++
-		}
-	}
-
-	activity.CommitCount = commitCount
-	return activity
+	return store.StatsReporter()
 }
 
-// getAssignedStatistics returns statistics for issues assigned to a specific user
-func getAssignedStatistics(assignee string) *types.Statistics {
-	if store == nil {
-		return nil
+func renderStatus(stats *types.Statistics, recentActivity *RecentActivitySummary) error {
+	output := &StatusOutput{
+		Summary:             stats,
+		BlockedCountSkipped: stats.BlockedIssues == nil,
+		RecentActivity:      recentActivity,
 	}
 
-	ctx := rootCtx
-
-	// Filter by assignee
-	assigneePtr := assignee
-	filter := types.IssueFilter{
-		Assignee: &assigneePtr,
+	if jsonOutput {
+		return outputJSON(output)
 	}
 
-	issues, err := store.SearchIssues(ctx, "", filter)
-	if err != nil {
-		return nil
+	// Human-readable colorized output using semantic ui package
+	fmt.Printf("\n%s Issue Database Status\n\n", ui.RenderAccent("📊"))
+	fmt.Printf("Summary:\n")
+	fmt.Printf("  Total Issues:           %d\n", stats.TotalIssues)
+	fmt.Printf("  Open:                   %s\n", ui.RenderPass(fmt.Sprintf("%d", stats.OpenIssues)))
+	fmt.Printf("  In Progress:            %s\n", ui.RenderWarn(fmt.Sprintf("%d", stats.InProgressIssues)))
+	// Skip-state is derived from the data itself (nil BlockedIssues/ReadyIssues),
+	// not the --no-blocked flag: --assigned recomputes fully-populated stats even
+	// when --no-blocked was also passed, so the flag alone would misrender those
+	// as skipped.
+	if stats.BlockedIssues == nil {
+		fmt.Printf("  Blocked:                %s\n", ui.MutedStyle.Render("(skipped)"))
+	} else if *stats.BlockedIssues > 0 {
+		fmt.Printf("  Blocked:                %s\n", ui.RenderFail(fmt.Sprintf("%d", *stats.BlockedIssues)))
+	} else {
+		fmt.Printf("  Blocked:                %d\n", *stats.BlockedIssues)
+	}
+	fmt.Printf("  Closed:                 %d\n", stats.ClosedIssues)
+	if stats.ReadyIssues == nil {
+		fmt.Printf("  Ready to Work:          %s\n", ui.MutedStyle.Render("(skipped)"))
+	} else {
+		fmt.Printf("  Ready to Work:          %s\n", ui.RenderPass(fmt.Sprintf("%d", *stats.ReadyIssues)))
 	}
 
-	stats := &types.Statistics{
-		TotalIssues: len(issues),
-	}
-
-	// Count by status
-	for _, issue := range issues {
-		switch issue.Status {
-		case types.StatusOpen:
-			stats.OpenIssues++
-		case types.StatusInProgress:
-			stats.InProgressIssues++
-		case types.StatusBlocked:
-			stats.BlockedIssues++
-		case types.StatusDeferred:
-			stats.DeferredIssues++
-		case types.StatusClosed:
-			stats.ClosedIssues++
+	// Extended statistics (only show if non-zero)
+	hasExtended := stats.PinnedIssues > 0 ||
+		stats.EpicsEligibleForClosure > 0 || stats.AverageLeadTime > 0
+	if hasExtended {
+		fmt.Printf("\nExtended:\n")
+		if stats.PinnedIssues > 0 {
+			fmt.Printf("  Pinned:                 %d\n", stats.PinnedIssues)
+		}
+		if stats.EpicsEligibleForClosure > 0 {
+			fmt.Printf("  Epics Ready to Close:   %s\n", ui.RenderPass(fmt.Sprintf("%d", stats.EpicsEligibleForClosure)))
+		}
+		if stats.AverageLeadTime > 0 {
+			fmt.Printf("  Avg Lead Time:          %.1f hours\n", stats.AverageLeadTime)
 		}
 	}
 
-	// Get ready work count for this assignee
-	readyFilter := types.WorkFilter{
-		Assignee: &assigneePtr,
-	}
-	readyIssues, err := store.GetReadyWork(ctx, readyFilter)
-	if err == nil {
-		stats.ReadyIssues = len(readyIssues)
+	if recentActivity != nil {
+		fmt.Printf("\nRecent Activity (last %d hours):\n", recentActivity.HoursTracked)
+		fmt.Printf("  Commits:                %d\n", recentActivity.CommitCount)
+		fmt.Printf("  Total Changes:          %d\n", recentActivity.TotalChanges)
+		fmt.Printf("  Issues Created:         %d\n", recentActivity.IssuesCreated)
+		fmt.Printf("  Issues Closed:          %d\n", recentActivity.IssuesClosed)
+		fmt.Printf("  Issues Reopened:        %d\n", recentActivity.IssuesReopened)
+		fmt.Printf("  Issues Updated:         %d\n", recentActivity.IssuesUpdated)
 	}
 
-	return stats
+	fmt.Printf("\nFor more details, use 'bd list' to see individual issues.\n")
+	fmt.Println()
+
+	return nil
+}
+
+// getGitActivity returns recent activity statistics.
+// Previously calculated from git log of issues.jsonl; now returns nil
+// as activity tracking has moved to Dolt-native queries.
+func getGitActivity(_ int) *RecentActivitySummary {
+	return nil
 }
 
 func init() {
 	statusCmd.Flags().Bool("all", false, "Show all issues (default behavior)")
 	statusCmd.Flags().Bool("assigned", false, "Show issues assigned to current user")
-	statusCmd.Flags().Bool("no-activity", false, "Skip git activity tracking (faster)")
+	statusCmd.Flags().Bool("no-activity", false, "Skip git activity summary (faster)")
+	statusCmd.Flags().Bool("no-blocked", false, "Skip blocked-count computation (faster on large rigs; not supported in proxied-server mode)")
 	// Note: --json flag is defined as a persistent flag in main.go, not here
 	rootCmd.AddCommand(statusCmd)
 }

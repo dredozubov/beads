@@ -2,16 +2,17 @@ package main
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
 	"strings"
 
-	"github.com/charmbracelet/huh"
+	"charm.land/huh/v2"
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/rpc"
+	"github.com/steveyegge/beads/internal/metrics"
 	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/domain"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 )
@@ -45,6 +46,7 @@ type createFormValues struct {
 	AcceptanceCriteria string
 	ExternalRef        string
 	Dependencies       []string
+	ParentID           string // Parent issue ID for hierarchical child creation
 }
 
 // parseCreateFormInput parses raw form input into a createFormValues struct.
@@ -94,12 +96,37 @@ func parseCreateFormInput(raw *createFormRawInput) *createFormValues {
 
 // CreateIssueFromFormValues creates an issue from the given form values.
 // It returns the created issue and any error that occurred.
-// This function handles labels, dependencies, and source_repo inheritance.
-func CreateIssueFromFormValues(ctx context.Context, s storage.Storage, fv *createFormValues, actor string) (*types.Issue, error) {
+// This function handles parent-child relationships, labels, dependencies,
+// and source_repo inheritance.
+func CreateIssueFromFormValues(ctx context.Context, s storage.DoltStorage, fv *createFormValues, actor string) (*types.Issue, error) {
+	// If parent is specified, validate it exists and generate child ID
+	var explicitID string
+	var inheritedLabels []string
+	if fv.ParentID != "" {
+		_, err := s.GetIssue(ctx, fv.ParentID)
+		if err != nil {
+			if errors.Is(err, storage.ErrNotFound) {
+				return nil, fmt.Errorf("parent issue %s not found", fv.ParentID)
+			}
+			return nil, fmt.Errorf("failed to check parent issue: %w", err)
+		}
+		childID, err := s.GetNextChildID(ctx, fv.ParentID)
+		if err != nil {
+			return nil, fmt.Errorf("failed to generate child ID: %w", err)
+		}
+		explicitID = childID
+		ctx = storage.WithReservedChildCounter(ctx, fv.ParentID, childID)
+
+		// Inherit parent labels (GH#2100), matching bd create --parent behavior
+		inheritedLabels, _ = s.GetLabels(ctx, fv.ParentID)
+	}
+
 	var externalRefPtr *string
 	if fv.ExternalRef != "" {
 		externalRefPtr = &fv.ExternalRef
 	}
+
+	labels := mergeCreateLabels(fv.Labels, inheritedLabels)
 
 	issue := &types.Issue{
 		Title:              fv.Title,
@@ -108,56 +135,30 @@ func CreateIssueFromFormValues(ctx context.Context, s storage.Storage, fv *creat
 		AcceptanceCriteria: fv.AcceptanceCriteria,
 		Status:             types.StatusOpen,
 		Priority:           fv.Priority,
-		IssueType:          types.IssueType(fv.IssueType),
+		IssueType:          types.IssueType(fv.IssueType).Normalize(),
 		Assignee:           fv.Assignee,
 		ExternalRef:        externalRefPtr,
 		CreatedBy:          getActorWithGit(), // GH#748: track who created the issue
+		Labels:             labels,
 	}
 
-	// Check if any dependencies are discovered-from type
-	// If so, inherit source_repo from the parent issue
-	var discoveredFromParentID string
-	for _, depSpec := range fv.Dependencies {
-		depSpec = strings.TrimSpace(depSpec)
-		if depSpec == "" {
-			continue
-		}
-
-		if strings.Contains(depSpec, ":") {
-			parts := strings.SplitN(depSpec, ":", 2)
-			if len(parts) == 2 {
-				depType := types.DependencyType(strings.TrimSpace(parts[0]))
-				dependsOnID := strings.TrimSpace(parts[1])
-
-				if depType == types.DepDiscoveredFrom && dependsOnID != "" {
-					discoveredFromParentID = dependsOnID
-					break
-				}
-			}
-		}
+	if explicitID != "" {
+		issue.ID = explicitID
 	}
 
-	// If we found a discovered-from dependency, inherit source_repo from parent
-	if discoveredFromParentID != "" {
-		parentIssue, err := s.GetIssue(ctx, discoveredFromParentID)
+	// If a discovered-from dependency is present, inherit source_repo from
+	// the referenced parent issue.
+	if dfParent := discoveredFromParent(fv.Dependencies); dfParent != "" {
+		parentIssue, err := s.GetIssue(ctx, dfParent)
 		if err == nil && parentIssue != nil && parentIssue.SourceRepo != "" {
 			issue.SourceRepo = parentIssue.SourceRepo
 		}
 	}
 
-	if err := s.CreateIssue(ctx, issue, actor); err != nil {
-		return nil, fmt.Errorf("failed to create issue: %w", err)
-	}
-
-	// Add labels if specified
-	for _, label := range fv.Labels {
-		if err := s.AddLabel(ctx, issue.ID, label, actor); err != nil {
-			// Log warning but don't fail the entire operation
-			fmt.Fprintf(os.Stderr, "Warning: failed to add label %s: %v\n", label, err)
-		}
-	}
-
-	// Add dependencies if specified
+	// Parse dependency specs before creating anything. The form keeps its
+	// historical lenient parsing (warn and skip malformed entries), but the
+	// edges that do parse commit atomically with the create below.
+	var depSpecs []domain.DependencySpec
 	for _, depSpec := range fv.Dependencies {
 		depSpec = strings.TrimSpace(depSpec)
 		if depSpec == "" {
@@ -169,10 +170,6 @@ func CreateIssueFromFormValues(ctx context.Context, s storage.Storage, fv *creat
 
 		if strings.Contains(depSpec, ":") {
 			parts := strings.SplitN(depSpec, ":", 2)
-			if len(parts) != 2 {
-				fmt.Fprintf(os.Stderr, "Warning: invalid dependency format '%s', expected 'type:id' or 'id'\n", depSpec)
-				continue
-			}
 			depType = types.DependencyType(strings.TrimSpace(parts[0]))
 			dependsOnID = strings.TrimSpace(parts[1])
 		} else {
@@ -185,13 +182,29 @@ func CreateIssueFromFormValues(ctx context.Context, s storage.Storage, fv *creat
 			continue
 		}
 
-		dep := &types.Dependency{
-			IssueID:     issue.ID,
-			DependsOnID: dependsOnID,
-			Type:        depType,
+		depSpecs = append(depSpecs, domain.DependencySpec{Type: depType, TargetID: dependsOnID})
+	}
+
+	// The issue and its edges (parent-child per GH#1983, plus form deps)
+	// commit in one transaction; a failed edge rolls back the create instead
+	// of leaving a dep-less issue behind (same contract as bd create).
+	edges := createDepEdges{parentID: fv.ParentID, specs: depSpecs}
+	if err := createIssueWithDeps(ctx, s, issue, actor, edges); err != nil {
+		return nil, fmt.Errorf("failed to create issue: %w", err)
+	}
+
+	if edges.empty() {
+		// Bare create: preserve the embedded-mode follow-up Dolt commit.
+		// The deps path commits inside its transaction instead.
+		shouldCommit, err := shouldCommitCreatePostWrites(issue, false)
+		if err != nil {
+			return nil, fmt.Errorf("dolt auto-commit: %w", err)
 		}
-		if err := s.AddDependency(ctx, dep, actor); err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: failed to add dependency %s -> %s: %v\n", issue.ID, dependsOnID, err)
+		if shouldCommit {
+			commitMsg := fmt.Sprintf("bd: create %s", issue.ID)
+			if err := s.Commit(ctx, commitMsg); err != nil && !isDoltNothingToCommit(err) {
+				WarnError("failed to commit post-create metadata: %v", err)
+			}
 		}
 	}
 
@@ -207,19 +220,36 @@ var createFormCmd = &cobra.Command{
 This command provides a user-friendly form interface for creating issues,
 with fields for title, description, type, priority, labels, and more.
 
+Use --parent to create a sub-issue under an existing parent issue.
+The child will get an auto-generated hierarchical ID (e.g., parent-id.1).
+
 The form uses keyboard navigation:
   - Tab/Shift+Tab: Move between fields
   - Enter: Submit the form (on the last field or submit button)
   - Ctrl+C: Cancel and exit
   - Arrow keys: Navigate within select fields`,
-	Run: func(cmd *cobra.Command, args []string) {
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if usesProxiedServer() {
+			return HandleErrorRespectJSON("create-form is not supported in proxied-server mode")
+		}
 		CheckReadonly("create-form")
-		runCreateForm(cmd)
+
+		evt := metrics.NewCommandEvent("create-form")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
+
+		return runCreateForm(cmd)
 	},
 }
 
-func runCreateForm(cmd *cobra.Command) {
-	_ = cmd // cmd parameter required by cobra.Command.Run signature
+func runCreateForm(cmd *cobra.Command) error {
+	parentID, _ := cmd.Flags().GetString("parent")
+
 	// Raw form input - will be populated by the form
 	raw := &createFormRawInput{}
 
@@ -327,71 +357,34 @@ func runCreateForm(cmd *cobra.Command) {
 				Affirmative("Create").
 				Negative("Cancel"),
 		),
-	).WithTheme(huh.ThemeDracula())
+	).WithTheme(huh.ThemeFunc(huh.ThemeDracula))
 
 	err := form.Run()
 	if err != nil {
 		if err == huh.ErrUserAborted {
 			fmt.Fprintln(os.Stderr, "Issue creation canceled.")
-			os.Exit(0)
+			return nil
 		}
-		FatalError("form error: %v", err)
+		return HandleError("form error: %v", err)
 	}
 
-	// Parse the form input
 	fv := parseCreateFormInput(raw)
+	fv.ParentID = parentID
 
-	// If daemon is running, use RPC
-	if daemonClient != nil {
-		createArgs := &rpc.CreateArgs{
-			Title:              fv.Title,
-			Description:        fv.Description,
-			IssueType:          fv.IssueType,
-			Priority:           fv.Priority,
-			Design:             fv.Design,
-			AcceptanceCriteria: fv.AcceptanceCriteria,
-			Assignee:           fv.Assignee,
-			ExternalRef:        fv.ExternalRef,
-			Labels:             fv.Labels,
-			Dependencies:       fv.Dependencies,
-		}
-
-		resp, err := daemonClient.Create(createArgs)
-		if err != nil {
-			FatalError("%v", err)
-		}
-
-		if jsonOutput {
-			fmt.Println(string(resp.Data))
-		} else {
-			var issue types.Issue
-			if err := json.Unmarshal(resp.Data, &issue); err != nil {
-				FatalError("parsing response: %v", err)
-			}
-			printCreatedIssue(&issue)
-		}
-		return
-	}
-
-	// Direct mode - use the extracted creation function
 	issue, err := CreateIssueFromFormValues(rootCtx, store, fv, actor)
 	if err != nil {
-		FatalError("%v", err)
+		return HandleError("%v", err)
 	}
-
-	// Schedule auto-flush
-	markDirtyAndScheduleFlush()
 
 	if jsonOutput {
-		outputJSON(issue)
-	} else {
-		printCreatedIssue(issue)
+		return outputJSON(issue)
 	}
+	printCreatedIssue(issue)
+	return nil
 }
 
 func printCreatedIssue(issue *types.Issue) {
-	fmt.Printf("\n%s Created issue: %s\n", ui.RenderPass("✓"), issue.ID)
-	fmt.Printf("  Title:    %s\n", issue.Title)
+	fmt.Printf("\n%s Created issue: %s\n", ui.RenderPass("✓"), formatFeedbackID(issue.ID, issue.Title))
 	fmt.Printf("  Type:     %s\n", issue.IssueType)
 	fmt.Printf("  Priority: P%d\n", issue.Priority)
 	fmt.Printf("  Status:   %s\n", issue.Status)
@@ -409,5 +402,6 @@ func printCreatedIssue(issue *types.Issue) {
 
 func init() {
 	// Note: --json flag is defined as a persistent flag in main.go
+	createFormCmd.Flags().String("parent", "", "Parent issue ID for creating a hierarchical child (e.g., 'bd-a3f8e9')")
 	rootCmd.AddCommand(createFormCmd)
 }

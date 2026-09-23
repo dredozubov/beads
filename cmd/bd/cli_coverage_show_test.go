@@ -1,4 +1,4 @@
-//go:build e2e
+//go:build cgo && e2e
 
 package main
 
@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -25,11 +25,6 @@ func runBDForCoverage(t *testing.T, dir string, args ...string) (stdout string, 
 
 	cliCoverageMutex.Lock()
 	defer cliCoverageMutex.Unlock()
-
-	// Add --no-daemon to all commands except init.
-	if len(args) > 0 && args[0] != "init" {
-		args = append([]string{"--no-daemon"}, args...)
-	}
 
 	oldStdout := os.Stdout
 	oldStderr := os.Stderr
@@ -44,16 +39,9 @@ func runBDForCoverage(t *testing.T, dir string, args ...string) (stdout string, 
 	rErr, wErr, _ := os.Pipe()
 	os.Stdout = wOut
 	os.Stderr = wErr
-
-	// Ensure direct mode.
-	oldNoDaemon, noDaemonWasSet := os.LookupEnv("BEADS_NO_DAEMON")
-	os.Setenv("BEADS_NO_DAEMON", "1")
 	defer func() {
-		if noDaemonWasSet {
-			_ = os.Setenv("BEADS_NO_DAEMON", oldNoDaemon)
-		} else {
-			os.Unsetenv("BEADS_NO_DAEMON")
-		}
+		os.Stdout = oldStdout
+		os.Stderr = oldStderr
 	}()
 
 	// Mark tests explicitly.
@@ -129,28 +117,11 @@ func runBDForCoverage(t *testing.T, dir string, args ...string) (stdout string, 
 		store.Close()
 		store = nil
 	}
-	if daemonClient != nil {
-		daemonClient.Close()
-		daemonClient = nil
-	}
-
 	// Reset all global flags and state (keep aligned with integration cli_fast_test).
 	dbPath = ""
 	actor = ""
 	jsonOutput = false
-	noDaemon = false
-	noAutoFlush = false
-	noAutoImport = false
 	sandboxMode = false
-	noDb = false
-	autoFlushEnabled = true
-	storeActive = false
-	flushFailureCount = 0
-	lastFlushError = nil
-	if flushManager != nil {
-		_ = flushManager.Shutdown()
-		flushManager = nil
-	}
 	rootCtx = nil
 	rootCancel = nil
 
@@ -159,8 +130,6 @@ func runBDForCoverage(t *testing.T, dir string, args ...string) (stdout string, 
 
 	_ = wOut.Close()
 	_ = wErr.Close()
-	os.Stdout = oldStdout
-	os.Stderr = oldStderr
 	_ = os.Chdir(oldDir)
 	os.Args = oldArgs
 	rootCmd.SetArgs(nil)
@@ -204,9 +173,6 @@ func parseCreatedIssueID(t *testing.T, out string) string {
 }
 
 func TestCoverage_ShowUpdateClose(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping CLI coverage test in short mode")
-	}
 
 	dir := t.TempDir()
 	runBDForCoverage(t, dir, "init", "--prefix", "test", "--quiet")
@@ -220,7 +186,7 @@ func TestCoverage_ShowUpdateClose(t *testing.T) {
 	runBDForCoverage(t, dir, "update", id, "--remove-label", "old", "--json")
 
 	// Show JSON output and verify labels were applied.
-	showOut, _ := runBDForCoverage(t, dir, "show", "--allow-stale", id, "--json")
+	showOut, _ := runBDForCoverage(t, dir, "show", id, "--json")
 	showPayload := extractJSONPayload(showOut)
 
 	var details []map[string]interface{}
@@ -249,7 +215,7 @@ func TestCoverage_ShowUpdateClose(t *testing.T) {
 	}
 
 	// Show text output.
-	showText, _ := runBDForCoverage(t, dir, "show", "--allow-stale", id)
+	showText, _ := runBDForCoverage(t, dir, "show", id)
 	if !strings.Contains(showText, "Show coverage issue") {
 		t.Fatalf("expected show output to contain title, got: %s", showText)
 	}
@@ -257,7 +223,7 @@ func TestCoverage_ShowUpdateClose(t *testing.T) {
 	// Multi-ID show should print both issues.
 	out2, _ := runBDForCoverage(t, dir, "create", "Second issue", "-p", "2", "--json")
 	id2 := parseCreatedIssueID(t, out2)
-	multi, _ := runBDForCoverage(t, dir, "show", "--allow-stale", id, id2)
+	multi, _ := runBDForCoverage(t, dir, "show", id, id2)
 	if !strings.Contains(multi, "Show coverage issue") || !strings.Contains(multi, "Second issue") {
 		t.Fatalf("expected multi-show output to include both titles, got: %s", multi)
 	}
@@ -281,9 +247,6 @@ func TestCoverage_ShowUpdateClose(t *testing.T) {
 }
 
 func TestCoverage_TemplateAndPinnedProtections(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping CLI coverage test in short mode")
-	}
 
 	dir := t.TempDir()
 	runBDForCoverage(t, dir, "init", "--prefix", "test", "--quiet")
@@ -309,9 +272,9 @@ func TestCoverage_TemplateAndPinnedProtections(t *testing.T) {
 
 	// Insert a template issue directly and verify update/close protect it.
 	dbFile := filepath.Join(dir, ".beads", "beads.db")
-	s, err := sqlite.New(context.Background(), dbFile)
+	s, err := dolt.New(context.Background(), &dolt.Config{Path: dbFile})
 	if err != nil {
-		t.Fatalf("sqlite.New: %v", err)
+		t.Skipf("skipping: Dolt server not available: %v", err)
 	}
 	ctx := context.Background()
 	template := &types.Issue{
@@ -336,7 +299,7 @@ func TestCoverage_TemplateAndPinnedProtections(t *testing.T) {
 	}
 	_ = s.Close()
 
-	showOut, _ := runBDForCoverage(t, dir, "show", "--allow-stale", template.ID, "--json")
+	showOut, _ := runBDForCoverage(t, dir, "show", template.ID, "--json")
 	showPayload := extractJSONPayload(showOut)
 	var showDetails []map[string]interface{}
 	if err := json.Unmarshal([]byte(showPayload), &showDetails); err != nil {
@@ -346,9 +309,9 @@ func TestCoverage_TemplateAndPinnedProtections(t *testing.T) {
 		t.Fatalf("expected 1 issue from show, got %d", len(showDetails))
 	}
 	// Re-open the DB after running the CLI to confirm is_template persisted.
-	s2, err := sqlite.New(context.Background(), dbFile)
+	s2, err := dolt.New(context.Background(), &dolt.Config{Path: dbFile})
 	if err != nil {
-		t.Fatalf("sqlite.New (reopen): %v", err)
+		t.Skipf("skipping: Dolt server not available: %v", err)
 	}
 	postShow, err := s2.GetIssue(context.Background(), template.ID)
 	_ = s2.Close()
@@ -377,23 +340,20 @@ func TestCoverage_TemplateAndPinnedProtections(t *testing.T) {
 }
 
 func TestCoverage_ShowThread(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping CLI coverage test in short mode")
-	}
 
 	dir := t.TempDir()
 	runBDForCoverage(t, dir, "init", "--prefix", "test", "--quiet")
 
 	dbFile := filepath.Join(dir, ".beads", "beads.db")
-	s, err := sqlite.New(context.Background(), dbFile)
+	s, err := dolt.New(context.Background(), &dolt.Config{Path: dbFile})
 	if err != nil {
-		t.Fatalf("sqlite.New: %v", err)
+		t.Skipf("skipping: Dolt server not available: %v", err)
 	}
 	ctx := context.Background()
 
-	root := &types.Issue{Title: "Root message", IssueType: types.TypeMessage, Status: types.StatusOpen, Sender: "alice", Assignee: "bob"}
-	reply1 := &types.Issue{Title: "Re: Root", IssueType: types.TypeMessage, Status: types.StatusOpen, Sender: "bob", Assignee: "alice"}
-	reply2 := &types.Issue{Title: "Re: Re: Root", IssueType: types.TypeMessage, Status: types.StatusOpen, Sender: "alice", Assignee: "bob"}
+	root := &types.Issue{Title: "Root message", IssueType: "message", Status: types.StatusOpen, Sender: "alice", Assignee: "bob"}
+	reply1 := &types.Issue{Title: "Re: Root", IssueType: "message", Status: types.StatusOpen, Sender: "bob", Assignee: "alice"}
+	reply2 := &types.Issue{Title: "Re: Re: Root", IssueType: "message", Status: types.StatusOpen, Sender: "alice", Assignee: "bob"}
 	if err := s.CreateIssue(ctx, root, "test-user"); err != nil {
 		s.Close()
 		t.Fatalf("CreateIssue root: %v", err)
@@ -416,7 +376,7 @@ func TestCoverage_ShowThread(t *testing.T) {
 	}
 	_ = s.Close()
 
-	out, _ := runBDForCoverage(t, dir, "show", "--allow-stale", reply2.ID, "--thread")
+	out, _ := runBDForCoverage(t, dir, "show", reply2.ID, "--thread")
 	if !strings.Contains(out, "Thread") || !strings.Contains(out, "Total: 3 messages") {
 		t.Fatalf("expected thread output, got: %s", out)
 	}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -8,7 +9,10 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/config"
-	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/metrics"
+	"github.com/steveyegge/beads/internal/remotecache"
+	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/types"
 )
 
 var repoCmd = &cobra.Command{
@@ -46,34 +50,46 @@ Paths can be absolute or relative (they are stored as-is).
 
 This modifies .beads/config.yaml, which is version-controlled and
 shared across all clones of this repository.`,
-	Args: cobra.ExactArgs(1),
+	Args:          cobra.ExactArgs(1),
+	SilenceUsage:  true,
+	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if usesProxiedServer() {
+			return HandleErrorRespectJSON("repo add is not supported in proxied-server mode")
+		}
+		evt := metrics.NewCommandEvent("repo-add")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
+
 		repoPath := args[0]
 
-		// Expand ~ to home directory for validation and display
-		expandedPath := repoPath
-		if len(repoPath) > 0 && repoPath[0] == '~' {
-			home, err := os.UserHomeDir()
-			if err == nil {
-				expandedPath = filepath.Join(home, repoPath[1:])
+		if remotecache.IsRemoteURL(repoPath) {
+			fmt.Fprintf(os.Stderr, "Adding remote repository: %s\n", repoPath)
+		} else {
+			expandedPath := repoPath
+			if len(repoPath) > 0 && repoPath[0] == '~' {
+				home, err := os.UserHomeDir()
+				if err == nil {
+					expandedPath = filepath.Join(home, repoPath[1:])
+				}
+			}
+
+			beadsDir := filepath.Join(expandedPath, ".beads")
+			if _, err := os.Stat(beadsDir); os.IsNotExist(err) {
+				return HandleError("no beads workspace found at %s", expandedPath)
 			}
 		}
 
-		// Validate the repo path exists and has .beads
-		beadsDir := filepath.Join(expandedPath, ".beads")
-		if _, err := os.Stat(beadsDir); os.IsNotExist(err) {
-			return fmt.Errorf("no .beads directory found at %s - is this a beads repository?", expandedPath)
-		}
-
-		// Find config.yaml
 		configPath, err := config.FindConfigYAMLPath()
 		if err != nil {
-			return fmt.Errorf("failed to find config.yaml: %w", err)
+			return HandleError("failed to find config.yaml: %v", err)
 		}
 
-		// Add the repo (use original path to preserve ~ etc.)
 		if err := config.AddRepo(configPath, repoPath); err != nil {
-			return fmt.Errorf("failed to add repository: %w", err)
+			return HandleError("failed to add repository: %v", err)
 		}
 
 		if jsonOutput {
@@ -100,44 +116,54 @@ you must remove "~/foo", not "/home/user/foo").
 
 This command also removes any previously-hydrated issues from the database
 that came from the removed repository.`,
-	Args: cobra.ExactArgs(1),
+	Args:          cobra.ExactArgs(1),
+	SilenceUsage:  true,
+	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if usesProxiedServer() {
+			return HandleErrorRespectJSON("repo remove is not supported in proxied-server mode")
+		}
+		evt := metrics.NewCommandEvent("repo-remove")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
+
 		repoPath := args[0]
 
-		// Ensure we have direct database access for cleanup
 		if err := ensureDirectMode("repo remove requires direct database access"); err != nil {
-			return err
+			return HandleError("%v", err)
 		}
 
 		ctx := rootCtx
 
-		// Delete issues from the removed repo before removing from config
-		// The source_repo field uses the original path (e.g., "~/foo")
-		deletedCount := 0
-		if sqliteStore, ok := store.(*sqlite.SQLiteStorage); ok {
-			count, err := sqliteStore.DeleteIssuesBySourceRepo(ctx, repoPath)
-			if err != nil {
-				return fmt.Errorf("failed to delete issues from repo: %w", err)
-			}
-			deletedCount = count
-
-			// Also clear the mtime cache entry
-			if err := sqliteStore.ClearRepoMtime(ctx, repoPath); err != nil {
-				// Non-fatal: just log a warning
-				fmt.Fprintf(os.Stderr, "Warning: failed to clear mtime cache: %v\n", err)
-			}
+		deletedCount, err := store.DeleteIssuesBySourceRepo(ctx, repoPath)
+		if err != nil {
+			return HandleError("failed to delete issues from repo: %v", err)
 		}
 
-		// Find config.yaml
+		if err := store.ClearRepoMtime(ctx, repoPath); err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: failed to clear mtime cache: %v\n", err)
+		}
+
 		configPath, err := config.FindConfigYAMLPath()
 		if err != nil {
-			return fmt.Errorf("failed to find config.yaml: %w", err)
+			return HandleError("failed to find config.yaml: %v", err)
 		}
 
-		// Remove the repo from config
 		if err := config.RemoveRepo(configPath, repoPath); err != nil {
-			return fmt.Errorf("failed to remove repository: %w", err)
+			return HandleError("failed to remove repository: %v", err)
 		}
+
+		// Evict remote cache if applicable
+		if remotecache.IsRemoteURL(repoPath) {
+			if cache, err := remotecache.DefaultCache(); err == nil {
+				_ = cache.Evict(repoPath)
+			}
+		}
+
+		commandDidWrite.Store(true)
 
 		if jsonOutput {
 			result := map[string]interface{}{
@@ -163,17 +189,27 @@ var repoListCmd = &cobra.Command{
 
 Shows the primary repository (always ".") and any additional
 repositories configured for hydration.`,
+	SilenceUsage:  true,
+	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		// Find config.yaml
+		if usesProxiedServer() {
+			return HandleErrorRespectJSON("repo list is not supported in proxied-server mode")
+		}
+		evt := metrics.NewCommandEvent("repo-list")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
+
 		configPath, err := config.FindConfigYAMLPath()
 		if err != nil {
-			return fmt.Errorf("failed to find config.yaml: %w", err)
+			return HandleError("failed to find config.yaml: %v", err)
 		}
 
-		// Get repos from YAML
 		repos, err := config.ListRepos(configPath)
 		if err != nil {
-			return fmt.Errorf("failed to load config: %w", err)
+			return HandleError("failed to load config: %v", err)
 		}
 
 		if jsonOutput {
@@ -208,38 +244,230 @@ repositories configured for hydration.`,
 var repoSyncCmd = &cobra.Command{
 	Use:   "sync",
 	Short: "Manually trigger multi-repo sync",
-	Long: `Trigger synchronization from all configured repositories.
+	Long: `Synchronize issues from all configured additional repositories.
 
-This hydrates issues from all repos in repos.additional into the
-local database, then exports any local changes back to JSONL.`,
+Reads issues.jsonl from each additional repository and imports them into
+the primary database with their original prefixes and source_repo set.
+Uses mtime caching to skip repos whose JSONL hasn't changed.
+
+Also triggers Dolt push/pull if a remote is configured.`,
+	SilenceUsage:  true,
+	SilenceErrors: true,
 	RunE: func(cmd *cobra.Command, args []string) error {
+		if usesProxiedServer() {
+			return HandleErrorRespectJSON("repo sync is not supported in proxied-server mode")
+		}
+		evt := metrics.NewCommandEvent("repo-sync")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
+
 		if err := ensureDirectMode("repo sync requires direct database access"); err != nil {
-			return err
+			return HandleError("%v", err)
 		}
 
 		ctx := rootCtx
+		verbose, _ := cmd.Flags().GetBool("verbose")
 
-		// Import from all repos
-		jsonlPath := findJSONLPath()
-		if err := importToJSONLWithStore(ctx, store, jsonlPath); err != nil {
-			return fmt.Errorf("import failed: %w", err)
+		configPath, err := config.FindConfigYAMLPath()
+		if err != nil {
+			return HandleError("failed to find config.yaml: %v", err)
 		}
 
-		// Export to all repos
-		if err := exportToJSONLWithStore(ctx, store, jsonlPath); err != nil {
-			return fmt.Errorf("export failed: %w", err)
+		repos, err := config.ListRepos(configPath)
+		if err != nil {
+			return HandleError("failed to load repo config: %v", err)
+		}
+
+		totalImported := 0
+		totalSkipped := 0
+
+		// Hydrate issues from each additional repository
+		for _, repoPath := range repos.Additional {
+			// Remote URL: pull into cache, read issues from SQL store
+			if remotecache.IsRemoteURL(repoPath) {
+				cache, err := remotecache.DefaultCache()
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to init cache for %s: %v\n", repoPath, err)
+					continue
+				}
+				if _, err = cache.Ensure(ctx, repoPath); err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to sync remote %s: %v\n", repoPath, err)
+					continue
+				}
+				remoteStore, err := cache.OpenStore(ctx, repoPath, newDoltStoreFromConfig)
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to open remote store %s: %v\n", repoPath, err)
+					continue
+				}
+
+				issues, err := remoteStore.SearchIssues(ctx, "", types.IssueFilter{})
+				_ = remoteStore.Close() // close eagerly — defer in a loop would leak connections
+				if err != nil {
+					fmt.Fprintf(os.Stderr, "Warning: failed to read issues from %s: %v\n", repoPath, err)
+					continue
+				}
+
+				for _, issue := range issues {
+					issue.SourceRepo = repoPath
+				}
+				if len(issues) > 0 {
+					if importErr := store.CreateIssuesWithFullOptions(ctx, issues, "repo-sync", storage.BatchCreateOptions{
+						SkipPrefixValidation: true,
+					}); importErr != nil {
+						fmt.Fprintf(os.Stderr, "Warning: failed to import from %s: %v\n", repoPath, importErr)
+						continue
+					}
+					totalImported += len(issues)
+					if verbose {
+						fmt.Fprintf(os.Stderr, "Imported %d issue(s) from remote %s\n", len(issues), repoPath)
+					}
+				}
+				continue
+			}
+
+			// Local path: expand tilde
+			expandedPath := repoPath
+			if len(repoPath) > 0 && repoPath[0] == '~' {
+				home, err := os.UserHomeDir()
+				if err == nil {
+					expandedPath = filepath.Join(home, repoPath[1:])
+				}
+			}
+
+			// Resolve to absolute path for consistent mtime caching
+			absPath, err := filepath.Abs(expandedPath)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to resolve path %s: %v\n", repoPath, err)
+				continue
+			}
+
+			jsonlPath := filepath.Join(absPath, ".beads", "issues.jsonl")
+			info, err := os.Stat(jsonlPath)
+			if err != nil {
+				if verbose {
+					fmt.Fprintf(os.Stderr, "Skipping %s: no issues.jsonl found\n", repoPath)
+				}
+				continue
+			}
+
+			// Check mtime cache — skip if JSONL hasn't changed
+			currentMtime := info.ModTime().UnixNano()
+			cachedMtime, _ := store.GetRepoMtime(ctx, absPath)
+			if cachedMtime == currentMtime {
+				if verbose {
+					fmt.Fprintf(os.Stderr, "Skipping %s: JSONL unchanged\n", repoPath)
+				}
+				totalSkipped++
+				continue
+			}
+
+			// Parse issues from JSONL
+			issues, err := parseIssuesFromJSONL(jsonlPath)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to parse %s: %v\n", jsonlPath, err)
+				continue
+			}
+
+			if len(issues) == 0 {
+				if verbose {
+					fmt.Fprintf(os.Stderr, "Skipping %s: no issues in JSONL\n", repoPath)
+				}
+				continue
+			}
+
+			// Set source_repo on all imported issues
+			for _, issue := range issues {
+				issue.SourceRepo = repoPath
+			}
+
+			// Import with prefix validation skipped (cross-prefix hydration)
+			if err := store.CreateIssuesWithFullOptions(ctx, issues, "repo-sync", storage.BatchCreateOptions{
+				SkipPrefixValidation: true,
+			}); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to import from %s: %v\n", repoPath, err)
+				continue
+			}
+
+			// Update mtime cache
+			if err := store.SetRepoMtime(ctx, absPath, jsonlPath, currentMtime); err != nil {
+				fmt.Fprintf(os.Stderr, "Warning: failed to update mtime cache for %s: %v\n", repoPath, err)
+			}
+
+			totalImported += len(issues)
+			if verbose {
+				fmt.Fprintf(os.Stderr, "Imported %d issue(s) from %s\n", len(issues), repoPath)
+			}
+		}
+
+		// Push is handled by periodic sync, not per-operation.
+		// Manual push available via: bd dolt push
+
+		if totalImported > 0 {
+			commandDidWrite.Store(true)
 		}
 
 		if jsonOutput {
 			result := map[string]interface{}{
-				"synced": true,
+				"synced":          true,
+				"repos_synced":    len(repos.Additional) - totalSkipped,
+				"repos_skipped":   totalSkipped,
+				"issues_imported": totalImported,
 			}
 			return json.NewEncoder(os.Stdout).Encode(result)
 		}
 
-		fmt.Println("Multi-repo sync complete")
+		if totalImported > 0 {
+			fmt.Printf("Multi-repo sync complete: imported %d issue(s) from %d repo(s)\n",
+				totalImported, len(repos.Additional)-totalSkipped)
+		} else if totalSkipped == len(repos.Additional) {
+			fmt.Println("Multi-repo sync complete: all repos up to date")
+		} else {
+			fmt.Println("Multi-repo sync complete")
+		}
 		return nil
 	},
+}
+
+// parseIssuesFromJSONL reads and parses issues from a JSONL file.
+func parseIssuesFromJSONL(path string) ([]*types.Issue, error) {
+	// #nosec G304 -- path comes from user-configured repos.additional in config.yaml
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open JSONL: %w", err)
+	}
+	defer f.Close()
+
+	var issues []*types.Issue
+	scanner := bufio.NewScanner(f)
+	// Allow up to 10MB per line (large issues with embedded content)
+	scanner.Buffer(make([]byte, 0, 64*1024), 10*1024*1024)
+
+	lineNum := 0
+	for scanner.Scan() {
+		lineNum++
+		line := scanner.Bytes()
+		if len(line) == 0 {
+			continue
+		}
+
+		var issue types.Issue
+		if err := json.Unmarshal(line, &issue); err != nil {
+			return nil, fmt.Errorf("failed to parse issue at line %d: %w", lineNum, err)
+		}
+		if issue.ID == "" {
+			continue // Skip malformed entries
+		}
+		issues = append(issues, &issue)
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("failed to read JSONL: %w", err)
+	}
+
+	return issues, nil
 }
 
 func init() {
@@ -252,6 +480,7 @@ func init() {
 	repoRemoveCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output JSON")
 	repoListCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output JSON")
 	repoSyncCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output JSON")
+	repoSyncCmd.Flags().Bool("verbose", false, "Show detailed sync progress")
 
 	rootCmd.AddCommand(repoCmd)
 }

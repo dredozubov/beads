@@ -22,7 +22,7 @@ func TestAiderBeadsInstructions(t *testing.T) {
 		"bd create",
 		"bd update",
 		"bd close",
-		"bd sync",
+		"bd dolt push",
 		"/run",
 		"bug",
 		"feature",
@@ -44,7 +44,7 @@ func TestAiderReadmeTemplate(t *testing.T) {
 		"bd ready",
 		"bd create",
 		"bd close",
-		"bd sync",
+		"bd dolt push",
 	}
 
 	for _, req := range requiredContent {
@@ -330,8 +330,9 @@ func TestCheckAider_NotInstalled(t *testing.T) {
 		}
 	}()
 
-	// CheckAider calls os.Exit(1) when not installed
-	// We can't easily test that, but we document expected behavior
+	if err := CheckAider(); err == nil {
+		t.Fatal("CheckAider should return error when not installed")
+	}
 }
 
 func TestCheckAider_Installed(t *testing.T) {
@@ -365,8 +366,8 @@ func TestAiderInstructionsWorkflowPattern(t *testing.T) {
 	if !strings.Contains(instructions, "/run bd ready") {
 		t.Error("Should mention /run bd ready")
 	}
-	if !strings.Contains(instructions, "/run bd sync") {
-		t.Error("Should mention /run bd sync")
+	if !strings.Contains(instructions, "/run bd dolt push") {
+		t.Error("Should mention /run bd dolt push")
 	}
 
 	// Should explain that Aider requires explicit commands

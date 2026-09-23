@@ -2,55 +2,49 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strings"
 	"time"
 
 	"github.com/steveyegge/beads/internal/beads"
-	"github.com/steveyegge/beads/internal/config"
-	"github.com/steveyegge/beads/internal/git"
+	"github.com/steveyegge/beads/internal/doltremote"
 )
 
-// isGitRepo checks if the current directory is in a git repository
+// isGitRepo checks if the current working directory is in a git repository.
+// NOTE: This intentionally checks CWD, not the beads repo. It's used as a guard
+// before calling other git functions to prevent hangs on Windows (GH#727).
+// Does not use RepoContext because it's a prerequisite check for git availability.
 func isGitRepo() bool {
 	cmd := exec.Command("git", "rev-parse", "--git-dir")
 	return cmd.Run() == nil
 }
 
-// gitHasUnmergedPaths checks for unmerged paths or merge in progress
-func gitHasUnmergedPaths() (bool, error) {
-	cmd := exec.Command("git", "status", "--porcelain")
-	out, err := cmd.Output()
+// isBareGitRepo checks if the current git repository is bare.
+// Returns false when not in a git repository.
+func isBareGitRepo() bool {
+	cmd := exec.Command("git", "rev-parse", "--is-bare-repository")
+	output, err := cmd.Output()
 	if err != nil {
-		return false, fmt.Errorf("git status failed: %w", err)
+		return false
 	}
-
-	// Check for unmerged status codes (DD, AU, UD, UA, DU, AA, UU)
-	for _, line := range strings.Split(string(out), "\n") {
-		if len(line) >= 2 {
-			s := line[:2]
-			if s == "DD" || s == "AU" || s == "UD" || s == "UA" || s == "DU" || s == "AA" || s == "UU" {
-				return true, nil
-			}
-		}
-	}
-
-	// Check if MERGE_HEAD exists (merge in progress)
-	if exec.Command("git", "rev-parse", "-q", "--verify", "MERGE_HEAD").Run() == nil {
-		return true, nil
-	}
-
-	return false, nil
+	return strings.TrimSpace(string(output)) == "true"
 }
 
-// gitHasUpstream checks if the current branch has an upstream configured
-// Uses git config directly for compatibility with Git for Windows
+// gitHasUpstream checks if the current branch has an upstream configured in the beads repository.
+// Uses RepoContext to ensure git commands run in the correct repository.
+// Uses git config directly for compatibility with Git for Windows.
 func gitHasUpstream() bool {
+	rc, err := beads.GetRepoContext()
+	if err != nil {
+		return false
+	}
+
+	ctx := context.Background()
 	// Get current branch name
-	branchCmd := exec.Command("git", "symbolic-ref", "--short", "HEAD")
+	branchCmd := rc.GitCmd(ctx, "symbolic-ref", "--short", "HEAD")
 	branchOutput, err := branchCmd.Output()
 	if err != nil {
 		return false
@@ -60,529 +54,148 @@ func gitHasUpstream() bool {
 	return gitBranchHasUpstream(branch)
 }
 
+// gitHasAnyRemotes returns true if the git repository has any remotes configured.
+// Used to distinguish between "new repo with no remotes" and "repo with origin but no upstream".
+func gitHasAnyRemotes() bool {
+	rc, err := beads.GetRepoContext()
+	if err != nil {
+		return false
+	}
+
+	ctx := context.Background()
+	remoteCmd := rc.GitCmd(ctx, "remote")
+	output, err := remoteCmd.Output()
+	if err != nil {
+		return false
+	}
+	return strings.TrimSpace(string(output)) != ""
+}
+
+// gitOriginGetURL returns the URL for the origin git remote.
+func gitOriginGetURL() (string, error) {
+	cmd := exec.Command("git", "remote", "get-url", "origin")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+func gitOriginGetURLForActiveRepo(ctx context.Context) (string, error) {
+	rc, err := beads.GetRepoContext()
+	if err != nil {
+		return "", err
+	}
+	cmd := rc.GitCmd(ctx, "remote", "get-url", "origin")
+	output, err := cmd.Output()
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(string(output)), nil
+}
+
+// gitOriginHasDoltDataRef checks if origin has refs/dolt/data.
+// Returns false on any error (network, no remote, timeout, etc).
+// Uses a 10s timeout since this is a network call used for auto-detection,
+// and suppresses credential prompts to avoid blocking on SSH remotes.
+func gitOriginHasDoltDataRef() bool {
+	return gitRemoteHasDoltDataRef("origin")
+}
+
+func gitRemoteHasDoltDataRef(remote string) bool {
+	hasData, err := gitRemoteHasDoltDataRefStatus(remote)
+	return err == nil && hasData
+}
+
+// gitOriginHasDoltDataRefStatus is the tri-state form: no data vs. unknown.
+func gitOriginHasDoltDataRefStatus() (bool, error) {
+	return gitRemoteHasDoltDataRefStatus("origin")
+}
+
+// A non-nil error means UNKNOWN, not "no data" — the bool is meaningless.
+//
+// The error names the failure, not the remote: every caller already names the
+// remote it probed, and wrapping here too produced messages that said the URL
+// and the ref twice ("...on sync.remote \"X\": probe refs/dolt/data on X: exit
+// status 128").
+func gitRemoteHasDoltDataRefStatus(remote string) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), gitDoltDataProbeTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "git", "ls-remote", gitRemoteURLForLsRemote(remote), "refs/dolt/data")
+	cmd.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	output, err := cmd.Output()
+	if err != nil {
+		return false, gitLsRemoteProbeError(ctx, err)
+	}
+	return strings.TrimSpace(string(output)) != "", nil
+}
+
+const gitDoltDataProbeTimeout = 10 * time.Second
+
+// gitLsRemoteProbeError turns a failed `git ls-remote` into something a user
+// can act on. exec.ExitError.Error() is only "exit status 128" — git's actual
+// complaint (auth vs. DNS vs. deleted repo) sits unread in ExitError.Stderr
+// because cmd.Output() captures it there, and a context timeout surfaces as
+// the equally opaque "signal: killed".
+func gitLsRemoteProbeError(ctx context.Context, err error) error {
+	if ctx.Err() == context.DeadlineExceeded {
+		return fmt.Errorf("git ls-remote did not answer within %s (network, or an SSH key that wants a passphrase)", gitDoltDataProbeTimeout)
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		// git can echo the remote it failed to reach — including a CI token in
+		// https://x-access-token:<token>@host form — so scrub credentials before
+		// this detail reaches plan.Reason, which flows to both stderr and
+		// `bd bootstrap --json`. exitErr itself is only "exit status 128".
+		if detail := scrubURLCredentials(firstNonEmptyLine(string(exitErr.Stderr))); detail != "" {
+			return fmt.Errorf("git ls-remote: %v: %s", exitErr, detail)
+		}
+	}
+	return fmt.Errorf("git ls-remote: %w", err)
+}
+
+// firstNonEmptyLine returns the first meaningful line of git's stderr. git
+// prefixes most failures with a "remote:"/"fatal:" line that already says
+// everything; the rest is usually a hint block we do not want inside a
+// single-line Reason.
+func firstNonEmptyLine(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		if trimmed := strings.TrimSpace(line); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
+}
+
+func gitRemoteURLForLsRemote(remote string) string {
+	return strings.TrimPrefix(remote, "git+")
+}
+
+// gitURLToDoltRemote converts a git remote URL to dolt's remote format.
+// HTTPS URLs get "git+" prefix: https://... → git+https://...
+// SCP-style SSH URLs are converted: git@host:path → git+ssh://git@host/path
+// SSH URLs get "git+" prefix: ssh://... → git+ssh://...
+// URLs that already have "git+" prefix are returned as-is.
+func gitURLToDoltRemote(url string) string {
+	return doltremote.FromGitURL(url)
+}
+
 // gitBranchHasUpstream checks if a specific branch has an upstream configured.
 // Unlike gitHasUpstream(), this works even when HEAD is detached (e.g., jj/jujutsu).
-// This is critical for sync-branch workflows where the sync branch has upstream
-// tracking but the main working copy may be in detached HEAD state.
+// Uses RepoContext to ensure git commands run in the correct repository.
 func gitBranchHasUpstream(branch string) bool {
+	rc, err := beads.GetRepoContext()
+	if err != nil {
+		return false
+	}
+
+	ctx := context.Background()
 	// Check if remote and merge refs are configured for the branch
-	remoteCmd := exec.Command("git", "config", "--get", fmt.Sprintf("branch.%s.remote", branch)) //nolint:gosec // G204: branch from caller
-	mergeCmd := exec.Command("git", "config", "--get", fmt.Sprintf("branch.%s.merge", branch))   //nolint:gosec // G204: branch from caller
+	remoteCmd := rc.GitCmd(ctx, "config", "--get", fmt.Sprintf("branch.%s.remote", branch)) //nolint:gosec // G204: branch from caller
+	mergeCmd := rc.GitCmd(ctx, "config", "--get", fmt.Sprintf("branch.%s.merge", branch))   //nolint:gosec // G204: branch from caller
 
 	remoteErr := remoteCmd.Run()
 	mergeErr := mergeCmd.Run()
 
 	return remoteErr == nil && mergeErr == nil
-}
-
-// gitHasChanges checks if the specified file has uncommitted changes
-func gitHasChanges(ctx context.Context, filePath string) (bool, error) {
-	cmd := exec.CommandContext(ctx, "git", "status", "--porcelain", filePath)
-	output, err := cmd.Output()
-	if err != nil {
-		return false, fmt.Errorf("git status failed: %w", err)
-	}
-	return len(strings.TrimSpace(string(output))) > 0, nil
-}
-
-// getRepoRootForWorktree returns the main repository root for running git commands
-// This is always the main repository root, never the worktree root
-func getRepoRootForWorktree(_ context.Context) string {
-	repoRoot, err := git.GetMainRepoRoot()
-	if err != nil {
-		// Fallback to current directory if GetMainRepoRoot fails
-		return "."
-	}
-	return repoRoot
-}
-
-// gitHasBeadsChanges checks if any tracked files in .beads/ have uncommitted changes
-// This function is worktree-aware and handles bare repo worktree setups (GH#827).
-// It also handles redirected beads directories (bd-arjb) by running git commands
-// from the directory containing the actual .beads/.
-func gitHasBeadsChanges(ctx context.Context) (bool, error) {
-	// Get the absolute path to .beads directory
-	beadsDir := beads.FindBeadsDir()
-	if beadsDir == "" {
-		return false, fmt.Errorf("no .beads directory found")
-	}
-
-	// Check if beads directory is redirected (bd-arjb)
-	// When redirected, beadsDir points outside the current repo, so we need to
-	// run git commands from the directory containing the actual .beads/
-	redirectInfo := beads.GetRedirectInfo()
-	if redirectInfo.IsRedirected {
-		// beadsDir is the target (e.g., /path/to/mayor/rig/.beads)
-		// We need to run git from the parent of .beads (e.g., /path/to/mayor/rig)
-		targetRepoDir := filepath.Dir(beadsDir)
-		statusCmd := exec.CommandContext(ctx, "git", "-C", targetRepoDir, "status", "--porcelain", beadsDir) //nolint:gosec // G204: beadsDir from beads.FindBeadsDir()
-		statusOutput, err := statusCmd.Output()
-		if err != nil {
-			return false, fmt.Errorf("git status failed: %w", err)
-		}
-		return len(strings.TrimSpace(string(statusOutput))) > 0, nil
-	}
-
-	// Run git status with absolute path from current directory.
-	// This is more robust than using -C with a repo root, because:
-	// 1. In bare repo worktree setups, GetMainRepoRoot() returns the parent
-	//    of the bare repo, which isn't a valid working tree (GH#827)
-	// 2. Git will find the repository from cwd, which is always valid
-	statusCmd := exec.CommandContext(ctx, "git", "status", "--porcelain", beadsDir) //nolint:gosec // G204: beadsDir from beads.FindBeadsDir()
-	statusOutput, err := statusCmd.Output()
-	if err != nil {
-		return false, fmt.Errorf("git status failed: %w", err)
-	}
-	return len(strings.TrimSpace(string(statusOutput))) > 0, nil
-}
-
-// buildGitCommitArgs returns git commit args with config-based author and signing options (GH#600)
-// This allows users to configure a separate author and disable GPG signing for beads commits.
-func buildGitCommitArgs(repoRoot, message string, extraArgs ...string) []string {
-	args := []string{"-C", repoRoot, "commit"}
-
-	// Add --author if configured
-	if author := config.GetString("git.author"); author != "" {
-		args = append(args, "--author", author)
-	}
-
-	// Add --no-gpg-sign if configured
-	if config.GetBool("git.no-gpg-sign") {
-		args = append(args, "--no-gpg-sign")
-	}
-
-	// Add message
-	args = append(args, "-m", message)
-
-	// Add any extra args (like -- pathspec)
-	args = append(args, extraArgs...)
-
-	return args
-}
-
-// gitCommit commits the specified file (worktree-aware)
-func gitCommit(ctx context.Context, filePath string, message string) error {
-	// Get the repository root (handles worktrees properly)
-	repoRoot := getRepoRootForWorktree(ctx)
-	if repoRoot == "" {
-		return fmt.Errorf("cannot determine repository root")
-	}
-
-	// Make file path relative to repo root for git operations
-	relPath, err := filepath.Rel(repoRoot, filePath)
-	if err != nil {
-		relPath = filePath // Fall back to absolute path
-	}
-
-	// Stage the file from repo root context
-	addCmd := exec.CommandContext(ctx, "git", "-C", repoRoot, "add", relPath) //nolint:gosec // G204: paths from internal git helpers
-	if err := addCmd.Run(); err != nil {
-		return fmt.Errorf("git add failed: %w", err)
-	}
-
-	// Generate message if not provided
-	if message == "" {
-		message = fmt.Sprintf("bd sync: %s", time.Now().Format("2006-01-02 15:04:05"))
-	}
-
-	// Commit from repo root context with config-based author and signing options
-	// Use pathspec to commit ONLY this file
-	// This prevents accidentally committing other staged files
-	commitArgs := buildGitCommitArgs(repoRoot, message, "--", relPath)
-	commitCmd := exec.CommandContext(ctx, "git", commitArgs...) //nolint:gosec // G204: args from buildGitCommitArgs
-	output, err := commitCmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("git commit failed: %w\n%s", err, output)
-	}
-
-	return nil
-}
-
-// gitCommitBeadsDir stages and commits only sync-related files in .beads/
-// This ensures bd sync doesn't accidentally commit other staged files.
-// Only stages specific sync files (issues.jsonl, deletions.jsonl, metadata.json)
-// to avoid staging gitignored snapshot files that may be tracked.
-// Worktree-aware: handles cases where .beads is in the main repo but we're running from a worktree.
-func gitCommitBeadsDir(ctx context.Context, message string) error {
-	beadsDir := beads.FindBeadsDir()
-	if beadsDir == "" {
-		return fmt.Errorf("no .beads directory found")
-	}
-
-	// Determine the repository root
-	// When beads directory is redirected (bd-arjb), we need to run git commands
-	// from the directory containing the actual .beads/, not the current working directory
-	var repoRoot string
-	redirectInfo := beads.GetRedirectInfo()
-	if redirectInfo.IsRedirected {
-		// beadsDir is the target (e.g., /path/to/mayor/rig/.beads)
-		// We need to run git from the parent of .beads (e.g., /path/to/mayor/rig)
-		repoRoot = filepath.Dir(beadsDir)
-	} else {
-		// Get the repository root (handles worktrees properly)
-		repoRoot = getRepoRootForWorktree(ctx)
-		if repoRoot == "" {
-			return fmt.Errorf("cannot determine repository root")
-		}
-	}
-
-	// Stage only the specific sync-related files
-	// This avoids staging gitignored snapshot files (beads.*.jsonl, *.meta.json)
-	// that may still be tracked from before they were added to .gitignore
-	syncFiles := []string{
-		filepath.Join(beadsDir, "issues.jsonl"),
-		filepath.Join(beadsDir, "deletions.jsonl"),
-		filepath.Join(beadsDir, "interactions.jsonl"),
-		filepath.Join(beadsDir, "metadata.json"),
-	}
-
-	// Only add files that exist
-	var filesToAdd []string
-	for _, f := range syncFiles {
-		if _, err := os.Stat(f); err == nil {
-			// Convert to relative path from repo root for git operations
-			relPath, err := filepath.Rel(repoRoot, f)
-			if err != nil {
-				relPath = f // Fall back to absolute path if relative fails
-			}
-			filesToAdd = append(filesToAdd, relPath)
-		}
-	}
-
-	if len(filesToAdd) == 0 {
-		return fmt.Errorf("no sync files found to commit")
-	}
-
-	// Stage only the sync files from repo root context (worktree-aware)
-	args := append([]string{"-C", repoRoot, "add"}, filesToAdd...)
-	addCmd := exec.CommandContext(ctx, "git", args...) //nolint:gosec // G204: paths from internal git helpers
-	if err := addCmd.Run(); err != nil {
-		return fmt.Errorf("git add failed: %w", err)
-	}
-
-	// Generate message if not provided
-	if message == "" {
-		message = fmt.Sprintf("bd sync: %s", time.Now().Format("2006-01-02 15:04:05"))
-	}
-
-	// Commit only .beads/ files using -- pathspec
-	// This prevents accidentally committing other staged files that the user
-	// may have staged but wasn't ready to commit yet.
-	// Convert beadsDir to relative path for git commit (worktree-aware)
-	relBeadsDir, err := filepath.Rel(repoRoot, beadsDir)
-	if err != nil {
-		relBeadsDir = beadsDir // Fall back to absolute path if relative fails
-	}
-
-	// Use config-based author and signing options with pathspec
-	commitArgs := buildGitCommitArgs(repoRoot, message, "--", relBeadsDir)
-	commitCmd := exec.CommandContext(ctx, "git", commitArgs...) //nolint:gosec // G204: args from buildGitCommitArgs
-	output, err := commitCmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("git commit failed: %w\n%s", err, output)
-	}
-
-	return nil
-}
-
-// hasGitRemote checks if a git remote exists in the repository
-func hasGitRemote(ctx context.Context) bool {
-	cmd := exec.CommandContext(ctx, "git", "remote")
-	output, err := cmd.Output()
-	if err != nil {
-		return false
-	}
-	return len(strings.TrimSpace(string(output))) > 0
-}
-
-// isInRebase checks if we're currently in a git rebase state
-func isInRebase() bool {
-	// Get actual git directory (handles worktrees)
-	gitDir, err := git.GetGitDir()
-	if err != nil {
-		return false
-	}
-
-	// Check for rebase-merge directory (interactive rebase)
-	rebaseMergePath := filepath.Join(gitDir, "rebase-merge")
-	if _, err := os.Stat(rebaseMergePath); err == nil {
-		return true
-	}
-	// Check for rebase-apply directory (non-interactive rebase)
-	rebaseApplyPath := filepath.Join(gitDir, "rebase-apply")
-	if _, err := os.Stat(rebaseApplyPath); err == nil {
-		return true
-	}
-	return false
-}
-
-// hasJSONLConflict checks if the beads JSONL file has a merge conflict
-// Returns true only if the JSONL file (issues.jsonl or beads.jsonl) is the only file in conflict
-func hasJSONLConflict() bool {
-	cmd := exec.Command("git", "status", "--porcelain")
-	out, err := cmd.Output()
-	if err != nil {
-		return false
-	}
-
-	var hasJSONLConflict bool
-	var hasOtherConflict bool
-
-	for _, line := range strings.Split(string(out), "\n") {
-		if len(line) < 3 {
-			continue
-		}
-
-		// Check for unmerged status codes (UU = both modified, AA = both added, etc.)
-		status := line[:2]
-		if status == "UU" || status == "AA" || status == "DD" ||
-			status == "AU" || status == "UA" || status == "DU" || status == "UD" {
-			filepath := strings.TrimSpace(line[3:])
-
-			// Check for beads JSONL files (issues.jsonl or beads.jsonl in .beads/)
-			if strings.HasSuffix(filepath, "issues.jsonl") || strings.HasSuffix(filepath, "beads.jsonl") {
-				hasJSONLConflict = true
-			} else {
-				hasOtherConflict = true
-			}
-		}
-	}
-
-	// Only return true if ONLY the JSONL file has a conflict
-	return hasJSONLConflict && !hasOtherConflict
-}
-
-// runGitRebaseContinue continues a rebase after resolving conflicts
-func runGitRebaseContinue(ctx context.Context) error {
-	cmd := exec.CommandContext(ctx, "git", "rebase", "--continue")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("git rebase --continue failed: %w\n%s", err, output)
-	}
-	return nil
-}
-
-// gitPull pulls from the current branch's upstream
-// Returns nil if no remote configured (local-only mode)
-// If configuredRemote is non-empty, uses that instead of the branch's configured remote.
-// This allows respecting the sync.remote bd config.
-func gitPull(ctx context.Context, configuredRemote string) error {
-	// Check if any remote exists (support local-only repos)
-	if !hasGitRemote(ctx) {
-		return nil // Gracefully skip - local-only mode
-	}
-
-	// Get current branch name
-	// Use symbolic-ref to work in fresh repos without commits
-	branchCmd := exec.CommandContext(ctx, "git", "symbolic-ref", "--short", "HEAD")
-	branchOutput, err := branchCmd.Output()
-	if err != nil {
-		return fmt.Errorf("failed to get current branch: %w", err)
-	}
-	branch := strings.TrimSpace(string(branchOutput))
-
-	// Determine remote to use:
-	// 1. If configuredRemote (from sync.remote bd config) is set, use that
-	// 2. Otherwise, get from git branch tracking config
-	// 3. Fall back to "origin"
-	remote := configuredRemote
-	if remote == "" {
-		remoteCmd := exec.CommandContext(ctx, "git", "config", "--get", fmt.Sprintf("branch.%s.remote", branch)) //nolint:gosec // G204: branch from git symbolic-ref
-		remoteOutput, err := remoteCmd.Output()
-		if err != nil {
-			// If no remote configured, default to "origin"
-			remote = "origin"
-		} else {
-			remote = strings.TrimSpace(string(remoteOutput))
-		}
-	}
-
-	// Pull with explicit remote and branch
-	cmd := exec.CommandContext(ctx, "git", "pull", remote, branch) //nolint:gosec // G204: remote/branch from git config, not user input
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("git pull failed: %w\n%s", err, output)
-	}
-	return nil
-}
-
-// gitPush pushes to the current branch's upstream
-// Returns nil if no remote configured (local-only mode)
-// If configuredRemote is non-empty, pushes to that remote explicitly.
-// This allows respecting the sync.remote bd config.
-func gitPush(ctx context.Context, configuredRemote string) error {
-	// Check if any remote exists (support local-only repos)
-	if !hasGitRemote(ctx) {
-		return nil // Gracefully skip - local-only mode
-	}
-
-	// If configuredRemote is set, push explicitly to that remote with current branch
-	if configuredRemote != "" {
-		// Get current branch name
-		branchCmd := exec.CommandContext(ctx, "git", "symbolic-ref", "--short", "HEAD")
-		branchOutput, err := branchCmd.Output()
-		if err != nil {
-			return fmt.Errorf("failed to get current branch: %w", err)
-		}
-		branch := strings.TrimSpace(string(branchOutput))
-
-		cmd := exec.CommandContext(ctx, "git", "push", configuredRemote, branch) //nolint:gosec // G204: configuredRemote from bd config
-		output, err := cmd.CombinedOutput()
-		if err != nil {
-			return fmt.Errorf("git push failed: %w\n%s", err, output)
-		}
-		return nil
-	}
-
-	// Default: use git's default push behavior
-	cmd := exec.CommandContext(ctx, "git", "push")
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("git push failed: %w\n%s", err, output)
-	}
-	return nil
-}
-
-func checkMergeDriverConfig() {
-	// Get current merge driver configuration
-	cmd := exec.Command("git", "config", "merge.beads.driver")
-	output, err := cmd.Output()
-	if err != nil {
-		// No merge driver configured - this is OK, user may not need it
-		return
-	}
-
-	currentConfig := strings.TrimSpace(string(output))
-
-	// Check if using old incorrect placeholders
-	if strings.Contains(currentConfig, "%L") || strings.Contains(currentConfig, "%R") {
-		fmt.Fprintf(os.Stderr, "\n⚠️  WARNING: Git merge driver is misconfigured!\n")
-		fmt.Fprintf(os.Stderr, "   Current: %s\n", currentConfig)
-		fmt.Fprintf(os.Stderr, "   Problem: Git only supports %%O (base), %%A (current), %%B (other)\n")
-		fmt.Fprintf(os.Stderr, "            Using %%L/%%R will cause merge failures!\n")
-		fmt.Fprintf(os.Stderr, "\n   Fix now: bd doctor --fix\n")
-		fmt.Fprintf(os.Stderr, "   Or manually: git config merge.beads.driver \"bd merge %%A %%O %%A %%B\"\n\n")
-	}
-}
-
-// restoreBeadsDirFromBranch restores .beads/ directory from the current branch's committed state.
-// This is used after sync when sync.branch is configured to keep the working directory clean.
-// The actual beads data lives on the sync branch; the main branch's .beads/ is just a snapshot.
-func restoreBeadsDirFromBranch(ctx context.Context) error {
-	beadsDir := beads.FindBeadsDir()
-	if beadsDir == "" {
-		return fmt.Errorf("no .beads directory found")
-	}
-
-	// Skip restore when beads directory is redirected (bd-lmqhe)
-	// When redirected, the beads directory is in a different repo, so
-	// git checkout from the current repo won't work for paths outside it.
-	redirectInfo := beads.GetRedirectInfo()
-	if redirectInfo.IsRedirected {
-		return nil
-	}
-
-	// Restore .beads/ from HEAD (current branch's committed state)
-	// Using -- to ensure .beads/ is treated as a path, not a branch name
-	cmd := exec.CommandContext(ctx, "git", "checkout", "HEAD", "--", beadsDir) //nolint:gosec // G204: beadsDir from FindBeadsDir(), not user input
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("git checkout failed: %w\n%s", err, output)
-	}
-	return nil
-}
-
-// gitHasUncommittedBeadsChanges checks if .beads/issues.jsonl has uncommitted changes.
-// This detects the failure mode where a previous sync exported but failed before commit.
-// Returns true if the JSONL file has staged or unstaged changes (M or A status).
-// GH#885: Pre-flight safety check to detect incomplete sync operations.
-// Also handles redirected beads directories (bd-arjb).
-func gitHasUncommittedBeadsChanges(ctx context.Context) (bool, error) {
-	beadsDir := beads.FindBeadsDir()
-	if beadsDir == "" {
-		return false, nil // No beads dir, nothing to check
-	}
-
-	jsonlPath := filepath.Join(beadsDir, "issues.jsonl")
-
-	// Check if beads directory is redirected (bd-arjb)
-	// When redirected, beadsDir points outside the current repo, so we need to
-	// run git commands from the directory containing the actual .beads/
-	redirectInfo := beads.GetRedirectInfo()
-	if redirectInfo.IsRedirected {
-		targetRepoDir := filepath.Dir(beadsDir)
-		cmd := exec.CommandContext(ctx, "git", "-C", targetRepoDir, "status", "--porcelain", jsonlPath) //nolint:gosec // G204: jsonlPath from internal beads.FindBeadsDir()
-		output, err := cmd.Output()
-		if err != nil {
-			return false, fmt.Errorf("git status failed: %w", err)
-		}
-		return parseGitStatusForBeadsChanges(string(output)), nil
-	}
-
-	// Check git status for the JSONL file specifically
-	cmd := exec.CommandContext(ctx, "git", "status", "--porcelain", jsonlPath) //nolint:gosec // G204: jsonlPath from internal beads.FindBeadsDir()
-	output, err := cmd.Output()
-	if err != nil {
-		return false, fmt.Errorf("git status failed: %w", err)
-	}
-
-	return parseGitStatusForBeadsChanges(string(output)), nil
-}
-
-// parseGitStatusForBeadsChanges parses git status --porcelain output and returns
-// true if the status indicates uncommitted changes (modified or added).
-// Format: XY filename where X=staged, Y=unstaged
-// M = modified, A = added, ? = untracked, D = deleted
-// Only M and A in either position indicate changes we care about.
-func parseGitStatusForBeadsChanges(statusOutput string) bool {
-	statusLine := strings.TrimSpace(statusOutput)
-	if statusLine == "" {
-		return false // No changes
-	}
-
-	// Any status (M, A, MM, AM, etc.) indicates uncommitted changes
-	if len(statusLine) >= 2 {
-		x, y := statusLine[0], statusLine[1]
-		// Check for modifications (staged or unstaged)
-		if x == 'M' || x == 'A' || y == 'M' || y == 'A' {
-			return true
-		}
-	}
-
-	return false
-}
-
-// getDefaultBranch returns the default branch name (main or master) for origin remote
-// Checks remote HEAD first, then falls back to checking if main/master exist
-func getDefaultBranch(ctx context.Context) string {
-	return getDefaultBranchForRemote(ctx, "origin")
-}
-
-// getDefaultBranchForRemote returns the default branch name for a specific remote
-// Checks remote HEAD first, then falls back to checking if main/master exist
-func getDefaultBranchForRemote(ctx context.Context, remote string) string {
-	// Try to get default branch from remote
-	cmd := exec.CommandContext(ctx, "git", "symbolic-ref", fmt.Sprintf("refs/remotes/%s/HEAD", remote)) //nolint:gosec // G204: remote from git config
-	output, err := cmd.Output()
-	if err == nil {
-		ref := strings.TrimSpace(string(output))
-		// Extract branch name from refs/remotes/<remote>/main
-		prefix := fmt.Sprintf("refs/remotes/%s/", remote)
-		if strings.HasPrefix(ref, prefix) {
-			return strings.TrimPrefix(ref, prefix)
-		}
-	}
-
-	// Fallback: check if <remote>/main exists
-	if exec.CommandContext(ctx, "git", "rev-parse", "--verify", fmt.Sprintf("%s/main", remote)).Run() == nil { //nolint:gosec // G204: remote from git config
-		return "main"
-	}
-
-	// Fallback: check if <remote>/master exists
-	if exec.CommandContext(ctx, "git", "rev-parse", "--verify", fmt.Sprintf("%s/master", remote)).Run() == nil { //nolint:gosec // G204: remote from git config
-		return "master"
-	}
-
-	// Default to main
-	return "main"
 }

@@ -1,3 +1,5 @@
+//go:build cgo
+
 package main
 
 import (
@@ -8,11 +10,13 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/steveyegge/beads/internal/linear"
+	"github.com/steveyegge/beads/internal/tracker"
 	"github.com/steveyegge/beads/internal/types"
 )
 
@@ -1095,150 +1099,7 @@ func TestFetchIssueByIdentifierSendsNumericFilter(t *testing.T) {
 	}
 }
 
-func TestDoPushToLinearPreferLocalForcesUpdate(t *testing.T) {
-	testStore, cleanup := setupTestDB(t)
-	defer cleanup()
-
-	ctx := context.Background()
-	if err := testStore.SetConfig(ctx, "linear.api_key", "test-api-key"); err != nil {
-		t.Fatalf("SetConfig linear.api_key failed: %v", err)
-	}
-	if err := testStore.SetConfig(ctx, "linear.team_id", "12345678-1234-1234-1234-123456789abc"); err != nil {
-		t.Fatalf("SetConfig linear.team_id failed: %v", err)
-	}
-
-	localUpdated := time.Now().Add(-2 * time.Hour)
-	issue := &types.Issue{
-		Title:       "Local Issue",
-		Description: "Local description",
-		Priority:    2,
-		IssueType:   types.TypeTask,
-		Status:      types.StatusInProgress,
-		CreatedAt:   localUpdated,
-		UpdatedAt:   localUpdated,
-	}
-	externalRef := "https://linear.app/team/issue/TEAM-123/local-issue"
-	issue.ExternalRef = &externalRef
-	if err := testStore.CreateIssue(ctx, issue, "test-actor"); err != nil {
-		t.Fatalf("CreateIssue failed: %v", err)
-	}
-
-	remoteUpdated := time.Now().Add(-1 * time.Hour)
-	remoteUpdatedStr := remoteUpdated.UTC().Format(time.RFC3339)
-
-	updatedCalled := false
-	origTransport := http.DefaultTransport
-	http.DefaultTransport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
-		body, err := io.ReadAll(r.Body)
-		if err != nil {
-			return nil, fmt.Errorf("read request body: %w", err)
-		}
-		_ = r.Body.Close()
-
-		var gqlReq linear.GraphQLRequest
-		if err := json.Unmarshal(body, &gqlReq); err != nil {
-			return nil, fmt.Errorf("decode request body: %w", err)
-		}
-
-		var resp struct {
-			Data   json.RawMessage `json:"data"`
-			Errors []interface{}   `json:"errors,omitempty"`
-		}
-		switch {
-		case strings.Contains(gqlReq.Query, "TeamStates"):
-			resp.Data = json.RawMessage(`{
-				"team": {
-					"id": "team-123",
-					"states": {
-						"nodes": [
-							{"id": "state-started", "name": "In Progress", "type": "started"}
-						]
-					}
-				}
-			}`)
-		case strings.Contains(gqlReq.Query, "IssueByIdentifier"):
-			resp.Data = json.RawMessage(fmt.Sprintf(`{
-				"issues": {
-					"nodes": [
-						{
-							"id": "uuid-123",
-							"identifier": "TEAM-123",
-							"title": "Remote Issue",
-							"description": "Remote description",
-							"url": "https://linear.app/team/issue/TEAM-123/remote-issue",
-							"priority": 2,
-							"state": {"id": "state-started", "name": "In Progress", "type": "started"},
-							"labels": {"nodes": []},
-							"createdAt": "2025-01-01T00:00:00Z",
-							"updatedAt": "%s"
-						}
-					]
-				}
-			}`, remoteUpdatedStr))
-		case strings.Contains(gqlReq.Query, "UpdateIssue"):
-			updatedCalled = true
-			resp.Data = json.RawMessage(`{
-				"issueUpdate": {
-					"success": true,
-					"issue": {
-						"id": "uuid-123",
-						"identifier": "TEAM-123",
-						"title": "Updated Title",
-						"description": "Updated description",
-						"url": "https://linear.app/team/issue/TEAM-123/remote-issue",
-						"priority": 2,
-						"state": {"id": "state-started", "name": "In Progress", "type": "started"},
-						"updatedAt": "2025-01-02T00:00:00Z"
-					}
-				}
-			}`)
-		default:
-			return nil, fmt.Errorf("unexpected query: %s", gqlReq.Query)
-		}
-
-		respBytes, err := json.Marshal(resp)
-		if err != nil {
-			return nil, fmt.Errorf("encode response: %w", err)
-		}
-
-		return &http.Response{
-			StatusCode: http.StatusOK,
-			Header:     http.Header{"Content-Type": []string{"application/json"}},
-			Body:       io.NopCloser(bytes.NewReader(respBytes)),
-			Request:    r,
-		}, nil
-	})
-	t.Cleanup(func() { http.DefaultTransport = origTransport })
-
-	origStore := store
-	origActor := actor
-	store = testStore
-	actor = "test-actor"
-	t.Cleanup(func() {
-		store = origStore
-		actor = origActor
-	})
-
-	forceUpdateIDs := map[string]bool{issue.ID: true}
-	stats, err := doPushToLinear(ctx, false, false, true, forceUpdateIDs, nil)
-	if err != nil {
-		t.Fatalf("doPushToLinear failed: %v", err)
-	}
-	if !updatedCalled {
-		t.Fatal("expected UpdateIssue to be called when force-update is enabled")
-	}
-	if stats.Updated != 1 {
-		t.Fatalf("expected Updated=1, got %d", stats.Updated)
-	}
-	if stats.Skipped != 0 {
-		t.Fatalf("expected Skipped=0, got %d", stats.Skipped)
-	}
-}
-
 func TestLinearClientFetchIssues(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping integration test in short mode")
-	}
 
 	// Create a mock GraphQL server
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1274,6 +1135,13 @@ func TestLinearClientFetchIssues(t *testing.T) {
 								"nodes": [
 									{"id": "label-1", "name": "bug"}
 								]
+							},
+							"projectMilestone": {
+								"id": "milestone-1",
+								"name": "M7: Team-Ready",
+								"description": "Team-ready milestone",
+								"progress": 60.61,
+								"targetDate": "2026-05-12"
 							},
 							"createdAt": "2025-01-15T10:00:00Z",
 							"updatedAt": "2025-01-16T10:00:00Z"
@@ -1334,12 +1202,12 @@ func TestLinearClientFetchIssues(t *testing.T) {
 	if issue1.State.Type != "started" {
 		t.Errorf("expected state type 'started', got %s", issue1.State.Type)
 	}
+	if issue1.ProjectMilestone == nil || issue1.ProjectMilestone.ID != "milestone-1" {
+		t.Fatalf("expected projectMilestone milestone-1, got %#v", issue1.ProjectMilestone)
+	}
 }
 
 func TestLinearClientCreateIssue(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping integration test in short mode")
-	}
 
 	// Create a mock GraphQL server for create mutation
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1390,9 +1258,6 @@ func TestLinearClientCreateIssue(t *testing.T) {
 }
 
 func TestLinearClientUpdateIssue(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping integration test in short mode")
-	}
 
 	// Create a mock GraphQL server for update mutation
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1449,9 +1314,6 @@ func TestLinearClientUpdateIssue(t *testing.T) {
 }
 
 func TestLinearClientGetTeamStates(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping integration test in short mode")
-	}
 
 	// Create a mock GraphQL server for team states query
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1506,9 +1368,6 @@ func TestLinearClientGetTeamStates(t *testing.T) {
 }
 
 func TestLinearClientRateLimitHandling(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping integration test in short mode")
-	}
 
 	// Create a mock server that returns 429 then succeeds
 	attempts := 0
@@ -1565,9 +1424,6 @@ func TestLinearClientRateLimitHandling(t *testing.T) {
 }
 
 func TestLinearClientGraphQLError(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping integration test in short mode")
-	}
 
 	// Create a mock server that returns a GraphQL error
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1764,9 +1620,6 @@ func TestBuildLinearToLocalUpdatesWithClosedAt(t *testing.T) {
 }
 
 func TestLinearClientFetchTeams(t *testing.T) {
-	if testing.Short() {
-		t.Skip("Skipping integration test in short mode")
-	}
 
 	// Create a mock GraphQL server for teams query
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1826,6 +1679,27 @@ func TestLinearClientFetchTeams(t *testing.T) {
 	// Check second team
 	if teams[1].Key != "PROD" {
 		t.Errorf("expected team key 'PROD', got %s", teams[1].Key)
+	}
+}
+
+func TestLinearConfigToEnvVar(t *testing.T) {
+	tests := []struct {
+		key  string
+		want string
+	}{
+		{"linear.api_key", "LINEAR_API_KEY"},
+		{"linear.team_id", "LINEAR_TEAM_ID"},
+		{"linear.team_ids", "LINEAR_TEAM_IDS"},
+		{"linear.unknown", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.key, func(t *testing.T) {
+			got := linearConfigToEnvVar(tt.key)
+			if got != tt.want {
+				t.Errorf("linearConfigToEnvVar(%q) = %q, want %q", tt.key, got, tt.want)
+			}
+		})
 	}
 }
 
@@ -1895,4 +1769,90 @@ func TestIsValidUUID(t *testing.T) {
 			}
 		})
 	}
+}
+
+// fakeLinearConfigReader is a test double for configReader that
+// returns values from an in-memory map. Unset keys return "" with no error
+// (matches storage.Storage's behavior for missing config keys).
+type fakeLinearConfigReader map[string]string
+
+func (f fakeLinearConfigReader) GetConfig(_ context.Context, key string) (string, error) {
+	return f[key], nil
+}
+
+// TestApplyLinearExcludeIDConfig covers the bd-ee0 config-read path that
+// wires linear.exclude_id_prefix / linear.exclude_id_patterns into
+// SyncOptions. The engine-side filter behavior (applying the rules to
+// individual issues) is tested by the TestEngineExcludeID* family in
+// internal/tracker/engine_test.go; this test exercises the cmd/bd surface.
+func TestApplyLinearExcludeIDConfig(t *testing.T) {
+	tests := []struct {
+		name         string
+		cfg          fakeLinearConfigReader
+		wantPrefix   string
+		wantPatterns []string
+	}{
+		{
+			name:         "both keys set",
+			cfg:          fakeLinearConfigReader{"linear.exclude_id_prefix": "hw-mol-", "linear.exclude_id_patterns": "-wisp-,sandbox-,scratch-"},
+			wantPrefix:   "hw-mol-",
+			wantPatterns: []string{"-wisp-", "sandbox-", "scratch-"},
+		},
+		{
+			name:         "prefix only",
+			cfg:          fakeLinearConfigReader{"linear.exclude_id_prefix": "hw-mol-"},
+			wantPrefix:   "hw-mol-",
+			wantPatterns: nil,
+		},
+		{
+			name:         "patterns only",
+			cfg:          fakeLinearConfigReader{"linear.exclude_id_patterns": "wisp-,sandbox-"},
+			wantPrefix:   "",
+			wantPatterns: []string{"wisp-", "sandbox-"},
+		},
+		{
+			name:         "patterns trimmed and empty entries skipped",
+			cfg:          fakeLinearConfigReader{"linear.exclude_id_patterns": "  a  , ,  b  ,"},
+			wantPrefix:   "",
+			wantPatterns: []string{"a", "b"},
+		},
+		{
+			name:         "prefix trimmed",
+			cfg:          fakeLinearConfigReader{"linear.exclude_id_prefix": "  hw-mol-  "},
+			wantPrefix:   "hw-mol-",
+			wantPatterns: nil,
+		},
+		{
+			name:         "neither key set is no-op",
+			cfg:          fakeLinearConfigReader{},
+			wantPrefix:   "",
+			wantPatterns: nil,
+		},
+		{
+			name:         "empty string values treated as unset",
+			cfg:          fakeLinearConfigReader{"linear.exclude_id_prefix": "", "linear.exclude_id_patterns": ""},
+			wantPrefix:   "",
+			wantPatterns: nil,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var opts tracker.SyncOptions
+			applyLinearExcludeIDConfig(context.Background(), tt.cfg, &opts)
+			if opts.ExcludeIDPrefix != tt.wantPrefix {
+				t.Errorf("ExcludeIDPrefix = %q, want %q", opts.ExcludeIDPrefix, tt.wantPrefix)
+			}
+			if !reflect.DeepEqual(opts.ExcludeIDPatterns, tt.wantPatterns) {
+				t.Errorf("ExcludeIDPatterns = %v, want %v", opts.ExcludeIDPatterns, tt.wantPatterns)
+			}
+		})
+	}
+}
+
+// TestApplyLinearExcludeIDConfig_NilSafe verifies the helper is safe to
+// call with nil reader or nil opts (defensive guards).
+func TestApplyLinearExcludeIDConfig_NilSafe(t *testing.T) {
+	var opts tracker.SyncOptions
+	applyLinearExcludeIDConfig(context.Background(), nil, &opts)                    // must not panic
+	applyLinearExcludeIDConfig(context.Background(), fakeLinearConfigReader{}, nil) // must not panic
 }

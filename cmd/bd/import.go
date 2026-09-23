@@ -2,799 +2,548 @@ package main
 
 import (
 	"bufio"
-	"bytes"
-	"cmp"
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/debug"
-	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/beads"
+	"github.com/steveyegge/beads/internal/config"
+	"github.com/steveyegge/beads/internal/metrics"
+	"github.com/steveyegge/beads/internal/storage/uow"
 	"github.com/steveyegge/beads/internal/types"
-	"github.com/steveyegge/beads/internal/utils"
-	"golang.org/x/term"
 )
 
 var importCmd = &cobra.Command{
-	Use:     "import",
-	GroupID: "sync",
-	Short:   "Import issues from JSONL format",
-	Long: `Import issues from JSON Lines format (one JSON object per line).
+	Use:   "import [file|-]",
+	Short: "Import issues from a JSONL file or stdin into the database",
+	Long: `Import issues from a JSONL file (newline-delimited JSON) into the database.
 
-Reads from stdin by default, or use -i flag for file input.
+If no file is specified, imports from the configured import.path under .beads/
+(default: issues.jsonl). Use "-" to read from stdin; redirecting stdin without
+"-" or a file argument is an error, so a typo'd 'bd import < file' cannot
+silently import the default file instead. This is the incremental counterpart to
+'bd export': new issues are created and existing issues are updated (upsert
+semantics).
 
-Behavior:
-  - Existing issues (same ID) are updated
-  - New issues are created
-  - Collisions (same ID, different content) are detected and reported
-  - Use --dedupe-after to find and merge content duplicates after import
-  - Use --dry-run to preview changes without applying them
+Memory records (lines with "_type":"memory") are automatically detected and
+imported as persistent memories (equivalent to 'bd remember'). This makes
+'bd export | bd import' a full round-trip for both issues and memories.
 
-NOTE: Import requires direct database access and does not work with daemon mode.
-      The command automatically uses --no-daemon when executed.`,
-	Run: func(cmd *cobra.Command, args []string) {
-		CheckReadonly("import")
-		// Check for positional arguments (common mistake: bd import file.jsonl instead of bd import -i file.jsonl)
-		if len(args) > 0 {
-			fmt.Fprintf(os.Stderr, "Error: Unexpected argument(s): %v\n\n", args)
-			fmt.Fprintf(os.Stderr, "Did you mean: bd import -i %s\n\n", args[0])
-			fmt.Fprintf(os.Stderr, "The import command does not accept positional arguments.\n")
-			fmt.Fprintf(os.Stderr, "Use the -i flag to specify an input file:\n")
-			fmt.Fprintf(os.Stderr, "  bd import -i .beads/issues.jsonl\n\n")
-			fmt.Fprintf(os.Stderr, "Or pipe data via stdin:\n")
-			fmt.Fprintf(os.Stderr, "  cat data.jsonl | bd import\n")
-			os.Exit(1)
-		}
+Each JSONL line should map to an issue. The importer accepts every field
+'bd export' emits — see 'bd export' output for the canonical schema. Only
+"title" is required; everything else is optional.
 
-		// Ensure database directory exists (auto-create if needed)
-		dbDir := filepath.Dir(dbPath)
-		if err := os.MkdirAll(dbDir, 0750); err != nil {
-			fmt.Fprintf(os.Stderr, "Error: failed to create database directory: %v\n", err)
-			os.Exit(1)
-		}
+Common fields:
+  title                  Required. Short summary.
+  description            Long-form body.
+  design, notes,         Additional content sections.
+    acceptance_criteria
+  issue_type             bug | feature | task | epic | chore | ...
+  priority               0-4 (0 = critical). 0 is preserved (no omitempty).
+  status                 open | in_progress | blocked | closed | ...
+                         (rows with status "tombstone" are skipped)
+  assignee, owner,       Ownership metadata.
+    created_by
+  labels                 Array of strings.
+  dependencies           Array of {issue_id, depends_on_id, type, ...}.
+  comments               Array of comment objects.
+  external_ref,          Cross-system identifiers (e.g. "gh-9").
+    source_system
+  due_at, defer_until    RFC3339 timestamps for scheduling.
+  metadata               Arbitrary JSON object preserved verbatim.
 
-		// Import requires direct database access due to complex transaction handling
-		// and collision detection. Force direct mode regardless of daemon state.
-		//
-		// NOTE: We only close the daemon client connection here, not stop the daemon
-		// process. This is because import may be called as a subprocess from sync,
-		// and stopping the daemon would break the parent sync's connection.
-		// The daemon-stale-DB issue is addressed separately by
-		// having sync use --no-daemon mode for consistency.
-		if daemonClient != nil {
-			debug.Logf("Debug: import command forcing direct mode (closes daemon connection)\n")
-			_ = daemonClient.Close()
-			daemonClient = nil
+Timestamps (created_at, updated_at, started_at, closed_at) are preserved
+when present in the JSONL and otherwise filled in by the importer. The
+legacy "wisp" boolean is accepted as an alias for "ephemeral".
 
-			var err error
-			store, err = sqlite.New(rootCtx, dbPath)
-			if err != nil {
-				// Check for fresh clone scenario
-				beadsDir := filepath.Dir(dbPath)
-				if handleFreshCloneError(err, beadsDir) {
-					os.Exit(1)
-				}
-				fmt.Fprintf(os.Stderr, "Error: failed to open database: %v\n", err)
-				os.Exit(1)
-			}
-			defer func() { _ = store.Close() }()
-		}
+By default a row only rewrites an existing local issue when its
+updated_at is strictly newer. Older rows are skipped (reported as
+stale_skipped_ids) and rows with the same updated_at keep every local
+column — updated_at has second granularity, so a timestamp tie can be
+two distinct same-second updates, and the local row wins the tie
+(reported as tie_kept_local_ids; the row's labels/comments/dependencies
+still merge). The guard is also enforced inside the upsert itself, so a
+local update that lands while the import is running is preserved rather
+than overwritten. Existing issues that the import did rewrite are listed
+with a field-level summary (updated_issues), so local state changed by
+an import is visible. To deliberately restore an older snapshot, pass
+--allow-stale, which imports every row even when it overwrites newer
+local state.
 
-		// We'll check if database needs initialization after reading the JSONL
-		// so we can detect the prefix from the imported issues
+Large imports are written in bounded transactions (a few hundred issues
+each, with a short pause between commits) with progress on stderr, so
+concurrent bd commands keep working while the import runs instead of
+stalling on one batch-wide write lock. Rows land in dependency order
+with their blocking edges in the same transaction, so a half-finished
+import never shows a blocked issue as ready. If an import fails partway,
+the already-committed chunks are durable and the command exits nonzero;
+re-running the same import is safe and converges (rows upsert,
+labels/comments/dependencies deduplicate).
 
-		input, _ := cmd.Flags().GetString("input")
-		skipUpdate, _ := cmd.Flags().GetBool("skip-existing")
-		strict, _ := cmd.Flags().GetBool("strict")
-		dryRun, _ := cmd.Flags().GetBool("dry-run")
-		renameOnImport, _ := cmd.Flags().GetBool("rename-on-import")
-		dedupeAfter, _ := cmd.Flags().GetBool("dedupe-after")
-		clearDuplicateExternalRefs, _ := cmd.Flags().GetBool("clear-duplicate-external-refs")
-		orphanHandling, _ := cmd.Flags().GetString("orphan-handling")
-		force, _ := cmd.Flags().GetBool("force")
-		protectLeftSnapshot, _ := cmd.Flags().GetBool("protect-left-snapshot")
-		noGitHistory, _ := cmd.Flags().GetBool("no-git-history")
-		_ = noGitHistory // Accepted for compatibility with bd sync subprocess calls
-
-		// Check if stdin is being used interactively (not piped)
-		if input == "" && term.IsTerminal(int(os.Stdin.Fd())) {
-			fmt.Fprintf(os.Stderr, "Error: No input specified.\n\n")
-			fmt.Fprintf(os.Stderr, "Usage:\n")
-			fmt.Fprintf(os.Stderr, "  bd import -i .beads/issues.jsonl          # Import from file\n")
-			fmt.Fprintf(os.Stderr, "  bd import -i .beads/issues.jsonl --dry-run # Preview changes\n")
-			fmt.Fprintf(os.Stderr, "  cat data.jsonl | bd import               # Import from pipe\n")
-			fmt.Fprintf(os.Stderr, "  bd sync --import-only                    # Import latest JSONL\n\n")
-			fmt.Fprintf(os.Stderr, "For more information, run: bd import --help\n")
-			os.Exit(1)
-		}
-
-		// Open input
-		in := os.Stdin
-		if input != "" {
-			// #nosec G304 - user-provided file path is intentional
-			f, err := os.Open(input)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error opening input file: %v\n", err)
-				os.Exit(1)
-			}
-			defer func() {
-				if err := f.Close(); err != nil {
-					fmt.Fprintf(os.Stderr, "Warning: failed to close input file: %v\n", err)
-				}
-			}()
-			in = f
-		}
-
-		// Phase 1: Read and parse all JSONL
-		ctx := rootCtx
-		scanner := bufio.NewScanner(in)
-
-		var allIssues []*types.Issue
-		lineNum := 0
-
-		for scanner.Scan() {
-			lineNum++
-			rawLine := scanner.Bytes()
-			line := string(rawLine)
-
-			// Skip empty lines
-			if line == "" {
-				continue
-			}
-
-			// Detect git conflict markers in raw bytes (before JSON decoding)
-			// This prevents false positives when issue content contains these strings
-			trimmed := bytes.TrimSpace(rawLine)
-			if bytes.HasPrefix(trimmed, []byte("<<<<<<< ")) ||
-				bytes.Equal(trimmed, []byte("=======")) ||
-				bytes.HasPrefix(trimmed, []byte(">>>>>>> ")) {
-				fmt.Fprintf(os.Stderr, "Git conflict markers detected in JSONL file (line %d)\n", lineNum)
-				fmt.Fprintf(os.Stderr, "→ Attempting automatic 3-way merge...\n\n")
-
-				// Attempt automatic merge using bd merge command
-				if err := attemptAutoMerge(input); err != nil {
-					fmt.Fprintf(os.Stderr, "Error: Automatic merge failed: %v\n\n", err)
-					fmt.Fprintf(os.Stderr, "To resolve manually:\n")
-					fmt.Fprintf(os.Stderr, "  git checkout --ours .beads/issues.jsonl && bd import -i .beads/issues.jsonl\n")
-					fmt.Fprintf(os.Stderr, "  git checkout --theirs .beads/issues.jsonl && bd import -i .beads/issues.jsonl\n\n")
-					fmt.Fprintf(os.Stderr, "For advanced field-level merging, see: https://github.com/neongreen/mono/tree/main/beads-merge\n")
-					os.Exit(1)
-				}
-
-				fmt.Fprintf(os.Stderr, "✓ Automatic merge successful\n")
-				fmt.Fprintf(os.Stderr, "→ Restarting import with merged JSONL...\n\n")
-
-				// Re-open the input file to read the merged content
-				if input != "" {
-					// Close current file handle
-					if in != os.Stdin {
-						_ = in.Close()
-					}
-
-					// Re-open the merged file
-					// #nosec G304 - user-provided file path is intentional
-					f, err := os.Open(input)
-					if err != nil {
-						fmt.Fprintf(os.Stderr, "Error reopening merged file: %v\n", err)
-						os.Exit(1)
-					}
-					defer func() {
-						if err := f.Close(); err != nil {
-							fmt.Fprintf(os.Stderr, "Warning: failed to close input file: %v\n", err)
-						}
-					}()
-					in = f
-					scanner = bufio.NewScanner(in)
-					allIssues = nil // Reset issues list
-					lineNum = 0     // Reset line counter
-					continue        // Restart parsing from beginning
-				} else {
-					// Can't retry stdin - should not happen since git conflicts only in files
-					fmt.Fprintf(os.Stderr, "Error: Cannot retry merge from stdin\n")
-					os.Exit(1)
-				}
-			}
-
-			// Parse JSON
-			var issue types.Issue
-			if err := json.Unmarshal([]byte(line), &issue); err != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing line %d: %v\n", lineNum, err)
-				os.Exit(1)
-			}
-			issue.SetDefaults() // Apply defaults for omitted fields (beads-399)
-
-			allIssues = append(allIssues, &issue)
-		}
-
-		if err := scanner.Err(); err != nil {
-			fmt.Fprintf(os.Stderr, "Error reading input: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Check if database needs initialization (prefix not set)
-		// Detect prefix from the imported issues
-		initCtx := rootCtx
-		configuredPrefix, err2 := store.GetConfig(initCtx, "issue_prefix")
-		if err2 != nil || strings.TrimSpace(configuredPrefix) == "" {
-			// Database exists but not initialized - detect prefix from issues
-			detectedPrefix := detectPrefixFromIssues(allIssues)
-			prefixSource := "issues"
-			if detectedPrefix == "" {
-				// No issues to import or couldn't detect prefix, use directory name
-				// But avoid using ".beads" as prefix - go up one level
-				cwd, err := os.Getwd()
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Error: failed to get current directory: %v\n", err)
-					os.Exit(1)
-				}
-				dirName := filepath.Base(cwd)
-				if dirName == ".beads" || dirName == "beads" {
-					// Running from inside .beads/ - use parent directory
-					detectedPrefix = filepath.Base(filepath.Dir(cwd))
-				} else {
-					detectedPrefix = dirName
-				}
-				prefixSource = "directory"
-			}
-			detectedPrefix = strings.TrimRight(detectedPrefix, "-")
-
-			if err := store.SetConfig(initCtx, "issue_prefix", detectedPrefix); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: failed to set issue prefix: %v\n", err)
-				os.Exit(1)
-			}
-
-			fmt.Fprintf(os.Stderr, "✓ Initialized database with prefix '%s' (detected from %s)\n", detectedPrefix, prefixSource)
-		}
-
-		// Phase 2: Use shared import logic
-		opts := ImportOptions{
-			DryRun:                     dryRun,
-			SkipUpdate:                 skipUpdate,
-			Strict:                     strict,
-			RenameOnImport:             renameOnImport,
-			ClearDuplicateExternalRefs: clearDuplicateExternalRefs,
-			OrphanHandling:             orphanHandling,
-		}
-
-		// If --protect-left-snapshot is set, read the left snapshot and build timestamp map
-		// GH#865: Use timestamp-aware protection - only protect if local is newer than incoming
-		if protectLeftSnapshot && input != "" {
-			beadsDir := filepath.Dir(input)
-			leftSnapshotPath := filepath.Join(beadsDir, "beads.left.jsonl")
-			if _, err := os.Stat(leftSnapshotPath); err == nil {
-				sm := NewSnapshotManager(input)
-				leftTimestamps, err := sm.BuildIDToTimestampMap(leftSnapshotPath)
-				if err != nil {
-					fmt.Fprintf(os.Stderr, "Warning: failed to read left snapshot: %v\n", err)
-				} else if len(leftTimestamps) > 0 {
-					opts.ProtectLocalExportIDs = leftTimestamps
-					fmt.Fprintf(os.Stderr, "Protecting %d issue(s) from left snapshot (timestamp-aware)\n", len(leftTimestamps))
-				}
-			}
-		}
-
-		result, err := importIssuesCore(ctx, dbPath, store, allIssues, opts)
-
-		// Check for uncommitted changes in JSONL after import
-		// Only check if we have an input file path (not stdin) and it's the default beads file
-		if result != nil && input != "" && (input == ".beads/issues.jsonl" || input == ".beads/beads.jsonl") {
-			checkUncommittedChanges(input, result)
-		}
-
-		// Handle errors and special cases
-		if err != nil {
-			// Check if it's a prefix mismatch error
-			if result != nil && result.PrefixMismatch {
-				fmt.Fprintf(os.Stderr, "\n=== Prefix Mismatch Detected ===\n")
-				fmt.Fprintf(os.Stderr, "Database configured prefix: %s-\n", result.ExpectedPrefix)
-				fmt.Fprintf(os.Stderr, "Found issues with different prefixes:\n")
-				for prefix, count := range result.MismatchPrefixes {
-					fmt.Fprintf(os.Stderr, "  %s- (%d issues)\n", prefix, count)
-				}
-				fmt.Fprintf(os.Stderr, "\nOptions:\n")
-				fmt.Fprintf(os.Stderr, "  --rename-on-import    Auto-rename imported issues to match configured prefix\n")
-				fmt.Fprintf(os.Stderr, "  --dry-run             Preview what would be imported\n")
-				fmt.Fprintf(os.Stderr, "\nOr use 'bd rename-prefix' after import to fix the database.\n")
-				os.Exit(1)
-			}
-
-			// Check if it's a collision error
-			if result != nil && len(result.CollisionIDs) > 0 {
-				// Print collision report before exiting
-				fmt.Fprintf(os.Stderr, "\n=== Collision Detection Report ===\n")
-				fmt.Fprintf(os.Stderr, "COLLISIONS DETECTED: %d\n\n", result.Collisions)
-				fmt.Fprintf(os.Stderr, "Colliding issue IDs: %v\n", result.CollisionIDs)
-				fmt.Fprintf(os.Stderr, "\nWith hash-based IDs, collisions should not occur.\n")
-				fmt.Fprintf(os.Stderr, "This may indicate manual ID manipulation or a bug.\n")
-				os.Exit(1)
-			}
-			fmt.Fprintf(os.Stderr, "Import failed: %v\n", err)
-			os.Exit(1)
-		}
-
-		// Handle dry-run mode
-		if dryRun {
-			if result.PrefixMismatch {
-				fmt.Fprintf(os.Stderr, "\n=== Prefix Mismatch Detected ===\n")
-				fmt.Fprintf(os.Stderr, "Database configured prefix: %s-\n", result.ExpectedPrefix)
-				fmt.Fprintf(os.Stderr, "Found issues with different prefixes:\n")
-				for prefix, count := range result.MismatchPrefixes {
-					fmt.Fprintf(os.Stderr, "  %s- (%d issues)\n", prefix, count)
-				}
-				fmt.Fprintf(os.Stderr, "\nUse --rename-on-import to automatically fix prefixes during import.\n")
-			}
-
-			if result.Collisions > 0 {
-				fmt.Fprintf(os.Stderr, "\n=== Collision Detection Report ===\n")
-				fmt.Fprintf(os.Stderr, "COLLISIONS DETECTED: %d\n", result.Collisions)
-				fmt.Fprintf(os.Stderr, "Colliding issue IDs: %v\n", result.CollisionIDs)
-			} else if !result.PrefixMismatch {
-				fmt.Fprintf(os.Stderr, "No collisions detected.\n")
-			}
-			msg := fmt.Sprintf("Would create %d new issues, update %d existing issues", result.Created, result.Updated)
-			if result.Unchanged > 0 {
-				msg += fmt.Sprintf(", %d unchanged", result.Unchanged)
-			}
-			fmt.Fprintf(os.Stderr, "%s\n", msg)
-			fmt.Fprintf(os.Stderr, "\nDry-run mode: no changes made\n")
-			os.Exit(0)
-		}
-
-		// Print remapping report if collisions were resolved
-		if len(result.IDMapping) > 0 {
-			fmt.Fprintf(os.Stderr, "\n=== Remapping Report ===\n")
-			fmt.Fprintf(os.Stderr, "Issues remapped: %d\n\n", len(result.IDMapping))
-
-			// Sort by old ID for consistent output
-			type mapping struct {
-				oldID string
-				newID string
-			}
-			mappings := make([]mapping, 0, len(result.IDMapping))
-			for oldID, newID := range result.IDMapping {
-				mappings = append(mappings, mapping{oldID, newID})
-			}
-			slices.SortFunc(mappings, func(a, b mapping) int {
-				return cmp.Compare(a.oldID, b.oldID)
-			})
-
-			fmt.Fprintf(os.Stderr, "Remappings:\n")
-			for _, m := range mappings {
-				fmt.Fprintf(os.Stderr, "  %s → %s\n", m.oldID, m.newID)
-			}
-			fmt.Fprintf(os.Stderr, "\nAll text and dependency references have been updated.\n")
-		}
-
-		// Flush immediately after import (no debounce) to ensure daemon sees changes
-		// Without this, daemon FileWatcher won't detect the import for up to 30s
-		// Only flush if there were actual changes to avoid unnecessary I/O
-		if result.Created > 0 || result.Updated > 0 || len(result.IDMapping) > 0 {
-			flushToJSONLWithState(flushState{forceDirty: true})
-		}
-
-		// Update jsonl_content_hash metadata to enable content-based staleness detection
-		// This prevents git operations from resurrecting deleted issues by comparing content instead of mtime
-		// ALWAYS update metadata after successful import, even if no changes were made (fixes staleness check)
-		// This ensures that running `bd import` marks the database as fresh for staleness detection
-		// Renamed from last_import_hash - more accurate since updated on both import AND export
-		if input != "" {
-			if currentHash, err := computeJSONLHash(input); err == nil {
-				if err := store.SetMetadata(ctx, "jsonl_content_hash", currentHash); err != nil {
-					// Non-fatal warning: Metadata update failures are intentionally non-fatal to prevent blocking
-					// successful imports. System degrades gracefully to mtime-based staleness detection if metadata
-					// is unavailable. This ensures import operations always succeed even if metadata storage fails.
-					debug.Logf("Warning: failed to update jsonl_content_hash: %v", err)
-				}
-				// Also update jsonl_file_hash to prevent integrity check warnings
-				// validateJSONLIntegrity() compares this hash against actual JSONL content.
-				// Without this, sync that imports but skips re-export leaves jsonl_file_hash stale,
-				// causing spurious "hash mismatch" warnings on subsequent operations.
-				if err := store.SetJSONLFileHash(ctx, currentHash); err != nil {
-					debug.Logf("Warning: failed to update jsonl_file_hash: %v", err)
-				}
-				// Use RFC3339Nano for nanosecond precision to avoid race with file mtime (fixes #399)
-				importTime := time.Now().Format(time.RFC3339Nano)
-				if err := store.SetMetadata(ctx, "last_import_time", importTime); err != nil {
-					// Non-fatal warning (see above comment about graceful degradation)
-					debug.Logf("Warning: failed to update last_import_time: %v", err)
-				}
-				// Note: mtime tracking removed in bd-v0y fix (git doesn't preserve mtime)
-			} else {
-				debug.Logf("Warning: failed to read JSONL for hash update: %v", err)
-			}
-		}
-
-		// Update database mtime to reflect it's now in sync with JSONL
-		// This is CRITICAL even when import found 0 changes, because:
-		// 1. Import validates DB and JSONL are in sync (no content divergence)
-		// 2. Without mtime update, bd sync refuses to export (thinks JSONL is newer)
-		// 3. This can happen after git pull updates JSONL mtime but content is identical
-		// Fix for: refusing to export: JSONL is newer than database (import first to avoid data loss)
-		if err := TouchDatabaseFile(dbPath, input); err != nil {
-			debug.Logf("Warning: failed to update database mtime: %v", err)
-		}
-
-		// Print summary
-		fmt.Fprintf(os.Stderr, "Import complete: %d created, %d updated", result.Created, result.Updated)
-		if result.Unchanged > 0 {
-			fmt.Fprintf(os.Stderr, ", %d unchanged", result.Unchanged)
-		}
-		if result.Skipped > 0 {
-			fmt.Fprintf(os.Stderr, ", %d skipped", result.Skipped)
-		}
-		if len(result.IDMapping) > 0 {
-			fmt.Fprintf(os.Stderr, ", %d issues remapped", len(result.IDMapping))
-		}
-		fmt.Fprintf(os.Stderr, "\n")
-
-		// Print skipped dependencies summary if any
-		if len(result.SkippedDependencies) > 0 {
-			fmt.Fprintf(os.Stderr, "\n⚠️  Warning: Skipped %d dependencies due to missing references:\n", len(result.SkippedDependencies))
-			for _, dep := range result.SkippedDependencies {
-				fmt.Fprintf(os.Stderr, "  - %s\n", dep)
-			}
-			fmt.Fprintf(os.Stderr, "\nThis can happen after merges that delete issues referenced by other issues.\n")
-			fmt.Fprintf(os.Stderr, "The import continued successfully - you may want to review the skipped dependencies.\n")
-		}
-
-		// Print force message if metadata was updated despite no changes
-		if force && result.Created == 0 && result.Updated == 0 && len(result.IDMapping) == 0 {
-			fmt.Fprintf(os.Stderr, "Metadata updated (database already in sync with JSONL)\n")
-		}
-
-		// Run duplicate detection if requested
-		if dedupeAfter {
-			fmt.Fprintf(os.Stderr, "\n=== Post-Import Duplicate Detection ===\n")
-
-			// Get all issues (fresh after import)
-			allIssues, err := store.SearchIssues(ctx, "", types.IssueFilter{})
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error fetching issues for deduplication: %v\n", err)
-				os.Exit(1)
-			}
-
-			duplicateGroups := findDuplicateGroups(allIssues)
-			if len(duplicateGroups) == 0 {
-				fmt.Fprintf(os.Stderr, "No duplicates found.\n")
-				return
-			}
-
-			refCounts := countReferences(allIssues)
-			structuralScores := countStructuralRelationships(duplicateGroups)
-
-			fmt.Fprintf(os.Stderr, "Found %d duplicate group(s)\n\n", len(duplicateGroups))
-
-			for i, group := range duplicateGroups {
-				target := chooseMergeTarget(group, refCounts, structuralScores)
-				fmt.Fprintf(os.Stderr, "Group %d: %s\n", i+1, group[0].Title)
-
-				for _, issue := range group {
-					refs := refCounts[issue.ID]
-					depCount := 0
-					if score, ok := structuralScores[issue.ID]; ok {
-						depCount = score.dependentCount
-					}
-					marker := "  "
-					if issue.ID == target.ID {
-						marker = "→ "
-					}
-					fmt.Fprintf(os.Stderr, "  %s%s (%s, P%d, %d dependents, %d refs)\n",
-						marker, issue.ID, issue.Status, issue.Priority, depCount, refs)
-				}
-
-				sources := make([]string, 0, len(group)-1)
-				for _, issue := range group {
-					if issue.ID != target.ID {
-						sources = append(sources, issue.ID)
-					}
-				}
-				fmt.Fprintf(os.Stderr, "  Suggested: bd merge %s --into %s\n\n",
-					strings.Join(sources, " "), target.ID)
-			}
-
-			fmt.Fprintf(os.Stderr, "Run 'bd duplicates --auto-merge' to merge all duplicates.\n")
-		}
-	},
+EXAMPLES:
+  bd import                        # Import from configured import.path
+  bd import backup.jsonl           # Import from a specific file
+  bd import -i backup.jsonl        # Legacy alias for a specific file
+  bd import -                      # Read JSONL from stdin
+  cat issues.jsonl | bd import -   # Pipe JSONL from another tool
+  bd import --dry-run              # Show what would be imported
+  bd import --dedup                # Skip issues with duplicate titles
+  bd import --allow-stale old.jsonl # Restore an older snapshot (overwrites newer local rows)
+  bd import --json                 # Structured output with created and skipped IDs`,
+	GroupID:       "sync",
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE:          runImport,
 }
 
-// TouchDatabaseFile updates the modification time of the database file.
-// This is used after import AND export to ensure the database appears "in sync" with JSONL,
-// preventing bd doctor and validatePreExport from incorrectly warning that JSONL is newer.
-//
-// In SQLite WAL mode, writes go to beads.db-wal and beads.db mtime may not update
-// until a checkpoint. Since validation compares JSONL mtime to beads.db mtime only,
-// we need to explicitly touch the DB file after both import and export operations.
-//
-// The function sets DB mtime to max(JSONL mtime, now) + 1ns to handle clock skew.
-// If jsonlPath is empty or can't be read, falls back to time.Now().
-//
-// Fixes issues #278, #301, #321: daemon export leaving JSONL newer than DB.
-func TouchDatabaseFile(dbPath, jsonlPath string) error {
-	targetTime := time.Now()
+var (
+	importDryRun     bool
+	importDedup      bool
+	importAllowStale bool
+	importInput      string
+)
 
-	// If we have the JSONL path, use max(JSONL mtime, now) to handle clock skew
-	// Use Lstat to get the symlink's own mtime, not the target's (NixOS fix).
-	if jsonlPath != "" {
-		if info, err := os.Lstat(jsonlPath); err == nil {
-			jsonlTime := info.ModTime()
-			if jsonlTime.After(targetTime) {
-				targetTime = jsonlTime.Add(time.Nanosecond)
-			}
+func init() {
+	importCmd.Flags().StringVarP(&importInput, "input", "i", "", "Read JSONL from a specific file")
+	importCmd.Flags().BoolVar(&importDryRun, "dry-run", false, "Show what would be imported without importing")
+	importCmd.Flags().BoolVar(&importDedup, "dedup", false, "Skip lines whose title matches an existing open issue")
+	importCmd.Flags().BoolVar(&importAllowStale, "allow-stale", false, "Import rows even when older than the local issue (required to restore an older snapshot)")
+	rootCmd.AddCommand(importCmd)
+}
+
+// importPoolReadTimeout is the per-I/O read deadline a `bd import` gets on
+// its shared-pool connections when neither the caller, BEADS_DOLT_POOL_READ_TIMEOUT
+// nor dolt.pool-read-timeout set one. The pool default (10s) is a fast-fail
+// tuned for interactive commands; an import's chunk COMMIT of 250 rows with
+// their aux tables legitimately outlives it whenever the server pauses — a
+// stock dolt sql-server's auto_gc took 16.5s mid-import in the wy-9we0jf
+// rollback drill, and every such pause surfaced as "i/o timeout" followed by
+// "write commit result indeterminate" (wy-sbgucn). 5m matches the repo's
+// other known-long operations (execWithLongTimeout, withReadTxLongTimeout).
+const importPoolReadTimeout = 5 * time.Minute
+
+// bulkLoadPoolReadTimeout returns the pool read-timeout fallback for cmd: the
+// bulk-load deadline for `bd import`, zero (keep the pool default) otherwise.
+// It is a FALLBACK, not an override — an operator's explicit setting still wins
+// (see dolt.Config.PoolReadTimeoutFallback).
+func bulkLoadPoolReadTimeout(cmd *cobra.Command) time.Duration {
+	if cmd != nil && cmd.Name() == "import" {
+		return importPoolReadTimeout
+	}
+	return 0
+}
+
+func runImport(cmd *cobra.Command, args []string) error {
+	// Explicit call, not inherited from CheckReadonly: runImport doesn't call
+	// CheckReadonly at all (a separate, pre-existing gap — readonlyMode
+	// doesn't gate bd import either), so it can't pick up the freeze check
+	// folded into CheckReadonly the way create/update/close/remember do.
+	// The path that makes this call load-bearing rather than redundant is
+	// `bd import --dry-run`: a preview sets useReadOnly, so it skips the early
+	// gate in PersistentPreRunE, and runImport is the only chokepoint left.
+	// Plain `bd import` is already stopped by that early gate.
+	if err := migrationFreezeGateFor(cmd, "import"); err != nil {
+		return err
+	}
+
+	evt := metrics.NewCommandEvent("import")
+	defer func() {
+		if c := metrics.Global(); c != nil {
+			c.CloseEventAndAdd(evt)
 		}
-	}
+	}()
 
-	// Best-effort touch - don't fail import if this doesn't work
-	return os.Chtimes(dbPath, targetTime, targetTime)
-}
-
-// checkUncommittedChanges detects if the JSONL file has uncommitted changes
-// and warns the user if the working tree differs from git HEAD
-func checkUncommittedChanges(filePath string, result *ImportResult) {
-	// Only warn if no actual changes were made (database already synced)
-	if result.Created > 0 || result.Updated > 0 {
-		return
-	}
-
-	// Get the directory containing the file to use as git working directory
-	workDir := filepath.Dir(filePath)
-
-	// Use git diff to check if working tree differs from HEAD
-	cmd := fmt.Sprintf("git diff --quiet HEAD %s", filePath)
-	exitCode, _ := runGitCommand(cmd, workDir)
-
-	// Exit code 0 = no changes, 1 = changes exist, >1 = error
-	if exitCode == 1 {
-		// Get line counts for context
-		workingTreeLines := countLines(filePath)
-		headLines := countLinesInGitHEAD(filePath, workDir)
-		
-		fmt.Fprintf(os.Stderr, "\n⚠️  Warning: %s has uncommitted changes\n", filePath)
-		fmt.Fprintf(os.Stderr, "   Working tree: %d lines\n", workingTreeLines)
-		if headLines > 0 {
-			fmt.Fprintf(os.Stderr, "   Git HEAD: %d lines\n", headLines)
+	if err := runImportInner(args); err != nil {
+		if _, isExit := err.(*exitError); isExit {
+			return err
 		}
-		fmt.Fprintf(os.Stderr, "\n   Import complete: database already synced with working tree\n")
-		fmt.Fprintf(os.Stderr, "   Run: git diff %s\n", filePath)
-		fmt.Fprintf(os.Stderr, "   To review uncommitted changes\n")
+		return HandleErrorRespectJSON("%v", err)
 	}
-}
-
-// runGitCommand executes a git command and returns exit code and output
-// workDir is the directory to run the command in (empty = current dir)
-func runGitCommand(cmd string, workDir string) (int, string) {
-	// #nosec G204 - command is constructed internally
-	gitCmd := exec.Command("sh", "-c", cmd)
-	if workDir != "" {
-		gitCmd.Dir = workDir
-	}
-	output, err := gitCmd.CombinedOutput()
-	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return exitErr.ExitCode(), string(output)
-		}
-		return -1, string(output)
-	}
-	return 0, string(output)
-}
-
-// countLines counts the number of lines in a file
-func countLines(filePath string) int {
-	// #nosec G304 - file path is controlled by caller
-	f, err := os.Open(filePath)
-	if err != nil {
-		return 0
-	}
-	defer func() { _ = f.Close() }()
-
-	scanner := bufio.NewScanner(f)
-	lines := 0
-	for scanner.Scan() {
-		lines++
-	}
-	return lines
-}
-
-// countLinesInGitHEAD counts lines in the file as it exists in git HEAD
-func countLinesInGitHEAD(filePath string, workDir string) int {
-	// First, find the git root
-	findRootCmd := "git rev-parse --show-toplevel 2>/dev/null"
-	exitCode, gitRootOutput := runGitCommand(findRootCmd, workDir)
-	if exitCode != 0 {
-		return 0
-	}
-	gitRoot := strings.TrimSpace(gitRootOutput)
-
-	// Make filePath relative to git root
-	absPath, err := filepath.Abs(filePath)
-	if err != nil {
-		return 0
-	}
-
-	relPath, err := filepath.Rel(gitRoot, absPath)
-	if err != nil {
-		return 0
-	}
-
-	cmd := fmt.Sprintf("git show HEAD:%s 2>/dev/null | wc -l", relPath)
-	exitCode, output := runGitCommand(cmd, workDir)
-	if exitCode != 0 {
-		return 0
-	}
-
-	var lines int
-	_, err = fmt.Sscanf(strings.TrimSpace(output), "%d", &lines)
-	if err != nil {
-		return 0
-	}
-	return lines
-}
-
-// attemptAutoMerge attempts to resolve git conflicts using bd merge 3-way merge
-func attemptAutoMerge(conflictedPath string) error {
-	// Validate inputs
-	if conflictedPath == "" {
-		return fmt.Errorf("no file path provided for merge")
-	}
-
-	// Get git repository root
-	gitRootCmd := exec.Command("git", "rev-parse", "--show-toplevel") // #nosec G204 -- fixed git invocation for repo root discovery
-	gitRootOutput, err := gitRootCmd.Output()
-	if err != nil {
-		return fmt.Errorf("not in a git repository: %w", err)
-	}
-	gitRoot := strings.TrimSpace(string(gitRootOutput))
-
-	// Convert conflicted path to absolute path relative to git root
-	absConflictedPath := conflictedPath
-	if !filepath.IsAbs(conflictedPath) {
-		absConflictedPath = filepath.Join(gitRoot, conflictedPath)
-	}
-
-	// Get base (merge-base), left (ours/HEAD), and right (theirs/MERGE_HEAD) versions
-	// These are the three inputs needed for 3-way merge
-
-	// Extract relative path from git root for git commands
-	relPath, err := filepath.Rel(gitRoot, absConflictedPath)
-	if err != nil {
-		relPath = conflictedPath
-	}
-
-	// Create temp directory for merge artifacts
-	tmpDir, err := os.MkdirTemp("", "bd-merge-*")
-	if err != nil {
-		return fmt.Errorf("failed to create temp directory: %w", err)
-	}
-	defer func() { _ = os.RemoveAll(tmpDir) }()
-
-	basePath := filepath.Join(tmpDir, "base.jsonl")
-	leftPath := filepath.Join(tmpDir, "left.jsonl")
-	rightPath := filepath.Join(tmpDir, "right.jsonl")
-	outputPath := filepath.Join(tmpDir, "merged.jsonl")
-
-	// Extract base version (merge-base)
-	baseCmd := exec.Command("git", "show", fmt.Sprintf(":1:%s", relPath)) // #nosec G204 -- relPath limited to files tracked in current repo
-	baseCmd.Dir = gitRoot
-	baseContent, err := baseCmd.Output()
-	if err != nil {
-		// Stage 1 might not exist if file was added in both branches
-		// Create empty base in this case
-		baseContent = []byte{}
-	}
-	if err := os.WriteFile(basePath, baseContent, 0600); err != nil {
-		return fmt.Errorf("failed to write base version: %w", err)
-	}
-
-	// Extract left version (ours/HEAD)
-	leftCmd := exec.Command("git", "show", fmt.Sprintf(":2:%s", relPath)) // #nosec G204 -- relPath limited to files tracked in current repo
-	leftCmd.Dir = gitRoot
-	leftContent, err := leftCmd.Output()
-	if err != nil {
-		return fmt.Errorf("failed to extract 'ours' version: %w", err)
-	}
-	if err := os.WriteFile(leftPath, leftContent, 0600); err != nil {
-		return fmt.Errorf("failed to write left version: %w", err)
-	}
-
-	// Extract right version (theirs/MERGE_HEAD)
-	rightCmd := exec.Command("git", "show", fmt.Sprintf(":3:%s", relPath)) // #nosec G204 -- relPath limited to files tracked in current repo
-	rightCmd.Dir = gitRoot
-	rightContent, err := rightCmd.Output()
-	if err != nil {
-		return fmt.Errorf("failed to extract 'theirs' version: %w", err)
-	}
-	if err := os.WriteFile(rightPath, rightContent, 0600); err != nil {
-		return fmt.Errorf("failed to write right version: %w", err)
-	}
-
-	// Get current executable to call bd merge
-	exe, err := os.Executable()
-	if err != nil {
-		return fmt.Errorf("cannot resolve current executable: %w", err)
-	}
-
-	// Invoke bd merge command
-	mergeCmd := exec.Command(exe, "merge", outputPath, basePath, leftPath, rightPath) // #nosec G204 -- executes current bd binary for deterministic merge
-	mergeOutput, err := mergeCmd.CombinedOutput()
-	if err != nil {
-		// Check exit code - bd merge returns 1 if there are conflicts, 2 for errors
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			if exitErr.ExitCode() == 1 {
-				// Conflicts exist - merge tool did its best but couldn't resolve everything
-				return fmt.Errorf("merge conflicts could not be automatically resolved:\n%s", mergeOutput)
-			}
-		}
-		return fmt.Errorf("merge command failed: %w\n%s", err, mergeOutput)
-	}
-
-	// Merge succeeded - copy merged result back to original file
-	// #nosec G304 -- merged output created earlier in this function
-	mergedContent, err := os.ReadFile(outputPath)
-	if err != nil {
-		return fmt.Errorf("failed to read merged output: %w", err)
-	}
-
-	if err := os.WriteFile(absConflictedPath, mergedContent, 0600); err != nil {
-		return fmt.Errorf("failed to write merged result: %w", err)
-	}
-
-	// Stage the resolved file
-	stageCmd := exec.Command("git", "add", relPath) // #nosec G204 -- relPath constrained to file within current repo
-	stageCmd.Dir = gitRoot
-	if err := stageCmd.Run(); err != nil {
-		// Non-fatal - user can stage manually
-		fmt.Fprintf(os.Stderr, "Warning: failed to auto-stage merged file: %v\n", err)
-	}
-
 	return nil
 }
 
-// detectPrefixFromIssues extracts the common prefix from issue IDs
-// Uses utils.ExtractIssuePrefix which handles multi-part prefixes correctly
-func detectPrefixFromIssues(issues []*types.Issue) string {
-	if len(issues) == 0 {
-		return ""
+func runImportInner(args []string) error {
+	ctx := rootCtx
+	if importInput != "" && len(args) > 0 {
+		return fmt.Errorf("use either --input or a positional file, not both")
 	}
 
-	// Count prefix occurrences
-	prefixCounts := make(map[string]int)
-	for _, issue := range issues {
-		prefix := utils.ExtractIssuePrefix(issue.ID)
-		if prefix != "" {
-			prefixCounts[prefix]++
+	fromStdin := importInput == "-" || (len(args) > 0 && args[0] == "-")
+
+	if fromStdin {
+		return runImportFromReader(ctx, os.Stdin, "stdin")
+	}
+
+	// Determine source file
+	var jsonlPath string
+	if importInput != "" {
+		jsonlPath = importInput
+	} else if len(args) > 0 {
+		jsonlPath = args[0]
+	} else {
+		// bd-axluy: `bd import < file` (or `... | bd import`) without "-"
+		// used to silently ignore stdin and import the default JSONL — a
+		// mutating command diverging from what the user piped. Demand an
+		// explicit source instead. /dev/null (the stdin subprocesses get by
+		// default) is a character device, so scripted bare `bd import` with
+		// no redirection still works.
+		if fi, statErr := os.Stdin.Stat(); statErr == nil && fi.Mode()&os.ModeCharDevice == 0 {
+			return fmt.Errorf("stdin is redirected, but without \"-\" bd import ignores it and imports the default JSONL instead; use 'bd import -' to import what you piped, or name a file explicitly")
+		}
+		beadsDir := beads.FindBeadsDir()
+		if beadsDir == "" {
+			return fmt.Errorf("%s — %s", activeWorkspaceNotFoundError(), diagHint())
+		}
+		if globalFlag {
+			jsonlPath = filepath.Join(beadsDir, "global-issues.jsonl")
+		} else {
+			jsonlPath = configuredImportJSONLPath(beadsDir)
 		}
 	}
 
-	// Find most common prefix
-	maxCount := 0
-	commonPrefix := ""
-	for prefix, count := range prefixCounts {
-		if count > maxCount {
-			maxCount = count
-			commonPrefix = prefix
+	info, err := os.Stat(jsonlPath)
+	if err != nil {
+		return fmt.Errorf("cannot read %s: %w", jsonlPath, err)
+	}
+	if info.Size() == 0 {
+		if jsonOutput {
+			return outputJSON(importResultJSON{Source: jsonlPath})
 		}
+		fmt.Fprintf(os.Stderr, "Empty file: %s\n", jsonlPath)
+		return nil
 	}
 
-	return commonPrefix
+	f, err := os.Open(jsonlPath) //nolint:gosec // G304: CLI argument
+	if err != nil {
+		return fmt.Errorf("cannot open %s: %w", jsonlPath, err)
+	}
+	defer f.Close()
+
+	return runImportFromReader(ctx, f, jsonlPath)
 }
 
-func init() {
-	importCmd.Flags().StringP("input", "i", "", "Input file (default: stdin)")
-	importCmd.Flags().BoolP("skip-existing", "s", false, "Skip existing issues instead of updating them")
-	importCmd.Flags().Bool("strict", false, "Fail on dependency errors instead of treating them as warnings")
-	importCmd.Flags().Bool("dedupe-after", false, "Detect and report content duplicates after import")
-	importCmd.Flags().Bool("dry-run", false, "Preview collision detection without making changes")
-	importCmd.Flags().Bool("rename-on-import", false, "Rename imported issues to match database prefix (updates all references)")
-	importCmd.Flags().Bool("clear-duplicate-external-refs", false, "Clear duplicate external_ref values (keeps first occurrence)")
-	importCmd.Flags().String("orphan-handling", "", "How to handle missing parent issues: strict/resurrect/skip/allow (default: use config or 'allow')")
-	importCmd.Flags().Bool("force", false, "Force metadata update even when database is already in sync with JSONL")
-	importCmd.Flags().Bool("protect-left-snapshot", false, "Protect issues in left snapshot from git-history-backfill")
-	importCmd.Flags().Bool("no-git-history", false, "Skip git history backfill for deletions (passed by bd sync)")
-	importCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output import statistics in JSON format")
-	rootCmd.AddCommand(importCmd)
+type importResultJSON struct {
+	Source              string         `json:"source"`
+	Created             int            `json:"created"`
+	Updated             int            `json:"updated,omitempty"`
+	Unchanged           int            `json:"unchanged,omitempty"`
+	Skipped             int            `json:"skipped"`
+	DedupHits           int            `json:"dedup_skipped,omitempty"`
+	Memories            int            `json:"memories,omitempty"`
+	IDs                 []string       `json:"ids,omitempty"`
+	UpdatedIssues       []ImportChange `json:"updated_issues,omitempty"`
+	TieKeptLocalIDs     []string       `json:"tie_kept_local_ids,omitempty"`
+	StaleSkippedIDs     []string       `json:"stale_skipped_ids,omitempty"`
+	SkippedDependencies []string       `json:"skipped_dependencies,omitempty"`
+	DryRun              bool           `json:"dry_run,omitempty"`
+}
+
+func runImportFromReader(ctx context.Context, r io.Reader, source string) error {
+	issues, memories, err := parseImportRecords(r)
+	if err != nil {
+		return err
+	}
+
+	if usesProxiedServer() {
+		return runImportRecordsProxied(ctx, issues, memories, source)
+	}
+
+	if store == nil {
+		return fmt.Errorf("no database — run 'bd init' or 'bd bootstrap' first")
+	}
+	return runImportRecordsClassic(ctx, issues, memories, source)
+}
+
+// parseImportRecords scans one JSONL stream into issue rows and memory
+// records — the `bd import` / `bd import -` parse loop, shared by the classic
+// and proxied modes. Same record vocabulary as parseJSONLFile (the bootstrap
+// reader): the optional _schema header and tombstones are skipped, and the
+// "wisp_plane" boolean is honored as the explicit wisps-plane marker (and
+// the legacy "wisp" alias for "ephemeral") via applyImportWispPlane.
+func parseImportRecords(r io.Reader) ([]*types.Issue, []memoryRecord, error) {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 1024*1024), 64*1024*1024)
+
+	var issues []*types.Issue
+	var memories []memoryRecord
+
+	for scanner.Scan() {
+		line := scanner.Text()
+		if line == "" {
+			continue
+		}
+
+		var peek map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(line), &peek); err != nil {
+			return nil, nil, fmt.Errorf("failed to parse JSONL line: %w", err)
+		}
+
+		// Skip the optional beads-jsonl header record (§J1.3). A canonical
+		// export may prepend a provenance line, e.g.
+		// {"_schema":"beads-jsonl/1","_dolt_branch":"main","_sort":"stable-v1"}.
+		// It carries no _type and no issue fields; without this guard it falls
+		// through to the issue path, unmarshals into an empty Issue, and aborts
+		// the whole import with "title is required". parseJSONLFile (the
+		// bootstrap reader) has always skipped it; this loop — the one `bd
+		// import` and `bd import -` run through — did not.
+		if _, isHeader := peek["_schema"]; isHeader {
+			continue
+		}
+
+		if rawType, ok := peek["_type"]; ok {
+			var typeStr string
+			if err := json.Unmarshal(rawType, &typeStr); err == nil && typeStr == "memory" {
+				var mem memoryRecord
+				if err := json.Unmarshal([]byte(line), &mem); err != nil {
+					return nil, nil, fmt.Errorf("failed to parse memory record: %w", err)
+				}
+				if mem.Key != "" && mem.Value != "" {
+					memories = append(memories, mem)
+				}
+				continue
+			}
+		}
+
+		var issue types.Issue
+		if err := json.Unmarshal([]byte(line), &issue); err != nil {
+			return nil, nil, fmt.Errorf("failed to parse issue from JSONL: %w", err)
+		}
+		if issue.Status == "tombstone" {
+			continue
+		}
+		applyImportWispPlane(peek, &issue)
+		issue.SetDefaults()
+		issues = append(issues, &issue)
+	}
+	if err := scanner.Err(); err != nil {
+		return nil, nil, fmt.Errorf("failed to scan JSONL: %w", err)
+	}
+	return issues, memories, nil
+}
+
+// runImportRecordsClassic is the classic (embedded/direct store) import
+// pipeline over the parsed records: dedup, dry-run classification, memory
+// writes, the batch issue import, the final commit and the issue_prefix
+// reconciliation.
+func runImportRecordsClassic(ctx context.Context, issues []*types.Issue, memories []memoryRecord, source string) error {
+	// Dedup: skip issues whose title matches an existing open issue
+	dedupHits := 0
+	if importDedup && len(issues) > 0 {
+		issues, dedupHits = filterDuplicatesByTitle(ctx, store, issues)
+	}
+
+	result := importResultJSON{
+		Source:    source,
+		DedupHits: dedupHits,
+		DryRun:    importDryRun,
+	}
+
+	if importDryRun {
+		result.Memories = len(memories)
+		result.Skipped = dedupHits
+
+		classification, err := classifyDryRunImport(ctx, store, issues, importAllowStale)
+		if err != nil {
+			return fmt.Errorf("dry-run: %w", err)
+		}
+		applyImportDryRunClassification(&result, classification)
+		return renderImportDryRun(result, len(memories), source, dedupHits)
+	}
+
+	// Import memories
+	for _, mem := range memories {
+		storageKey := kvPrefix + memoryPrefix + mem.Key
+		if err := store.SetConfig(ctx, storageKey, mem.Value); err != nil {
+			return fmt.Errorf("failed to import memory %q: %w", mem.Key, err)
+		}
+		result.Memories++
+	}
+
+	// Import issues
+	if len(issues) > 0 {
+		opts := ImportOptions{SkipPrefixValidation: true, AllowStale: importAllowStale}
+		importResult, err := importIssuesCore(ctx, "", store, issues, opts)
+		if err != nil {
+			return fmt.Errorf("import failed: %w", err)
+		}
+		applyImportOutcome(&result, importResult)
+	}
+
+	if result.Created > 0 || result.Memories > 0 {
+		commitMsg := fmt.Sprintf("bd import: %d issues", result.Created)
+		if result.Memories > 0 {
+			commitMsg += fmt.Sprintf(", %d memories", result.Memories)
+		}
+		commitMsg += fmt.Sprintf(" from %s", filepath.Base(source))
+		if err := store.Commit(ctx, commitMsg); err != nil {
+			// An import can be a working-set no-op: re-importing an
+			// identical snapshot, or equal-timestamp rows whose guarded
+			// upsert kept every local column (bd-hj85c).
+			if !strings.Contains(err.Error(), "nothing to commit") {
+				return fmt.Errorf("commit: %w", err)
+			}
+		}
+	}
+
+	// Sync issue_prefix from config.yaml to the database if stale (be-llaf).
+	// store.Commit skips the config table (GH#2455), so we use CommitWithConfig
+	// for this intentional config update after the issues commit completes.
+	// config.yaml is authoritative here and existing issue IDs are intentionally
+	// left unchanged: this deliberately bypasses the `bd config set issue_prefix`
+	// guard for the import/migration flow and is not a rename.
+	if yamlPrefix := config.GetString("issue-prefix"); yamlPrefix != "" {
+		if dbPrefix, _ := store.GetConfig(ctx, "issue_prefix"); dbPrefix != yamlPrefix {
+			if setErr := store.SetConfig(ctx, "issue_prefix", yamlPrefix); setErr == nil {
+				_ = store.CommitWithConfig(ctx, "bd import: sync issue_prefix from config.yaml")
+			}
+		}
+	}
+
+	return renderImportOutcome(result, source, dedupHits)
+}
+
+// applyImportDryRunClassification folds a dry-run classification into the
+// command's JSON result, identically in both modes.
+func applyImportDryRunClassification(result *importResultJSON, classification *ImportResult) {
+	result.Created = classification.Created
+	result.Updated = classification.Updated
+	result.Unchanged = classification.Unchanged
+	result.Skipped += classification.Skipped
+	result.IDs = append(result.IDs, classification.ImportedIDs...)
+	result.StaleSkippedIDs = classification.StaleSkippedIDs
+	result.UpdatedIssues = classification.UpdatedIssues
+	result.TieKeptLocalIDs = classification.TieKeptLocalIDs
+}
+
+// applyImportOutcome folds a real import's outcome into the command's JSON
+// result, identically in both modes.
+func applyImportOutcome(result *importResultJSON, importResult *ImportResult) {
+	result.Created = importResult.Created
+	result.Updated = importResult.Updated
+	result.Unchanged = importResult.Unchanged
+	result.Skipped += importResult.Skipped
+	result.SkippedDependencies = append(result.SkippedDependencies, importResult.SkippedDependencies...)
+	result.IDs = append(result.IDs, importResult.ImportedIDs...)
+	result.UpdatedIssues = append(result.UpdatedIssues, importResult.UpdatedIssues...)
+	result.TieKeptLocalIDs = append(result.TieKeptLocalIDs, importResult.TieKeptLocalIDs...)
+	result.StaleSkippedIDs = append(result.StaleSkippedIDs, importResult.StaleSkippedIDs...)
+}
+
+// renderImportDryRun reports a dry run (JSON or stderr), identically in both
+// modes.
+func renderImportDryRun(result importResultJSON, memoriesCount int, source string, dedupHits int) error {
+	if jsonOutput {
+		return outputJSON(result)
+	}
+	// The leading count is the sum of the breakdown that follows it
+	// (not len(issues)), which can be larger when rows were stale
+	// skipped — those are reported separately below instead of being
+	// folded into a total the breakdown then wouldn't add up to.
+	considered := result.Created + result.Updated + result.Unchanged
+	//nolint:gosec // G705: stderr, not a browser context
+	fmt.Fprintf(os.Stderr, "Would import %d issues (%d new, %d updated, %d unchanged) and %d memories from %s",
+		considered, result.Created, result.Updated, result.Unchanged, memoriesCount, source)
+	if dedupHits > 0 {
+		fmt.Fprintf(os.Stderr, " (%d duplicates skipped)", dedupHits) //nolint:gosec // G705: stderr, not a browser context
+	}
+	if len(result.StaleSkippedIDs) > 0 {
+		fmt.Fprintf(os.Stderr, " (%d stale skipped)", len(result.StaleSkippedIDs))
+	}
+	fmt.Fprintln(os.Stderr)
+	return nil
+}
+
+// renderImportOutcome reports a completed import (JSON or stderr),
+// identically in both modes.
+func renderImportOutcome(result importResultJSON, source string, dedupHits int) error {
+	if jsonOutput {
+		return outputJSON(result)
+	}
+
+	fmt.Fprintf(os.Stderr, "Imported %d issues", result.Created)
+	if result.Memories > 0 {
+		fmt.Fprintf(os.Stderr, " and %d memories", result.Memories)
+	}
+	fmt.Fprintf(os.Stderr, " from %s", source)
+	if dedupHits > 0 {
+		fmt.Fprintf(os.Stderr, " (%d duplicates skipped)", dedupHits) //nolint:gosec // G705: stderr, not a browser context
+	}
+	if staleSkipped := result.Skipped - dedupHits; staleSkipped > 0 {
+		fmt.Fprintf(os.Stderr, " (%d stale skipped; use --allow-stale to restore older rows)", staleSkipped) //nolint:gosec // G705: stderr, not a browser context
+	}
+	if result.Unchanged > 0 {
+		fmt.Fprintf(os.Stderr, " (%d already present, unchanged)", result.Unchanged) //nolint:gosec // G705: stderr, not a browser context
+	}
+	fmt.Fprintln(os.Stderr)
+	if len(result.UpdatedIssues) > 0 {
+		fmt.Fprintf(os.Stderr, "Updated %d existing issue(s):\n", len(result.UpdatedIssues))
+		for _, change := range result.UpdatedIssues {
+			fmt.Fprintf(os.Stderr, "  %s: %s\n", change.ID, change.Changes)
+		}
+	}
+	if len(result.TieKeptLocalIDs) > 0 {
+		fmt.Fprintf(os.Stderr, "Kept local state for %d issue(s) with the same updated_at but different content (use --allow-stale to overwrite): %s\n",
+			len(result.TieKeptLocalIDs), strings.Join(result.TieKeptLocalIDs, ", "))
+	}
+	for _, skipped := range result.SkippedDependencies {
+		fmt.Fprintf(os.Stderr, "Skipped dependency: %s\n", skipped)
+	}
+	return nil
+}
+
+// importTitleSearcher is the read seam the --dedup filter needs. It lives in
+// THIS file because naming types.IssueFilter is denied by default under
+// cmd/bd and import.go is the named exception for the bulk-movement family
+// (.golangci.yml, forbidigo): the classic storage.DoltStorage satisfies it
+// directly, and uowImportTitleSearcher adapts the proxied unit of work.
+type importTitleSearcher interface {
+	SearchIssues(ctx context.Context, query string, filter types.IssueFilter) ([]*types.Issue, error)
+}
+
+// uowImportTitleSearcher adapts a unit of work's issue use case to the
+// classic []*types.Issue search shape filterDuplicatesByTitle consumes. Both
+// stacks run the same issueops search underneath (issues merged with wisps),
+// so --dedup sees the same title universe in both modes.
+type uowImportTitleSearcher struct {
+	uw uow.UnitOfWork
+}
+
+func (s uowImportTitleSearcher) SearchIssues(ctx context.Context, query string, filter types.IssueFilter) ([]*types.Issue, error) {
+	page, err := s.uw.IssueUseCase().SearchIssues(ctx, query, filter)
+	if err != nil {
+		return nil, err
+	}
+	return page.Items, nil
+}
+
+// filterDuplicatesByTitle removes issues whose title matches an existing open issue.
+func filterDuplicatesByTitle(ctx context.Context, st importTitleSearcher, issues []*types.Issue) ([]*types.Issue, int) {
+	existing, err := st.SearchIssues(ctx, "", types.IssueFilter{})
+	if err != nil {
+		return issues, 0
+	}
+
+	titleSet := make(map[string]bool, len(existing))
+	for _, issue := range existing {
+		if issue.Status != types.StatusClosed {
+			titleSet[strings.ToLower(issue.Title)] = true
+		}
+	}
+
+	var kept []*types.Issue
+	skipped := 0
+	for _, issue := range issues {
+		if titleSet[strings.ToLower(issue.Title)] {
+			skipped++
+			continue
+		}
+		kept = append(kept, issue)
+	}
+	return kept, skipped
 }

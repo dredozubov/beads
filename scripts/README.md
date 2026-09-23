@@ -2,6 +2,92 @@
 
 Utility scripts for maintaining the beads project.
 
+## ci/
+
+Repository-owned CI command wrappers. These scripts are the source of truth for
+the target CI tiers; Make targets are aliases for local discoverability.
+
+```bash
+make ci-pr-core
+make ci-pr-policy
+make ci-pr-lint
+make ci-package-mcp
+make ci-package-npm
+```
+
+Each wrapper auto-detects the repository root, sources `.buildflags` when it
+invokes Go in the default build mode, and records per-command timing through
+`scripts/ci/lib/timing.sh`.
+
+Broad Go test wrappers also source `scripts/ci/lib/test-env.sh`, which creates a
+temporary HOME/XDG/Dolt root, isolates Git global/system config, clears runtime
+Beads/Dolt environment variables, and sets `BEADS_TEST_SKIP=dolt` before tests
+run. This keeps local `make test` and `make ci-pr-core` results comparable to
+the fast PR-core contract even on shared agent hosts. Set
+`BEADS_TEST_ENV_RUN_DOLT=1` only when intentionally running the Dolt-dependent
+tests through these broad wrappers, or `BEADS_TEST_ENV_DISABLE=1` when debugging
+against your real local configuration.
+
+The broad Go wrappers also cap package and test parallelism to `4` by default
+(`GO_TEST_PKG_PARALLEL` and `GO_TEST_PARALLEL`). This avoids turning high-core
+shared hosts into a different test topology than GitHub Actions.
+
+`make ci-pr-policy` includes `scripts/check-testing-short.sh`, which enforces
+that `testing.Short()` is only used for runtime, stress, or large-fixture skips.
+Use build tags, environment checks, or named wrappers for integration/e2e/API
+boundaries.
+
+Package gate wrappers validate publishable/package-adjacent surfaces:
+
+- `make ci-package-mcp` builds or consumes a `bd` binary, puts it on `PATH` as
+  `bd`, then runs locked MCP package `uv sync`, Ruff, mypy, pytest, and build
+  checks.
+- `make ci-package-npm` builds or consumes the native binary expected by
+  `npm-package/bin/bd`, runs the npm package test suite, and checks
+  `npm pack --dry-run`.
+
+Set `BEADS_TEST_BD_BINARY=/path/to/bd` for MCP and npm package gates to reuse a
+prebuilt candidate binary instead of rebuilding it inside the wrapper.
+
+## pr-preflight.sh
+
+Read-only PR safety check for agents and maintainers.
+
+```bash
+# Before implementing or opening a related PR
+./scripts/pr-preflight.sh --search "topic keywords" --repo gastownhall/beads
+
+# Before changing, closing, or merging an existing PR
+./scripts/pr-preflight.sh 123 --repo gastownhall/beads
+```
+
+It reports contributor/fork status, draft/review/merge/check state, risky diff
+signals such as `.beads/` changes or missing tests, and the required
+contributor-protection next steps. It does not replace code review or local
+validation.
+
+Base-branch health is supplemented by a warn-only PR-gate sample: the last 60
+completed `pull_request`-event runs, grouped per workflow. A single workflow
+whose decisive runs (>= 5, across >= 3 distinct head branches) are all
+failure-class is reported as a broken PR gate — the case where a job that
+exists only in the PR workflow is red for every PR while the base branch shows
+green. This detector never blocks (deliberately: automation classifies
+unrecognized `[block]` lines as genuine merge blockers and would park merge
+lanes on a false positive); it is skipped entirely while the base branch is
+red.
+
+## gh-body-lint
+
+Lint Markdown files before posting them with `gh ... --body-file`.
+
+```bash
+./scripts/gh-body-lint body.md
+./scripts/gh-body-lint --fix body.md
+```
+
+The lint catches literal `\n` sequences, which render poorly on GitHub, and
+`GH#123` references, which do not auto-link like `#123` or `owner/repo#123`.
+
 ## release.sh (⭐ The Easy Button)
 
 **One-command release** from version bump to local installation.
@@ -20,13 +106,13 @@ Utility scripts for maintaining the beads project.
 
 This master script automates the **entire release process**:
 
-1. ✅ Kills running daemons (avoids version conflicts)
+1. ✅ Stops running Dolt servers (avoids version conflicts)
 2. ✅ Runs tests and linting
 3. ✅ Bumps version in all files
 4. ✅ Commits and pushes version bump
 5. ✅ Creates and pushes git tag
-6. ✅ Updates Homebrew formula
-7. ✅ Upgrades local brew installation
+6. ✅ Verifies or opens the Homebrew core formula PR
+7. ✅ Upgrades local Homebrew installation
 8. ✅ Verifies everything works
 
 **After this script completes, your system is running the new version!**
@@ -47,7 +133,7 @@ This master script automates the **entire release process**:
 - All changes committed
 - golangci-lint installed
 - Homebrew installed (for local upgrade)
-- Push access to steveyegge/beads and steveyegge/homebrew-beads
+- Push access to gastownhall/beads
 
 ### Output
 
@@ -62,7 +148,8 @@ The script provides colorful, step-by-step progress output:
 After the script finishes:
 - GitHub Actions builds binaries for all platforms (~5 minutes)
 - PyPI package is published automatically
-- Users can `brew upgrade bd` to get the new version
+- Homebrew core formula is verified or tracked through its canonical PR
+- Users can `brew upgrade beads` to get the new version after Homebrew merges
 - GitHub Release is created with binaries and changelog
 
 ---
@@ -88,8 +175,9 @@ Bumps the version number across all beads components in a single command.
 
 Updates version in all these files:
 - `cmd/bd/version.go` - bd CLI version constant
-- `claude-plugin/.claude-plugin/plugin.json` - Plugin version
-- `.claude-plugin/marketplace.json` - Marketplace plugin version
+- `plugins/beads/.claude-plugin/plugin.json` - Claude plugin version
+- `plugins/beads/.codex-plugin/plugin.json` - Codex plugin version
+- `.claude-plugin/marketplace.json` - Claude marketplace plugin version
 - `integrations/beads-mcp/pyproject.toml` - MCP server version
 - `README.md` - Alpha status version
 - `PLUGIN.md` - Version requirements
@@ -125,65 +213,6 @@ Previously, version bumps only updated `cmd/bd/version.go`, leaving other compon
 - Validates version format before making any changes
 - Verifies all versions match after update
 - Shows diff for review before commit
-
----
-
-## update-homebrew.sh
-
-Automatically updates the Homebrew formula with GoReleaser release artifacts.
-
-### Usage
-
-```bash
-# Update formula after pushing git tag
-./scripts/update-homebrew.sh 0.9.3
-
-# Use custom tap directory
-TAP_DIR=~/homebrew-beads ./scripts/update-homebrew.sh 0.9.3
-```
-
-### What It Does
-
-This script automates the Homebrew formula update process:
-
-1. **Waits** for GitHub Actions release build (~5 minutes, checks every 30s)
-2. **Downloads** checksums.txt from the GitHub release
-3. **Extracts** SHA256s for all platform-specific binaries:
-   - macOS ARM64 (Apple Silicon)
-   - macOS AMD64 (Intel)
-   - Linux AMD64
-   - Linux ARM64
-4. **Clones/updates** the homebrew-beads tap repository
-5. **Updates** Formula/bd.rb with new version and all SHA256s
-6. **Commits and pushes** the changes
-
-### Important Notes
-
-- **Run AFTER pushing the git tag** - the script waits for GitHub Actions to finish
-- **Uses GoReleaser artifacts**, not source tarballs (fixed in v0.23.0)
-- **Automatically waits** up to 7.5 minutes for release build to complete
-- **Updates all platforms** in a single operation
-
-### Examples
-
-```bash
-# Standard usage (after git tag push)
-git tag v0.9.3 && git push origin v0.9.3
-./scripts/update-homebrew.sh 0.9.3
-
-# Custom tap directory
-TAP_DIR=/path/to/homebrew-beads ./scripts/update-homebrew.sh 0.9.3
-```
-
-### Why This Script Exists
-
-Previously, the Homebrew formula update was manual and error-prone:
-- Used source tarball SHA256 instead of GoReleaser artifacts (wrong!)
-- Required manually computing 4 separate SHA256s
-- Easy to forget updating all platforms
-- No automation for waiting on GitHub Actions
-
-This script fixes all those issues and is now used by `release.sh`.
 
 ---
 
@@ -233,7 +262,7 @@ This allows releases to work before a certificate is acquired.
 
 Windows code signing helps reduce antivirus false positives that affect Go binaries.
 Kaspersky and other AV software commonly flag unsigned Go executables as potentially
-malicious due to heuristic detection. See `docs/ANTIVIRUS.md` for details.
+malicious due to heuristic detection. See `docs/reference/antivirus.md` for details.
 
 ---
 

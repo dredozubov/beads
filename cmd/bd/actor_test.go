@@ -5,10 +5,12 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+
+	"github.com/steveyegge/beads/internal/config"
 )
 
 // TestGetActorWithGit tests the actor resolution fallback chain.
-// Priority: --actor flag > BD_ACTOR env > BEADS_ACTOR env > git config user.name > $USER > "unknown"
+// Priority: --actor flag > BEADS_ACTOR env > BD_ACTOR env (deprecated) > git config user.name > $USER > "unknown"
 func TestGetActorWithGit(t *testing.T) {
 	// Save original environment and actor variable
 	origActor := actor
@@ -48,37 +50,37 @@ func TestGetActorWithGit(t *testing.T) {
 	gitUserName := getGitUserName()
 
 	tests := []struct {
-		name          string
-		actorFlag     string
-		bdActor       string
-		beadsActor    string
-		user          string
-		expected      string
-		skipIfNoGit   bool // Skip if git user.name is not configured
+		name        string
+		actorFlag   string
+		bdActor     string
+		beadsActor  string
+		user        string
+		expected    string
+		skipIfNoGit bool // Skip if git user.name is not configured
 	}{
 		{
-			name:      "actor flag takes priority",
-			actorFlag: "flag-actor",
-			bdActor:   "bd-actor",
+			name:       "actor flag takes priority",
+			actorFlag:  "flag-actor",
+			bdActor:    "bd-actor",
 			beadsActor: "beads-actor",
-			user:      "system-user",
-			expected:  "flag-actor",
+			user:       "system-user",
+			expected:   "flag-actor",
 		},
 		{
-			name:      "BD_ACTOR takes priority when no flag",
-			actorFlag: "",
-			bdActor:   "bd-actor",
+			name:       "BEADS_ACTOR takes priority when no flag",
+			actorFlag:  "",
+			bdActor:    "bd-actor",
 			beadsActor: "beads-actor",
-			user:      "system-user",
-			expected:  "bd-actor",
+			user:       "system-user",
+			expected:   "beads-actor",
 		},
 		{
-			name:      "BEADS_ACTOR takes priority when no BD_ACTOR",
-			actorFlag: "",
-			bdActor:   "",
-			beadsActor: "beads-actor",
-			user:      "system-user",
-			expected:  "beads-actor",
+			name:       "BD_ACTOR used as fallback when no BEADS_ACTOR",
+			actorFlag:  "",
+			bdActor:    "bd-actor",
+			beadsActor: "",
+			user:       "system-user",
+			expected:   "bd-actor",
 		},
 		{
 			name:        "git config user.name used when no env vars",
@@ -90,22 +92,22 @@ func TestGetActorWithGit(t *testing.T) {
 			skipIfNoGit: true,
 		},
 		{
-			name:      "USER fallback when no git config",
-			actorFlag: "",
-			bdActor:   "",
+			name:       "USER fallback when no git config",
+			actorFlag:  "",
+			bdActor:    "",
 			beadsActor: "",
-			user:      "fallback-user",
-			expected:  "fallback-user",
+			user:       "fallback-user",
+			expected:   "fallback-user",
 			// Note: This test may fail if git user.name is configured
 			// We handle this by checking the actual git config in the test
 		},
 		{
-			name:      "unknown as final fallback",
-			actorFlag: "",
-			bdActor:   "",
+			name:       "unknown as final fallback",
+			actorFlag:  "",
+			bdActor:    "",
 			beadsActor: "",
-			user:      "",
-			expected:  "unknown",
+			user:       "",
+			expected:   "unknown",
 			// Note: This test may get git user.name instead if configured
 		},
 	}
@@ -155,6 +157,51 @@ func TestGetActorWithGit(t *testing.T) {
 	}
 }
 
+// TestResolveConfiguredActor verifies that BEADS_ACTOR (primary override)
+// outranks the deprecated BD_ACTOR alias when the --actor flag is not set,
+// even though viper's AutomaticEnv binds BD_ACTOR to the "actor" config key
+// (GH#4645). This is the resolution the pre-run hooks use to pre-populate the
+// global actor before getActorWithGit runs.
+func TestResolveConfiguredActor(t *testing.T) {
+	origBd, bdSet := os.LookupEnv("BD_ACTOR")
+	origBeads, beadsSet := os.LookupEnv("BEADS_ACTOR")
+	defer func() {
+		if bdSet {
+			os.Setenv("BD_ACTOR", origBd)
+		} else {
+			os.Unsetenv("BD_ACTOR")
+		}
+		if beadsSet {
+			os.Setenv("BEADS_ACTOR", origBeads)
+		} else {
+			os.Unsetenv("BEADS_ACTOR")
+		}
+		_ = config.Initialize()
+	}()
+
+	t.Run("BEADS_ACTOR outranks BD_ACTOR", func(t *testing.T) {
+		os.Setenv("BD_ACTOR", "from-bd-actor")
+		os.Setenv("BEADS_ACTOR", "from-beads-actor")
+		if err := config.Initialize(); err != nil {
+			t.Fatalf("config.Initialize(): %v", err)
+		}
+		if got := resolveConfiguredActor(); got != "from-beads-actor" {
+			t.Errorf("resolveConfiguredActor() = %q, want %q (BEADS_ACTOR must win)", got, "from-beads-actor")
+		}
+	})
+
+	t.Run("BD_ACTOR used when BEADS_ACTOR unset", func(t *testing.T) {
+		os.Unsetenv("BEADS_ACTOR")
+		os.Setenv("BD_ACTOR", "from-bd-actor")
+		if err := config.Initialize(); err != nil {
+			t.Fatalf("config.Initialize(): %v", err)
+		}
+		if got := resolveConfiguredActor(); got != "from-bd-actor" {
+			t.Errorf("resolveConfiguredActor() = %q, want %q (BD_ACTOR fallback)", got, "from-bd-actor")
+		}
+	})
+}
+
 // TestGetActorWithGit_PriorityOrder tests that the priority order is respected
 func TestGetActorWithGit_PriorityOrder(t *testing.T) {
 	// Save original state
@@ -176,7 +223,7 @@ func TestGetActorWithGit_PriorityOrder(t *testing.T) {
 		}
 	}()
 
-	// Test: flag > BD_ACTOR > BEADS_ACTOR
+	// Test: flag > BEADS_ACTOR > BD_ACTOR
 	actor = "from-flag"
 	os.Setenv("BD_ACTOR", "from-bd-actor")
 	os.Setenv("BEADS_ACTOR", "from-beads-actor")
@@ -186,17 +233,17 @@ func TestGetActorWithGit_PriorityOrder(t *testing.T) {
 		t.Errorf("Expected flag to take priority, got %q", result)
 	}
 
-	// Test: BD_ACTOR > BEADS_ACTOR (no flag)
+	// Test: BEADS_ACTOR > BD_ACTOR (no flag)
 	actor = ""
 	result = getActorWithGit()
-	if result != "from-bd-actor" {
-		t.Errorf("Expected BD_ACTOR to take priority over BEADS_ACTOR, got %q", result)
+	if result != "from-beads-actor" {
+		t.Errorf("Expected BEADS_ACTOR to take priority over BD_ACTOR, got %q", result)
 	}
 
-	// Test: BEADS_ACTOR when BD_ACTOR is empty
-	os.Unsetenv("BD_ACTOR")
+	// Test: BD_ACTOR as fallback when BEADS_ACTOR is empty
+	os.Unsetenv("BEADS_ACTOR")
 	result = getActorWithGit()
-	if result != "from-beads-actor" {
-		t.Errorf("Expected BEADS_ACTOR to be used, got %q", result)
+	if result != "from-bd-actor" {
+		t.Errorf("Expected BD_ACTOR to be used as fallback, got %q", result)
 	}
 }

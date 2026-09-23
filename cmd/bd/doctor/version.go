@@ -11,10 +11,23 @@ import (
 	"time"
 )
 
+var latestGitHubReleaseFetcher = fetchLatestGitHubRelease
+
 // CheckCLIVersion checks if the CLI version is up to date.
 // Takes cliVersion parameter since it can't access the Version variable from main package.
 func CheckCLIVersion(cliVersion string) DoctorCheck {
-	latestVersion, err := fetchLatestGitHubRelease()
+	// A Homebrew --HEAD build carries no orderable version — CompareVersions
+	// would read it as 0.0.0 and warn "update available" forever, and the
+	// suggested upgrade would actually move the user off HEAD.
+	if IsBrewHeadVersion(cliVersion) {
+		return DoctorCheck{
+			Name:    "CLI Version",
+			Status:  StatusOK,
+			Message: fmt.Sprintf("%s (Homebrew --HEAD build; release comparison skipped)", cliVersion),
+		}
+	}
+
+	latestVersion, err := latestGitHubReleaseFetcher()
 	if err != nil {
 		// Network error or API issue - don't fail, just warn
 		return DoctorCheck{
@@ -38,7 +51,7 @@ func CheckCLIVersion(cliVersion string) DoctorCheck {
 		return DoctorCheck{
 			Name:    "CLI Version",
 			Status:  StatusWarning,
-			Message: fmt.Sprintf("%s (latest: %s)", cliVersion, latestVersion),
+			Message: fmt.Sprintf("%s (latest: %s; update: %s)", cliVersion, latestVersion, upgradeCmd),
 			Fix:     fmt.Sprintf("Upgrade: %s", upgradeCmd),
 		}
 	}
@@ -50,13 +63,27 @@ func CheckCLIVersion(cliVersion string) DoctorCheck {
 	}
 }
 
+// CheckCLIVersionLocalOnly reports the local CLI version without making
+// network calls. This is intended for machine-readable or other
+// non-interactive contexts where deterministic exit behavior matters more than
+// update discovery.
+func CheckCLIVersionLocalOnly(cliVersion string) DoctorCheck {
+	return DoctorCheck{
+		Name:    "CLI Version",
+		Status:  StatusOK,
+		Message: fmt.Sprintf("%s (update check skipped in non-interactive mode)", cliVersion),
+	}
+}
+
+// installScriptCommand is the default upgrade/install command for non-Homebrew installations.
+const installScriptCommand = "curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash"
+
 // getUpgradeCommand returns the appropriate upgrade command based on how bd was installed.
 // Detects Homebrew on macOS/Linux, and falls back to the install script on all platforms.
 func getUpgradeCommand() string {
-	// Get the executable path
 	execPath, err := os.Executable()
 	if err != nil {
-		return "curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash"
+		return installScriptCommand
 	}
 
 	// Resolve symlinks to get the real path
@@ -65,19 +92,24 @@ func getUpgradeCommand() string {
 		realPath = execPath
 	}
 
-	// Normalize to lowercase for comparison
-	lowerPath := strings.ToLower(realPath)
+	return upgradeCommandForPath(realPath)
+}
 
-	// Check for Homebrew installation (macOS/Linux)
-	// Homebrew paths: /opt/homebrew/Cellar/bd, /usr/local/Cellar/bd, /home/linuxbrew/.linuxbrew/Cellar/bd
-	if strings.Contains(lowerPath, "/cellar/bd/") ||
-		strings.Contains(lowerPath, "/homebrew/") ||
-		strings.Contains(lowerPath, "/linuxbrew/") {
-		return "brew upgrade bd"
+// upgradeCommandForPath returns the upgrade command for a given executable path.
+// The homebrew-core formula is named "beads" (Formula/b/beads.rb), so the correct
+// command is "brew upgrade beads" — even for the legacy tap that used "bd.rb".
+func upgradeCommandForPath(execPath string) string {
+	lowerPath := strings.ToLower(execPath)
+
+	// Check for Homebrew Cellar path (macOS/Linux)
+	// Matches both homebrew-core formula "beads" and legacy tap formula "bd"
+	if strings.Contains(lowerPath, "/cellar/beads/") ||
+		strings.Contains(lowerPath, "/cellar/bd/") {
+		return "brew upgrade beads"
 	}
 
 	// Default to install script (works on all platforms including Windows via WSL/Git Bash)
-	return "curl -fsSL https://raw.githubusercontent.com/steveyegge/beads/main/scripts/install.sh | bash"
+	return installScriptCommand
 }
 
 // localVersionFile is the gitignored file that stores the last bd version used locally.
@@ -90,8 +122,7 @@ const localVersionFile = ".local_version"
 // GH#662: This was updated to check .local_version instead of metadata.json:LastBdVersion,
 // which is now deprecated.
 func CheckMetadataVersionTracking(path string, currentVersion string) DoctorCheck {
-	// Follow redirect to resolve actual beads directory (bd-tvus fix)
-	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
+	beadsDir := ResolveBeadsDirForRepo(path)
 	localVersionPath := filepath.Join(beadsDir, localVersionFile)
 
 	// Read .local_version file
@@ -131,6 +162,20 @@ func CheckMetadataVersionTracking(path string, currentVersion string) DoctorChec
 		}
 	}
 
+	trackingActive := DoctorCheck{
+		Name:    "Version Tracking",
+		Status:  StatusOK,
+		Message: fmt.Sprintf("Version tracking active (last: %s, current: %s)", lastVersion, currentVersion),
+	}
+
+	// A Homebrew --HEAD stamp carries no ordering, so the staleness heuristic
+	// below cannot apply — but it is a healthy marker, not a malformed one.
+	// Warning about it would be permanent: the offered fix rewrites the same
+	// stamp back.
+	if IsBrewHeadVersion(lastVersion) {
+		return trackingActive
+	}
+
 	// Validate that version is a valid semver-like string
 	if !IsValidSemver(lastVersion) {
 		return DoctorCheck{
@@ -149,6 +194,11 @@ func CheckMetadataVersionTracking(path string, currentVersion string) DoctorChec
 		currentParts := ParseVersionParts(currentVersion)
 		lastParts := ParseVersionParts(lastVersion)
 
+		// Guard against short version strings (e.g., "5" → [5] has no [1])
+		if len(currentParts) < 2 || len(lastParts) < 2 {
+			return trackingActive
+		}
+
 		// Simple heuristic: warn if minor version is 10+ behind or major version differs by 1+
 		majorDiff := currentParts[0] - lastParts[0]
 		minorDiff := currentParts[1] - lastParts[1]
@@ -164,11 +214,7 @@ func CheckMetadataVersionTracking(path string, currentVersion string) DoctorChec
 		}
 
 		// Version is behind but not too old - this is normal after upgrade
-		return DoctorCheck{
-			Name:    "Version Tracking",
-			Status:  StatusOK,
-			Message: fmt.Sprintf("Version tracking active (last: %s, current: %s)", lastVersion, currentVersion),
-		}
+		return trackingActive
 	}
 
 	// Version is current or ahead
@@ -258,6 +304,49 @@ func CompareVersions(v1, v2 string) int {
 	}
 
 	return 0
+}
+
+// IsBrewHeadVersion recognizes the version Homebrew stamps into --HEAD
+// installs of the core beads formula: HEAD-<shortsha>, a bare HEAD when the
+// head spec resolves no commit, and either shape carrying Homebrew's
+// _<revision> suffix. Such a stamp is a healthy current-era version marker,
+// not a malformed one — the binary rewrites it identically on every run, so
+// nothing the user does can "fix" it into semver.
+//
+// This is the canonical definition; every consumer of a version stamp that
+// needs to tell a --HEAD build apart from a release delegates here so the
+// ends cannot drift.
+func IsBrewHeadVersion(version string) bool {
+	rest, ok := strings.CutPrefix(version, "HEAD")
+	if !ok {
+		return false
+	}
+	// Homebrew's pkg_version appends _<revision> once the formula carries a
+	// revision, so a revision bump must not read as malformed. The revision is
+	// an unsigned decimal; a digits-only check keeps Atoi's tolerance of
+	// signed forms ("+1", "-0") from admitting shapes brew never emits.
+	if cut := strings.IndexByte(rest, '_'); cut >= 0 {
+		revision := rest[cut+1:]
+		if revision == "" || strings.Trim(revision, "0123456789") != "" {
+			return false
+		}
+		rest = rest[:cut]
+	}
+	// Homebrew leaves the version as a bare "HEAD" whenever the head spec
+	// cannot resolve a commit.
+	if rest == "" {
+		return true
+	}
+	sha, ok := strings.CutPrefix(rest, "-")
+	if !ok {
+		return false
+	}
+	// Bound the tail to a plausible git abbreviation so that arbitrary hex
+	// cannot stand in for a commit; git never abbreviates below 7 characters.
+	if len(sha) < 7 || len(sha) > 40 {
+		return false
+	}
+	return strings.Trim(sha, "0123456789abcdefABCDEF") == ""
 }
 
 // IsValidSemver checks if a version string is valid semver-like format (X.Y.Z)

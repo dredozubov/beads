@@ -1,17 +1,15 @@
 package main
 
 import (
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/rpc"
-	"github.com/steveyegge/beads/internal/types"
+	"github.com/steveyegge/beads/internal/metrics"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/ui"
-	"github.com/steveyegge/beads/internal/utils"
 )
 
 var editCmd = &cobra.Command{
@@ -28,22 +26,35 @@ Examples:
   bd edit bd-42 --design           # Edit design notes
   bd edit bd-42 --notes            # Edit notes
   bd edit bd-42 --acceptance       # Edit acceptance criteria`,
-	Args: cobra.ExactArgs(1),
-	Run: func(cmd *cobra.Command, args []string) {
+	Args:          cobra.ExactArgs(1),
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
 		CheckReadonly("edit")
+
+		evt := metrics.NewCommandEvent("edit")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
+
+		if usesProxiedServer() {
+			return runEditProxiedServer(cmd, rootCtx, args)
+		}
+
 		id := args[0]
 		ctx := rootCtx
 
-		// Resolve partial ID if in direct mode
-		if daemonClient == nil {
-			fullID, err := utils.ResolvePartialID(ctx, store, id)
-			if err != nil {
-				FatalErrorRespectJSON("resolving %s: %v", id, err)
-			}
-			id = fullID
+		// Resolve ID with prefix routing (supports cross-rig edits like `bd edit xe-5ls`)
+		result, err := resolveAndGetIssueForMutation(ctx, store, id)
+		if err != nil {
+			return HandleErrorRespectJSON("resolving %s: %v", id, err)
 		}
+		defer result.Close()
+		id = result.ResolvedID
+		issueStore := result.Store
 
-		// Determine which field to edit
 		fieldToEdit := "description"
 		if cmd.Flags().Changed("title") {
 			fieldToEdit = "title"
@@ -55,13 +66,11 @@ Examples:
 			fieldToEdit = "acceptance_criteria"
 		}
 
-		// Get the editor from environment
 		editor := os.Getenv("EDITOR")
 		if editor == "" {
 			editor = os.Getenv("VISUAL")
 		}
 		if editor == "" {
-			// Try common defaults
 			for _, defaultEditor := range []string{"vim", "vi", "nano", "emacs"} {
 				if _, err := exec.LookPath(defaultEditor); err == nil {
 					editor = defaultEditor
@@ -70,37 +79,11 @@ Examples:
 			}
 		}
 		if editor == "" {
-			FatalErrorRespectJSON("no editor found. Set $EDITOR or $VISUAL environment variable")
+			return HandleErrorRespectJSON("no editor found. Set $EDITOR or $VISUAL environment variable")
 		}
 
-		// Get the current issue
-		var issue *types.Issue
-		var err error
+		issue := result.Issue
 
-		if daemonClient != nil {
-			// Daemon mode
-			showArgs := &rpc.ShowArgs{ID: id}
-			resp, err := daemonClient.Show(showArgs)
-			if err != nil {
-				FatalErrorRespectJSON("fetching issue %s: %v", id, err)
-			}
-
-			issue = &types.Issue{}
-			if err := json.Unmarshal(resp.Data, issue); err != nil {
-				FatalErrorRespectJSON("parsing issue data: %v", err)
-			}
-		} else {
-			// Direct mode
-			issue, err = store.GetIssue(ctx, id)
-			if err != nil {
-				FatalErrorRespectJSON("fetching issue %s: %v", id, err)
-			}
-			if issue == nil {
-				FatalErrorRespectJSON("issue %s not found", id)
-			}
-		}
-
-		// Get the current field value
 		var currentValue string
 		switch fieldToEdit {
 		case "title":
@@ -115,22 +98,24 @@ Examples:
 			currentValue = issue.AcceptanceCriteria
 		}
 
-		// Create a temporary file with the current value
 		tmpFile, err := os.CreateTemp("", fmt.Sprintf("bd-edit-%s-*.txt", fieldToEdit))
 		if err != nil {
-			FatalErrorRespectJSON("creating temp file: %v", err)
+			return HandleErrorRespectJSON("creating temp file: %v", err)
 		}
 		tmpPath := tmpFile.Name()
-		defer func() { _ = os.Remove(tmpPath) }()
+		editSaved := false
+		defer func() {
+			if editSaved {
+				_ = os.Remove(tmpPath)
+			}
+		}()
 
-		// Write current value to temp file
 		if _, err := tmpFile.WriteString(currentValue); err != nil {
 			_ = tmpFile.Close()
-			FatalErrorRespectJSON("writing to temp file: %v", err)
+			return HandleErrorRespectJSON("writing to temp file: %v", err)
 		}
 		_ = tmpFile.Close()
 
-		// Open the editor - parse command and args (handles "vim -w" or "zeditor --wait")
 		editorParts := strings.Fields(editor)
 		editorArgs := append(editorParts[1:], tmpPath)
 		editorCmd := exec.Command(editorParts[0], editorArgs...) //nolint:gosec // G204: editor from trusted $EDITOR/$VISUAL env or known defaults
@@ -139,65 +124,62 @@ Examples:
 		editorCmd.Stderr = os.Stderr
 
 		if err := editorCmd.Run(); err != nil {
-			FatalErrorRespectJSON("running editor: %v", err)
+			return HandleErrorRespectJSON("running editor: %v", err)
 		}
 
-		// Read the edited content
 		// #nosec G304 -- tmpPath was created earlier in this function
 		editedContent, err := os.ReadFile(tmpPath)
 		if err != nil {
-			FatalErrorRespectJSON("reading edited file: %v", err)
+			return HandleErrorRespectJSON("reading edited file: %v", err)
 		}
 
-		newValue := string(editedContent)
+		newValue := strings.TrimSpace(string(editedContent))
 
-		// Check if the value changed
 		if newValue == currentValue {
+			editSaved = true
 			fmt.Println("No changes made")
-			return
+			return nil
 		}
 
-		// Validate title if editing title
-		if fieldToEdit == "title" && strings.TrimSpace(newValue) == "" {
-			FatalErrorRespectJSON("title cannot be empty")
+		if fieldToEdit == "title" && newValue == "" {
+			return HandleErrorRespectJSON("title cannot be empty")
 		}
 
-		// Update the issue
 		updates := map[string]interface{}{
 			fieldToEdit: newValue,
 		}
 
-		if daemonClient != nil {
-			// Daemon mode
-			updateArgs := &rpc.UpdateArgs{ID: id}
+		err = issueStore.UpdateIssue(ctx, id, updates, actor)
+		if err != nil {
+			if accessor, ok := storage.UnwrapStore(issueStore).(storage.RawDBAccessor); ok {
+				if pingErr := accessor.DB().PingContext(ctx); pingErr != nil {
+					accessor.DB().SetConnMaxIdleTime(0)
+					_ = accessor.DB().PingContext(ctx)
+				}
+			}
+			err = issueStore.UpdateIssue(ctx, id, updates, actor)
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Your edits are preserved in: %s\n", tmpPath)
+			return HandleErrorRespectJSON("updating issue: %v", err)
+		}
+		editSaved = true
+		if err := commitPendingIfEmbedded(ctx, issueStore, actor, doltAutoCommitParams{
+			Command:  "edit",
+			IssueIDs: []string{id},
+		}); err != nil {
+			fmt.Fprintf(os.Stderr, "Your edits are preserved in: %s\n", tmpPath)
+			return HandleErrorRespectJSON("failed to commit: %v", err)
+		}
 
-			switch fieldToEdit {
-			case "title":
-				updateArgs.Title = &newValue
-			case "description":
-				updateArgs.Description = &newValue
-			case "design":
-				updateArgs.Design = &newValue
-			case "notes":
-				updateArgs.Notes = &newValue
-			case "acceptance_criteria":
-				updateArgs.AcceptanceCriteria = &newValue
-			}
-
-			_, err := daemonClient.Update(updateArgs)
-			if err != nil {
-				FatalErrorRespectJSON("updating issue: %v", err)
-			}
-		} else {
-			// Direct mode
-			if err := store.UpdateIssue(ctx, id, updates, actor); err != nil {
-				FatalErrorRespectJSON("updating issue: %v", err)
-			}
-			markDirtyAndScheduleFlush()
+		displayTitle := issue.Title
+		if fieldToEdit == "title" {
+			displayTitle = newValue
 		}
 
 		fieldName := strings.ReplaceAll(fieldToEdit, "_", " ")
-		fmt.Printf("%s Updated %s for issue: %s\n", ui.RenderPass("✓"), fieldName, id)
+		fmt.Printf("%s Updated %s for issue: %s\n", ui.RenderPass("✓"), fieldName, formatFeedbackID(id, displayTitle))
+		return nil
 	},
 }
 

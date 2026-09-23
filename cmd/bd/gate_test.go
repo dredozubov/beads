@@ -1,17 +1,104 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
+	"encoding/json"
+	"errors"
+	"io"
 	"os"
 	"path/filepath"
+	"slices"
+	"sync"
 	"testing"
-	"time"
 
-	_ "github.com/ncruces/go-sqlite3/driver"
-	_ "github.com/ncruces/go-sqlite3/embed"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 )
+
+var gateTestStdoutMu sync.Mutex
+
+type gateCloseCall struct {
+	id      string
+	reason  string
+	actor   string
+	session string
+}
+
+type fakeGateCheckStore struct {
+	storage.DoltStorage
+	issues       []*types.Issue
+	searchFilter types.IssueFilter
+	closeCalls   []gateCloseCall
+}
+
+func (f *fakeGateCheckStore) SearchIssues(_ context.Context, _ string, filter types.IssueFilter) ([]*types.Issue, error) {
+	f.searchFilter = filter
+	return f.issues, nil
+}
+
+func (f *fakeGateCheckStore) CloseIssue(_ context.Context, id, reason, actor, session string) error {
+	f.closeCalls = append(f.closeCalls, gateCloseCall{
+		id:      id,
+		reason:  reason,
+		actor:   actor,
+		session: session,
+	})
+	return nil
+}
+
+func captureGateStdout(t *testing.T, fn func()) string {
+	t.Helper()
+
+	gateTestStdoutMu.Lock()
+	defer gateTestStdoutMu.Unlock()
+
+	old := os.Stdout
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatalf("os.Pipe: %v", err)
+	}
+	os.Stdout = w
+
+	var buf bytes.Buffer
+	done := make(chan struct{})
+	go func() {
+		_, _ = io.Copy(&buf, r)
+		close(done)
+	}()
+
+	fn()
+
+	_ = w.Close()
+	os.Stdout = old
+	<-done
+	_ = r.Close()
+
+	return buf.String()
+}
+
+func resetGateCheckFlags(t *testing.T) {
+	t.Helper()
+
+	if err := gateCheckCmd.Flags().Set("type", ""); err != nil {
+		t.Fatalf("reset type flag: %v", err)
+	}
+	if err := gateCheckCmd.Flags().Set("dry-run", "false"); err != nil {
+		t.Fatalf("reset dry-run flag: %v", err)
+	}
+	if err := gateCheckCmd.Flags().Set("escalate", "false"); err != nil {
+		t.Fatalf("reset escalate flag: %v", err)
+	}
+	if err := gateCheckCmd.Flags().Set("limit", "100"); err != nil {
+		t.Fatalf("reset limit flag: %v", err)
+	}
+
+	gateCheckCmd.Flags().Lookup("type").Changed = false
+	gateCheckCmd.Flags().Lookup("dry-run").Changed = false
+	gateCheckCmd.Flags().Lookup("escalate").Changed = false
+	gateCheckCmd.Flags().Lookup("limit").Changed = false
+}
 
 func TestShouldCheckGate(t *testing.T) {
 	tests := []struct {
@@ -65,138 +152,383 @@ func TestShouldCheckGate(t *testing.T) {
 	}
 }
 
-func TestCheckBeadGate_InvalidFormat(t *testing.T) {
-	ctx := context.Background()
+// fakeBeadGateGetter fakes the one lookup checkBeadGate performs.
+type fakeBeadGateGetter struct {
+	issues map[string]*types.Issue
+	err    error
+	gotID  string
+}
 
+func (f *fakeBeadGateGetter) GetIssue(_ context.Context, id string) (*types.Issue, error) {
+	f.gotID = id
+	if f.err != nil {
+		return nil, f.err
+	}
+	return f.issues[id], nil
+}
+
+func TestCheckBeadGate_CrossRigUsesBeadIDForRoutedLookup(t *testing.T) {
+	ctx := context.Background()
+	st := &fakeBeadGateGetter{issues: map[string]*types.Issue{
+		"gt-abc": {ID: "gt-abc", Status: types.StatusClosed},
+	}}
+
+	satisfied, reason := checkBeadGate(ctx, st, "gastown:gt-abc")
+	if !satisfied {
+		t.Fatalf("expected closed routed bead to satisfy gate, got reason %q", reason)
+	}
+	if st.gotID != "gt-abc" {
+		t.Fatalf("routed lookup ID = %q, want %q", st.gotID, "gt-abc")
+	}
+}
+
+func TestProxiedFreshReadGetterPreservesLocalNotFoundWhenRoutingUnavailable(t *testing.T) {
+	withStubbedProxiedLookup(t, nil)
+
+	oldDBPath := dbPath
+	dbPath = filepath.Join(t.TempDir(), ".beads", "dolt")
+	t.Cleanup(func() { dbPath = oldDBPath })
+
+	_, err := (proxiedFreshReadGetter{}).GetIssue(context.Background(), "bd-missing")
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Fatalf("GetIssue error = %v, want original local not-found", err)
+	}
+}
+
+func TestCheckBeadGate_InvalidCrossRigFormat(t *testing.T) {
+	ctx := context.Background()
 	tests := []struct {
 		name    string
 		awaitID string
-		wantErr string
 	}{
-		{
-			name:    "empty",
-			awaitID: "",
-			wantErr: "invalid await_id format",
-		},
-		{
-			name:    "no colon",
-			awaitID: "gastown-gt-abc",
-			wantErr: "invalid await_id format",
-		},
-		{
-			name:    "missing rig",
-			awaitID: ":gt-abc",
-			wantErr: "await_id missing rig name",
-		},
-		{
-			name:    "missing bead",
-			awaitID: "gastown:",
-			wantErr: "await_id missing rig name or bead ID",
-		},
+		{name: "missing rig", awaitID: ":gt-abc"},
+		{name: "missing bead", awaitID: "my-project:"},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			satisfied, reason := checkBeadGate(ctx, tt.awaitID)
+			satisfied, reason := checkBeadGate(ctx, nil, tt.awaitID)
 			if satisfied {
 				t.Errorf("expected not satisfied for %q", tt.awaitID)
 			}
-			if reason == "" {
-				t.Error("expected reason to be set")
-			}
-			// Just check the error message contains the expected substring
-			if tt.wantErr != "" && !gateTestContainsIgnoreCase(reason, tt.wantErr) {
-				t.Errorf("reason %q does not contain %q", reason, tt.wantErr)
+			if !gateTestContainsIgnoreCase(reason, "expected <rig>:<bead-id>") {
+				t.Errorf("reason %q does not describe the expected format", reason)
 			}
 		})
 	}
 }
 
-func TestCheckBeadGate_RigNotFound(t *testing.T) {
-	ctx := context.Background()
-
-	// Create a temp directory with a minimal beads setup
-	tmpDir, err := os.MkdirTemp("", "gate_test")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	// Change to temp dir
-	origDir, _ := os.Getwd()
-	defer os.Chdir(origDir)
-	os.Chdir(tmpDir)
-
-	// Try to check a gate for a non-existent rig
-	satisfied, reason := checkBeadGate(ctx, "nonexistent:some-id")
+func TestCheckBeadGate_EmptyAwaitID(t *testing.T) {
+	satisfied, reason := checkBeadGate(context.Background(), nil, "")
 	if satisfied {
-		t.Error("expected not satisfied for non-existent rig")
+		t.Error("expected not satisfied for empty await_id")
 	}
 	if reason == "" {
 		t.Error("expected reason to be set")
 	}
-	// The error should mention the rig not being found
-	if !gateTestContainsIgnoreCase(reason, "not found") && !gateTestContainsIgnoreCase(reason, "could not find") {
-		t.Errorf("reason should mention not found: %q", reason)
+}
+
+func TestCheckBeadGate_LocalBead(t *testing.T) {
+	// A plain (no-colon) await_id is a bead in this rig's own database
+	// (wy-hgms2): closed resolves the gate, anything else stays pending with
+	// a status-bearing reason.
+	ctx := context.Background()
+	st := &fakeBeadGateGetter{
+		issues: map[string]*types.Issue{
+			"bd-closed": {ID: "bd-closed", Status: types.StatusClosed},
+			"bd-open":   {ID: "bd-open", Status: types.StatusOpen},
+		},
+	}
+
+	satisfied, reason := checkBeadGate(ctx, st, "bd-closed")
+	if !satisfied {
+		t.Errorf("expected satisfied for closed local bead, got reason %q", reason)
+	}
+	if !gateTestContainsIgnoreCase(reason, "closed") {
+		t.Errorf("reason %q does not mention closed", reason)
+	}
+
+	satisfied, reason = checkBeadGate(ctx, st, "bd-open")
+	if satisfied {
+		t.Error("expected not satisfied for open local bead")
+	}
+	if !gateTestContainsIgnoreCase(reason, "open") {
+		t.Errorf("reason %q does not mention the bead status", reason)
 	}
 }
 
-func TestCheckBeadGate_TargetClosed(t *testing.T) {
-	// Create a temporary database that simulates a target rig
-	tmpDir, err := os.MkdirTemp("", "bead_gate_test")
-	if err != nil {
-		t.Fatal(err)
+func TestCheckBeadGate_LocalBeadNotFound(t *testing.T) {
+	st := &fakeBeadGateGetter{issues: map[string]*types.Issue{}}
+	satisfied, reason := checkBeadGate(context.Background(), st, "bd-missing")
+	if satisfied {
+		t.Error("expected not satisfied for missing local bead")
 	}
-	defer os.RemoveAll(tmpDir)
+	if !gateTestContainsIgnoreCase(reason, "not found") {
+		t.Errorf("reason %q does not mention not found", reason)
+	}
+}
 
-	// Create a minimal database with a closed issue
-	dbPath := filepath.Join(tmpDir, "beads.db")
-	db, err := sql.Open("sqlite3", dbPath)
+func TestCheckBeadGate_LocalBeadLookupError(t *testing.T) {
+	st := &fakeBeadGateGetter{err: errors.New("dolt exploded")}
+	satisfied, reason := checkBeadGate(context.Background(), st, "bd-abc")
+	if satisfied {
+		t.Error("expected not satisfied on lookup error")
+	}
+	if !gateTestContainsIgnoreCase(reason, "dolt exploded") {
+		t.Errorf("reason %q does not carry the lookup error", reason)
+	}
+}
+
+func TestCheckBeadGate_NilStoreStaysPending(t *testing.T) {
+	satisfied, reason := checkBeadGate(context.Background(), nil, "bd-abc")
+	if satisfied {
+		t.Error("expected not satisfied with no store")
+	}
+	if reason == "" {
+		t.Error("expected reason to be set")
+	}
+}
+
+func TestCheckGHPRUsesStateWithoutMergedField(t *testing.T) {
+	resolved, escalated, reason, err := checkGHPRWithRunner(&types.Issue{
+		IssueType: "gate",
+		AwaitType: "gh:pr",
+		AwaitID:   "3488",
+	}, fakeGHRunner(t,
+		`{"state":"MERGED","title":"Fix gate"}`,
+		"pr", "view", "3488", "--json", "state,title",
+	))
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("checkGHPR returned error: %v", err)
+	}
+	if !resolved {
+		t.Fatal("expected merged PR to resolve")
+	}
+	if escalated {
+		t.Fatal("did not expect merged PR to escalate")
+	}
+	if !gateTestContains(reason, "was merged") {
+		t.Fatalf("reason = %q, want merged message", reason)
+	}
+}
+
+func TestCheckGHPRUsesRepositoryFromMetadata(t *testing.T) {
+	resolved, escalated, reason, err := checkGHPRWithRunner(&types.Issue{
+		IssueType: "gate",
+		AwaitType: "gh:pr",
+		AwaitID:   "608",
+		Metadata:  json.RawMessage(`{"repo":"srobroek/agentic-packages"}`),
+	}, fakeGHRunner(t,
+		`{"state":"MERGED","title":"Cross-repo gate"}`,
+		"pr", "view", "608", "--json", "state,title", "--repo", "srobroek/agentic-packages",
+	))
+	if err != nil {
+		t.Fatalf("checkGHPR returned error: %v", err)
+	}
+	if !resolved || escalated {
+		t.Fatalf("resolved, escalated = %v, %v; want true, false (%s)", resolved, escalated, reason)
+	}
+}
+
+func TestCheckGHRunUsesRepositoryFromMetadata(t *testing.T) {
+	resolved, escalated, reason, err := checkGHRunWithRunner(&types.Issue{
+		IssueType: "gate",
+		AwaitType: "gh:run",
+		AwaitID:   "12345",
+		Metadata:  json.RawMessage(`{"repo":"srobroek/agentic-packages"}`),
+	}, nil,
+		fakeGHRunner(t,
+			`{"status":"completed","conclusion":"success","name":"CI"}`,
+			"run", "view", "12345", "--json", "status,conclusion,name", "--repo", "srobroek/agentic-packages",
+		),
+	)
+	if err != nil {
+		t.Fatalf("checkGHRun returned error: %v", err)
+	}
+	if !resolved || escalated {
+		t.Fatalf("resolved, escalated = %v, %v; want true, false (%s)", resolved, escalated, reason)
+	}
+}
+
+// TestCheckGHRun_CrossRepoDiscoveryUsesInjectedRunner covers the standards
+// note on the SF1 review: discoverRunIDByWorkflowNameInRepo was hard-wired to
+// runGHCommand, so the cross-repo discovery path (a workflow-name hint plus
+// metadata.repo) could not be exercised through the injected ghCommandRunner
+// seam at all. Both the discovery "run list" call and the follow-up "run
+// view" call must go through the same fake runner - if either one reached
+// the real runGHCommand this test would fail (or hang) instead of using the
+// canned response below.
+func TestCheckGHRun_CrossRepoDiscoveryUsesInjectedRunner(t *testing.T) {
+	var calls [][]string
+	fakeRunner := func(args ...string) (stdout, stderr []byte, err error) {
+		calls = append(calls, append([]string(nil), args...))
+		switch args[0] {
+		case "run":
+			if len(args) > 1 && args[1] == "list" {
+				return []byte(`[{"databaseId":999,"name":"release","status":"completed","conclusion":"success","workflowName":"release.yml"}]`), nil, nil
+			}
+			if len(args) > 1 && args[1] == "view" {
+				return []byte(`{"status":"completed","conclusion":"success","name":"CI"}`), nil, nil
+			}
+		}
+		t.Fatalf("unexpected gh invocation: %v", args)
+		return nil, nil, nil
 	}
 
-	// Create minimal schema
-	_, err = db.Exec(`
-		CREATE TABLE issues (
-			id TEXT PRIMARY KEY,
-			status TEXT,
-			title TEXT,
-			created_at TEXT,
-			updated_at TEXT
-		)
-	`)
+	resolved, escalated, reason, err := checkGHRunWithRunner(&types.Issue{
+		IssueType: "gate",
+		AwaitType: "gh:run",
+		AwaitID:   "release.yml",
+		Metadata:  json.RawMessage(`{"repo":"srobroek/agentic-packages"}`),
+	}, nil, fakeRunner)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("checkGHRun returned error: %v", err)
+	}
+	if !resolved || escalated {
+		t.Fatalf("resolved, escalated = %v, %v; want true, false (%s)", resolved, escalated, reason)
 	}
 
-	// Insert a closed issue
-	now := time.Now().Format(time.RFC3339)
-	_, err = db.Exec(`
-		INSERT INTO issues (id, status, title, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?)
-	`, "gt-test123", string(types.StatusClosed), "Test Issue", now, now)
+	wantCalls := [][]string{
+		{"run", "list", "--workflow", "release.yml", "--json", "databaseId,name,status,conclusion,createdAt,workflowName", "--limit", "5", "--repo", "srobroek/agentic-packages"},
+		{"run", "view", "999", "--json", "status,conclusion,name", "--repo", "srobroek/agentic-packages"},
+	}
+	if len(calls) != len(wantCalls) {
+		t.Fatalf("gh invocations = %v, want %v", calls, wantCalls)
+	}
+	for i, want := range wantCalls {
+		if !slices.Equal(calls[i], want) {
+			t.Errorf("gh invocation %d = %v, want %v", i, calls[i], want)
+		}
+	}
+}
+
+func TestQueryGitHubRunsForWorkflowUsesRepository(t *testing.T) {
+	runs, err := queryGitHubRunsForWorkflowInRepoWithRunner(
+		"release.yml",
+		5,
+		"srobroek/agentic-packages",
+		fakeGHRunner(t,
+			`[{"databaseId":12345,"name":"release","status":"completed","conclusion":"success","workflowName":"release.yml"}]`,
+			"run", "list", "--workflow", "release.yml", "--json", "databaseId,name,status,conclusion,createdAt,workflowName", "--limit", "5", "--repo", "srobroek/agentic-packages",
+		),
+	)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("queryGitHubRunsForWorkflowInRepo returned error: %v", err)
+	}
+	if len(runs) != 1 || runs[0].DatabaseID != 12345 {
+		t.Fatalf("runs = %#v, want one run with database ID 12345", runs)
+	}
+}
+
+func TestGitHubRepoFromIssueRejectsInvalidMetadata(t *testing.T) {
+	tests := []struct {
+		name     string
+		metadata json.RawMessage
+	}{
+		{"missing_owner", json.RawMessage(`{"repo":"missing-owner"}`)},
+		{"shell_metacharacter", json.RawMessage(`{"repo":"owner/repo;echo"}`)},
+		{"metadata_not_an_object", json.RawMessage(`"not-an-object"`)},
+		// SF3: an explicit JSON null must be rejected rather than silently
+		// falling back to the current repository - the dangerous direction,
+		// since it could point a cross-repo check at the wrong repo.
+		{"repo_null", json.RawMessage(`{"repo":null}`)},
+		{"repo_number", json.RawMessage(`{"repo":42}`)},
+		{"repo_bool", json.RawMessage(`{"repo":true}`)},
+		{"repo_object", json.RawMessage(`{"repo":{"owner":"a","name":"b"}}`)},
+		{"repo_array", json.RawMessage(`{"repo":["a","b"]}`)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if repo, err := githubRepoFromIssue(&types.Issue{Metadata: tt.metadata}); err == nil {
+				t.Fatalf("githubRepoFromIssue(%s) = %q, nil; want validation error", tt.metadata, repo)
+			}
+		})
+	}
+}
+
+// TestGitHubRepoFromIssueAllowsMissingRepoKey verifies metadata without a
+// "repo" key at all (as opposed to an explicit null) still falls back to the
+// current repository without error - only an explicit malformed value is
+// rejected (SF3).
+func TestGitHubRepoFromIssueAllowsMissingRepoKey(t *testing.T) {
+	tests := []struct {
+		name     string
+		metadata json.RawMessage
+	}{
+		{"nil_metadata", nil},
+		{"null_metadata", json.RawMessage(`null`)},
+		{"empty_object", json.RawMessage(`{}`)},
+		{"unrelated_key", json.RawMessage(`{"priority":"high"}`)},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			repo, err := githubRepoFromIssue(&types.Issue{Metadata: tt.metadata})
+			if err != nil {
+				t.Fatalf("githubRepoFromIssue(%s) returned error: %v", tt.metadata, err)
+			}
+			if repo != "" {
+				t.Fatalf("githubRepoFromIssue(%s) = %q, want empty", tt.metadata, repo)
+			}
+		})
+	}
+}
+
+// TestRepoMetadataForGateRestrictsToGitHubTypes covers SF4: repo metadata
+// inheritance/validation must only run for gh:* gate types. A human or timer
+// gate blocking an issue with non-GitHub-shaped "repo" metadata (legal per
+// the metadata contract - "any valid JSON") must not fail gate creation.
+func TestRepoMetadataForGateRestrictsToGitHubTypes(t *testing.T) {
+	badRepoMetadata := json.RawMessage(`{"repo":"not-owner-slash-repo"}`)
+
+	nonGitHubTypes := []string{"human", "timer", "bead"}
+	for _, gateType := range nonGitHubTypes {
+		t.Run("ignores_bad_repo_metadata_for_"+gateType, func(t *testing.T) {
+			metadata, err := repoMetadataForGate(gateType, &types.Issue{Metadata: badRepoMetadata})
+			if err != nil {
+				t.Fatalf("repoMetadataForGate(%q) returned error: %v; non-GitHub gates must tolerate arbitrary repo metadata", gateType, err)
+			}
+			if metadata != nil {
+				t.Fatalf("repoMetadataForGate(%q) = %s, want nil metadata", gateType, metadata)
+			}
+		})
 	}
 
-	// Insert an open issue
-	_, err = db.Exec(`
-		INSERT INTO issues (id, status, title, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?)
-	`, "gt-open456", string(types.StatusOpen), "Open Issue", now, now)
-	if err != nil {
-		t.Fatal(err)
+	githubTypes := []string{"gh:run", "gh:pr"}
+	for _, gateType := range githubTypes {
+		t.Run("rejects_bad_repo_metadata_for_"+gateType, func(t *testing.T) {
+			if _, err := repoMetadataForGate(gateType, &types.Issue{Metadata: badRepoMetadata}); err == nil {
+				t.Fatalf("repoMetadataForGate(%q) = nil error, want validation error", gateType)
+			}
+		})
+
+		t.Run("inherits_valid_repo_for_"+gateType, func(t *testing.T) {
+			metadata, err := repoMetadataForGate(gateType, &types.Issue{
+				Metadata: json.RawMessage(`{"repo":"srobroek/agentic-packages"}`),
+			})
+			if err != nil {
+				t.Fatalf("repoMetadataForGate(%q) returned error: %v", gateType, err)
+			}
+			var decoded struct {
+				Repo string `json:"repo"`
+			}
+			if unmarshalErr := json.Unmarshal(metadata, &decoded); unmarshalErr != nil {
+				t.Fatalf("repoMetadataForGate(%q) = %s, not valid JSON: %v", gateType, metadata, unmarshalErr)
+			}
+			if decoded.Repo != "srobroek/agentic-packages" {
+				t.Fatalf("repoMetadataForGate(%q) repo = %q, want srobroek/agentic-packages", gateType, decoded.Repo)
+			}
+		})
 	}
 
-	db.Close()
-
-	// Note: This test can't fully exercise checkBeadGate because it relies on
-	// routing.ResolveBeadsDirForRig which needs a proper routes.jsonl setup.
-	// The full integration test would need the town/rig infrastructure.
-	// For now, we just verify the function signature and basic error handling.
-	t.Log("Database created with closed issue gt-test123 and open issue gt-open456")
-	t.Log("Full integration testing requires routes.jsonl setup")
+	t.Run("no_metadata_no_repo", func(t *testing.T) {
+		metadata, err := repoMetadataForGate("gh:run", &types.Issue{})
+		if err != nil {
+			t.Fatalf("repoMetadataForGate(gh:run) returned error: %v", err)
+		}
+		if metadata != nil {
+			t.Fatalf("repoMetadataForGate(gh:run) = %s, want nil", metadata)
+		}
+	})
 }
 
 func TestIsNumericID(t *testing.T) {
@@ -292,6 +624,330 @@ func TestGetWorkflowNameHint(t *testing.T) {
 	}
 }
 
+func TestCheckGHRun_DryRunDoesNotPersistDiscoveredRunID(t *testing.T) {
+	origDiscover := discoverRunIDByWorkflowNameFunc
+	origUpdate := updateGateAwaitIDFunc
+	origStatus := checkGHRunStatusFunc
+	t.Cleanup(func() {
+		discoverRunIDByWorkflowNameFunc = origDiscover
+		updateGateAwaitIDFunc = origUpdate
+		checkGHRunStatusFunc = origStatus
+	})
+
+	updateCalls := 0
+	discoverRunIDByWorkflowNameFunc = func(workflowHint string) (string, error) {
+		if workflowHint != "release.yml" {
+			t.Fatalf("unexpected workflow hint %q", workflowHint)
+		}
+		return "12345", nil
+	}
+	updateGateAwaitIDFunc = func(_ interface{}, gateID, runID string) error {
+		updateCalls++
+		t.Fatalf("unexpected await_id persistence for %s -> %s", gateID, runID)
+		return nil
+	}
+	checkGHRunStatusFunc = func(runID string) (bool, bool, string, error) {
+		if runID != "12345" {
+			t.Fatalf("expected discovered run ID 12345, got %q", runID)
+		}
+		return true, false, "workflow 'release' succeeded", nil
+	}
+
+	resolved, escalated, reason, err := checkGHRun(&types.Issue{
+		ID:      "bd-gate",
+		AwaitID: "release.yml",
+	}, nil)
+	if err != nil {
+		t.Fatalf("checkGHRun returned error: %v", err)
+	}
+	if !resolved {
+		t.Fatal("expected dry-run check to resolve using discovered run status")
+	}
+	if escalated {
+		t.Fatal("did not expect escalation for successful workflow")
+	}
+	if reason == "" {
+		t.Fatal("expected resolution reason")
+	}
+	if updateCalls != 0 {
+		t.Fatalf("expected no await_id updates during dry-run, got %d", updateCalls)
+	}
+}
+
+func TestCheckGHRun_PersistsDiscoveredRunIDOutsideDryRun(t *testing.T) {
+	origDiscover := discoverRunIDByWorkflowNameFunc
+	origUpdate := updateGateAwaitIDFunc
+	origStatus := checkGHRunStatusFunc
+	t.Cleanup(func() {
+		discoverRunIDByWorkflowNameFunc = origDiscover
+		updateGateAwaitIDFunc = origUpdate
+		checkGHRunStatusFunc = origStatus
+	})
+
+	updateCalls := 0
+	discoverRunIDByWorkflowNameFunc = func(workflowHint string) (string, error) {
+		if workflowHint != "release.yml" {
+			t.Fatalf("unexpected workflow hint %q", workflowHint)
+		}
+		return "67890", nil
+	}
+	updateGateAwaitIDFunc = func(_ interface{}, gateID, runID string) error {
+		updateCalls++
+		if gateID != "bd-gate" {
+			t.Fatalf("expected gate ID bd-gate, got %q", gateID)
+		}
+		if runID != "67890" {
+			t.Fatalf("expected discovered run ID 67890, got %q", runID)
+		}
+		return nil
+	}
+	checkGHRunStatusFunc = func(runID string) (bool, bool, string, error) {
+		if runID != "67890" {
+			t.Fatalf("expected discovered run ID 67890, got %q", runID)
+		}
+		return false, false, "workflow 'release' is queued", nil
+	}
+
+	resolved, escalated, reason, err := checkGHRun(&types.Issue{
+		ID:      "bd-gate",
+		AwaitID: "release.yml",
+	}, func(gateID, runID string) error { return updateGateAwaitIDFunc(nil, gateID, runID) })
+	if err != nil {
+		t.Fatalf("checkGHRun returned error: %v", err)
+	}
+	if resolved {
+		t.Fatal("did not expect queued workflow to resolve")
+	}
+	if escalated {
+		t.Fatal("did not expect queued workflow to escalate")
+	}
+	if reason == "" {
+		t.Fatal("expected pending reason")
+	}
+	if updateCalls != 1 {
+		t.Fatalf("expected one await_id update outside dry-run, got %d", updateCalls)
+	}
+}
+
+func TestCheckGHRun_ReturnsErrorWhenPersistingDiscoveredRunIDFails(t *testing.T) {
+	origDiscover := discoverRunIDByWorkflowNameFunc
+	origUpdate := updateGateAwaitIDFunc
+	origStatus := checkGHRunStatusFunc
+	t.Cleanup(func() {
+		discoverRunIDByWorkflowNameFunc = origDiscover
+		updateGateAwaitIDFunc = origUpdate
+		checkGHRunStatusFunc = origStatus
+	})
+
+	discoverRunIDByWorkflowNameFunc = func(workflowHint string) (string, error) {
+		if workflowHint != "release.yml" {
+			t.Fatalf("unexpected workflow hint %q", workflowHint)
+		}
+		return "12345", nil
+	}
+	updateGateAwaitIDFunc = func(_ interface{}, gateID, runID string) error {
+		if gateID != "bd-gate" {
+			t.Fatalf("expected gate ID bd-gate, got %q", gateID)
+		}
+		if runID != "12345" {
+			t.Fatalf("expected discovered run ID 12345, got %q", runID)
+		}
+		return errors.New("write failed")
+	}
+	checkGHRunStatusFunc = func(runID string) (bool, bool, string, error) {
+		t.Fatalf("did not expect status check after await_id persistence failure, got %q", runID)
+		return false, false, "", nil
+	}
+
+	resolved, escalated, reason, err := checkGHRun(&types.Issue{
+		ID:      "bd-gate",
+		AwaitID: "release.yml",
+	}, func(gateID, runID string) error { return updateGateAwaitIDFunc(nil, gateID, runID) })
+	if err == nil {
+		t.Fatal("expected checkGHRun to return an error when await_id persistence fails")
+	}
+	if resolved {
+		t.Fatal("did not expect resolution when await_id persistence fails")
+	}
+	if escalated {
+		t.Fatal("did not expect escalation when await_id persistence fails")
+	}
+	if reason != "" {
+		t.Fatalf("expected empty reason on persistence failure, got %q", reason)
+	}
+	if !gateTestContains(err.Error(), "failed to update gate with discovered run ID") {
+		t.Fatalf("expected wrapped persistence error, got %v", err)
+	}
+}
+
+func TestCheckGHRunStatus_Success(t *testing.T) {
+	resolved, escalated, reason, err := checkGHRunStatusInRepoWithRunner(
+		"12345",
+		"",
+		fakeGHRunner(t,
+			`{"status":"completed","conclusion":"success","name":"release"}`,
+			"run", "view", "12345", "--json", "status,conclusion,name",
+		),
+	)
+	if err != nil {
+		t.Fatalf("checkGHRunStatus returned error: %v", err)
+	}
+	if !resolved {
+		t.Fatal("expected successful workflow run to resolve the gate")
+	}
+	if escalated {
+		t.Fatal("did not expect successful workflow run to escalate the gate")
+	}
+	if reason != "workflow 'release' succeeded" {
+		t.Fatalf("checkGHRunStatus reason = %q, want %q", reason, "workflow 'release' succeeded")
+	}
+}
+
+func TestGateCheck_GHRunWorkflowDiscoveryPersistence(t *testing.T) {
+	tests := []struct {
+		name            string
+		dryRun          bool
+		wantUpdateCalls int
+		wantCloseCalls  int
+		wantOutput      string
+	}{
+		{
+			name:            "dry run keeps discovered run ID in memory only",
+			dryRun:          true,
+			wantUpdateCalls: 0,
+			wantCloseCalls:  0,
+			wantOutput:      "would resolve - workflow 'release' succeeded",
+		},
+		{
+			name:            "live run persists discovered run ID before closing",
+			dryRun:          false,
+			wantUpdateCalls: 1,
+			wantCloseCalls:  1,
+			wantOutput:      "resolved - workflow 'release' succeeded",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			origStore := store
+			origRootCtx := rootCtx
+			origJSONOutput := jsonOutput
+			origReadonlyMode := readonlyMode
+			origActor := actor
+			origDiscover := discoverRunIDByWorkflowNameFunc
+			origUpdate := updateGateAwaitIDFunc
+			origStatus := checkGHRunStatusFunc
+			t.Cleanup(func() {
+				store = origStore
+				rootCtx = origRootCtx
+				jsonOutput = origJSONOutput
+				readonlyMode = origReadonlyMode
+				actor = origActor
+				discoverRunIDByWorkflowNameFunc = origDiscover
+				updateGateAwaitIDFunc = origUpdate
+				checkGHRunStatusFunc = origStatus
+				resetGateCheckFlags(t)
+			})
+
+			resetGateCheckFlags(t)
+
+			fakeStore := &fakeGateCheckStore{
+				issues: []*types.Issue{
+					{
+						ID:        "bd-gate",
+						IssueType: "gate",
+						AwaitType: "gh:run",
+						AwaitID:   "release.yml",
+					},
+				},
+			}
+
+			store = fakeStore
+			rootCtx = context.Background()
+			jsonOutput = false
+			readonlyMode = false
+			actor = "test-actor"
+
+			if err := gateCheckCmd.Flags().Set("dry-run", map[bool]string{true: "true", false: "false"}[tt.dryRun]); err != nil {
+				t.Fatalf("set dry-run flag: %v", err)
+			}
+			if err := gateCheckCmd.Flags().Set("type", "gh:run"); err != nil {
+				t.Fatalf("set type flag: %v", err)
+			}
+			if err := gateCheckCmd.Flags().Set("escalate", "false"); err != nil {
+				t.Fatalf("set escalate flag: %v", err)
+			}
+			if err := gateCheckCmd.Flags().Set("limit", "100"); err != nil {
+				t.Fatalf("set limit flag: %v", err)
+			}
+
+			updateCalls := 0
+			discoverRunIDByWorkflowNameFunc = func(workflowHint string) (string, error) {
+				if workflowHint != "release.yml" {
+					t.Fatalf("unexpected workflow hint %q", workflowHint)
+				}
+				return "12345", nil
+			}
+			updateGateAwaitIDFunc = func(_ interface{}, gateID, runID string) error {
+				updateCalls++
+				if gateID != "bd-gate" {
+					t.Fatalf("expected gate ID bd-gate, got %q", gateID)
+				}
+				if runID != "12345" {
+					t.Fatalf("expected discovered run ID 12345, got %q", runID)
+				}
+				return nil
+			}
+			checkGHRunStatusFunc = func(runID string) (bool, bool, string, error) {
+				if runID != "12345" {
+					t.Fatalf("expected discovered run ID 12345, got %q", runID)
+				}
+				return true, false, "workflow 'release' succeeded", nil
+			}
+
+			output := captureGateStdout(t, func() {
+				if err := gateCheckCmd.RunE(gateCheckCmd, nil); err != nil {
+					t.Fatalf("gateCheckCmd.RunE: %v", err)
+				}
+			})
+
+			if updateCalls != tt.wantUpdateCalls {
+				t.Fatalf("updateGateAwaitIDFunc call count = %d, want %d", updateCalls, tt.wantUpdateCalls)
+			}
+			if len(fakeStore.closeCalls) != tt.wantCloseCalls {
+				t.Fatalf("CloseIssue call count = %d, want %d", len(fakeStore.closeCalls), tt.wantCloseCalls)
+			}
+			if !gateTestContains(output, tt.wantOutput) {
+				t.Fatalf("output %q does not contain %q", output, tt.wantOutput)
+			}
+			if !gateTestContains(output, "Checked 1 gates: 1 resolved, 0 escalated, 0 errors") {
+				t.Fatalf("summary output missing expected counts: %q", output)
+			}
+			if fakeStore.searchFilter.IssueType == nil || *fakeStore.searchFilter.IssueType != "gate" {
+				t.Fatalf("expected gate filter, got %+v", fakeStore.searchFilter)
+			}
+			if len(fakeStore.searchFilter.ExcludeStatus) != 1 || fakeStore.searchFilter.ExcludeStatus[0] != types.StatusClosed {
+				t.Fatalf("expected closed-status exclusion, got %+v", fakeStore.searchFilter.ExcludeStatus)
+			}
+			if fakeStore.searchFilter.Limit != 100 {
+				t.Fatalf("expected limit 100, got %d", fakeStore.searchFilter.Limit)
+			}
+			if tt.wantCloseCalls == 1 {
+				call := fakeStore.closeCalls[0]
+				if call.id != "bd-gate" {
+					t.Fatalf("expected CloseIssue for bd-gate, got %q", call.id)
+				}
+				if call.reason != "workflow 'release' succeeded" {
+					t.Fatalf("expected CloseIssue reason to match status, got %q", call.reason)
+				}
+				if call.actor != "test-actor" {
+					t.Fatalf("expected CloseIssue actor test-actor, got %q", call.actor)
+				}
+			}
+		})
+	}
+}
+
 func TestWorkflowNameMatches(t *testing.T) {
 	tests := []struct {
 		name         string
@@ -331,6 +987,88 @@ func TestWorkflowNameMatches(t *testing.T) {
 	}
 }
 
+func TestCheckGHPR_StateHandling(t *testing.T) {
+	tests := []struct {
+		name           string
+		ghJSON         string
+		wantResolved   bool
+		wantEscalated  bool
+		reasonContains string
+	}{
+		{
+			name:           "MERGED resolves gate",
+			ghJSON:         `{"state":"MERGED","title":"Add feature X"}`,
+			wantResolved:   true,
+			wantEscalated:  false,
+			reasonContains: "was merged",
+		},
+		{
+			name:           "CLOSED escalates without merge",
+			ghJSON:         `{"state":"CLOSED","title":"Stale PR"}`,
+			wantResolved:   false,
+			wantEscalated:  true,
+			reasonContains: "closed without merging",
+		},
+		{
+			name:           "OPEN leaves gate pending",
+			ghJSON:         `{"state":"OPEN","title":"WIP"}`,
+			wantResolved:   false,
+			wantEscalated:  false,
+			reasonContains: "still open",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			gate := &types.Issue{AwaitID: "https://github.com/org/repo/pull/1"}
+			resolved, escalated, reason, err := checkGHPRWithRunner(gate, fakeGHRunner(t,
+				tt.ghJSON,
+				"pr", "view", gate.AwaitID, "--json", "state,title",
+			))
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if resolved != tt.wantResolved {
+				t.Errorf("resolved = %v, want %v", resolved, tt.wantResolved)
+			}
+			if escalated != tt.wantEscalated {
+				t.Errorf("escalated = %v, want %v", escalated, tt.wantEscalated)
+			}
+			if !gateTestContainsIgnoreCase(reason, tt.reasonContains) {
+				t.Errorf("reason %q does not contain %q", reason, tt.reasonContains)
+			}
+		})
+	}
+}
+
+func TestCheckGHPR_NoMergedFieldRequested(t *testing.T) {
+	gate := &types.Issue{AwaitID: "https://github.com/org/repo/pull/99"}
+	resolved, _, reason, err := checkGHPRWithRunner(gate, fakeGHRunner(t,
+		`{"state":"MERGED","title":"Test PR"}`,
+		"pr", "view", gate.AwaitID, "--json", "state,title",
+	))
+	if err != nil {
+		t.Fatalf("checkGHPR failed (likely requested 'merged' field): %v", err)
+	}
+	if !resolved {
+		t.Errorf("expected resolved=true for MERGED state")
+	}
+	if !gateTestContainsIgnoreCase(reason, "was merged") {
+		t.Errorf("reason %q should contain 'was merged'", reason)
+	}
+}
+
+func fakeGHRunner(t *testing.T, stdout string, wantArgs ...string) ghCommandRunner {
+	t.Helper()
+	return func(args ...string) ([]byte, []byte, error) {
+		t.Helper()
+		if !slices.Equal(args, wantArgs) {
+			t.Fatalf("gh arguments = %q, want %q", args, wantArgs)
+		}
+		return []byte(stdout), nil, nil
+	}
+}
+
 // gateTestContainsIgnoreCase checks if haystack contains needle (case-insensitive)
 func gateTestContainsIgnoreCase(haystack, needle string) bool {
 	return gateTestContains(gateTestLowerCase(haystack), gateTestLowerCase(needle))
@@ -360,4 +1098,62 @@ func gateTestFindSubstring(s, substr string) int {
 		}
 	}
 	return -1
+}
+
+// TestFilterIssueGates covers the bead-scoping helper behind `bd gate list <issue-id>`:
+// only gate-type dependencies are returned, --all controls closed visibility, and the
+// limit is honored. Regression guard for the bug where `bd gate list <bead>` silently
+// ignored the argument and returned the DB-wide gate list.
+func TestFilterIssueGates(t *testing.T) {
+	gate := types.IssueType("gate")
+	task := types.IssueType("task")
+	deps := []*types.Issue{
+		{ID: "g-open", IssueType: gate, Status: types.StatusOpen},
+		{ID: "g-closed", IssueType: gate, Status: types.StatusClosed},
+		{ID: "t-blocker", IssueType: task, Status: types.StatusOpen}, // not a gate
+		nil, // defensive: skipped
+		{ID: "g-open2", IssueType: gate, Status: types.StatusOpen},
+	}
+
+	t.Run("open_only_excludes_closed_and_nongates", func(t *testing.T) {
+		got := filterIssueGates(deps, false, 0)
+		ids := gateIDs(got)
+		if len(got) != 2 || ids[0] != "g-open" || ids[1] != "g-open2" {
+			t.Fatalf("expected [g-open g-open2], got %v", ids)
+		}
+	})
+
+	t.Run("all_includes_closed_gates_only", func(t *testing.T) {
+		got := filterIssueGates(deps, true, 0)
+		ids := gateIDs(got)
+		if len(got) != 3 {
+			t.Fatalf("expected 3 gates (incl. closed), got %v", ids)
+		}
+		for _, id := range ids {
+			if id == "t-blocker" {
+				t.Fatalf("non-gate dependency leaked into result: %v", ids)
+			}
+		}
+	})
+
+	t.Run("limit_caps_results", func(t *testing.T) {
+		got := filterIssueGates(deps, true, 1)
+		if len(got) != 1 || got[0].ID != "g-open" {
+			t.Fatalf("expected limit=1 -> [g-open], got %v", gateIDs(got))
+		}
+	})
+
+	t.Run("empty_deps", func(t *testing.T) {
+		if got := filterIssueGates(nil, true, 0); len(got) != 0 {
+			t.Fatalf("expected no gates, got %v", gateIDs(got))
+		}
+	})
+}
+
+func gateIDs(gs []*types.Issue) []string {
+	ids := make([]string, 0, len(gs))
+	for _, g := range gs {
+		ids = append(ids, g.ID)
+	}
+	return ids
 }

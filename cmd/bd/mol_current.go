@@ -2,16 +2,13 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"os"
 	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/rpc"
-	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/metrics"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
@@ -23,14 +20,14 @@ const LargeMoleculeThreshold = 100
 
 // MoleculeProgress holds the progress information for a molecule
 type MoleculeProgress struct {
-	MoleculeID    string         `json:"molecule_id"`
-	MoleculeTitle string         `json:"molecule_title"`
-	Assignee      string         `json:"assignee,omitempty"`
-	CurrentStep   *types.Issue   `json:"current_step,omitempty"`
-	NextStep      *types.Issue   `json:"next_step,omitempty"`
-	Steps         []*StepStatus  `json:"steps"`
-	Completed     int            `json:"completed"`
-	Total         int            `json:"total"`
+	MoleculeID    string        `json:"molecule_id"`
+	MoleculeTitle string        `json:"molecule_title"`
+	Assignee      string        `json:"assignee,omitempty"`
+	CurrentStep   *types.Issue  `json:"current_step,omitempty"`
+	NextStep      *types.Issue  `json:"next_step,omitempty"`
+	Steps         []*StepStatus `json:"steps"`
+	Completed     int           `json:"completed"`
+	Total         int           `json:"total"`
 }
 
 // StepStatus represents the status of a step in a molecule
@@ -59,74 +56,70 @@ For large molecules (>100 steps), a summary is shown instead.
 Use --limit or --range to view specific steps:
   bd mol current <id> --limit 50       # Show first 50 steps
   bd mol current <id> --range 100-150  # Show steps 100-150`,
-	Args: cobra.MaximumNArgs(1),
-	Run: func(cmd *cobra.Command, args []string) {
-		ctx := rootCtx
+	Args:          cobra.MaximumNArgs(1),
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		evt := metrics.NewCommandEvent("mol-current")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
+
 		forAgent, _ := cmd.Flags().GetString("for")
 		limit, _ := cmd.Flags().GetInt("limit")
 		rangeStr, _ := cmd.Flags().GetString("range")
 
-		// Determine who we're looking for
 		agent := forAgent
 		if agent == "" {
-			agent = actor // Default to current user/agent
+			agent = actor
 		}
 
-		// mol current requires direct store access for subgraph loading
+		if usesProxiedServer() {
+			return runMolCurrentProxiedServer(rootCtx, args, agent, limit, rangeStr)
+		}
+
+		ctx := rootCtx
+
 		if store == nil {
-			if daemonClient != nil {
-				fmt.Fprintf(os.Stderr, "Error: mol current requires direct database access\n")
-				fmt.Fprintf(os.Stderr, "Hint: use --no-daemon flag: bd --no-daemon mol current\n")
-			} else {
-				fmt.Fprintf(os.Stderr, "Error: no database connection\n")
-			}
-			os.Exit(1)
+			return HandleErrorRespectJSON("no database connection")
 		}
 
-		// Parse range flag if provided
 		var rangeStart, rangeEnd int
 		if rangeStr != "" {
 			var err error
 			rangeStart, rangeEnd, err = parseRange(rangeStr)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: invalid range '%s': %v\n", rangeStr, err)
-				os.Exit(1)
+				return HandleErrorRespectJSON("invalid range '%s': %v", rangeStr, err)
 			}
 		}
 
-		// Determine if user explicitly requested steps
 		explicitSteps := limit > 0 || rangeStr != ""
 
 		var molecules []*MoleculeProgress
 
 		if len(args) == 1 {
-			// Explicit molecule ID given
 			moleculeID, err := utils.ResolvePartialID(ctx, store, args[0])
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: molecule '%s' not found\n", args[0])
-				os.Exit(1)
+				return HandleErrorRespectJSON("molecule '%s' not found", args[0])
 			}
 
-			// Check child count first for large molecule detection
 			stats, err := store.GetMoleculeProgress(ctx, moleculeID)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error loading molecule: %v\n", err)
-				os.Exit(1)
+				return HandleErrorRespectJSON("loading molecule: %v", err)
 			}
 
-			// If large molecule and no explicit flags, show summary
 			if stats.Total > LargeMoleculeThreshold && !explicitSteps && !jsonOutput {
 				printLargeMoleculeSummary(stats)
-				return
+				return nil
 			}
 
 			progress, err := getMoleculeProgress(ctx, store, moleculeID)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error loading molecule: %v\n", err)
-				os.Exit(1)
+				return HandleErrorRespectJSON("loading molecule: %v", err)
 			}
 
-			// Apply limit or range filtering
 			if rangeStr != "" {
 				progress.Steps = filterStepsByRange(progress.Steps, rangeStart, rangeEnd)
 			} else if limit > 0 && len(progress.Steps) > limit {
@@ -135,12 +128,15 @@ Use --limit or --range to view specific steps:
 
 			molecules = append(molecules, progress)
 		} else {
-			// Infer from in_progress issues
 			molecules = findInProgressMolecules(ctx, store, agent)
+
+			if len(molecules) == 0 {
+				molecules = findHookedMolecules(ctx, store, agent)
+			}
+
 			if len(molecules) == 0 {
 				if jsonOutput {
-					outputJSON([]interface{}{})
-					return
+					return outputJSON([]interface{}{})
 				}
 				fmt.Printf("No molecules in progress")
 				if agent != "" {
@@ -148,29 +144,28 @@ Use --limit or --range to view specific steps:
 				}
 				fmt.Println(".")
 				fmt.Println("\nTo start work on a molecule:")
-				fmt.Println("  bd mol pour <proto-id>      # Instantiate a molecule from template")
-				fmt.Println("  bd update <step-id> --status in_progress  # Claim a step")
-				return
+				fmt.Println("  bd mol wisp create <proto-id>  # Instantiate as ephemeral wisp")
+				fmt.Println("  bd update <step-id> --claim  # Claim a step")
+				return nil
 			}
 		}
 
 		if jsonOutput {
-			outputJSON(molecules)
-			return
+			return outputJSON(molecules)
 		}
 
-		// Human-readable output
 		for i, mol := range molecules {
 			if i > 0 {
 				fmt.Println()
 			}
 			printMoleculeProgress(mol)
 		}
+		return nil
 	},
 }
 
 // getMoleculeProgress loads a molecule and computes progress
-func getMoleculeProgress(ctx context.Context, s storage.Storage, moleculeID string) (*MoleculeProgress, error) {
+func getMoleculeProgress(ctx context.Context, s molReader, moleculeID string) (*MoleculeProgress, error) {
 	subgraph, err := loadTemplateSubgraph(ctx, s, moleculeID)
 	if err != nil {
 		return nil, err
@@ -183,12 +178,15 @@ func getMoleculeProgress(ctx context.Context, s storage.Storage, moleculeID stri
 		Total:         len(subgraph.Issues) - 1, // Exclude root
 	}
 
-	// Get ready issues for this molecule
+	// Compute step readiness from within-molecule dependencies.
+	// Uses analyzeMoleculeParallel instead of GetReadyWork because GetReadyWork
+	// excludes ephemeral issues (wisp steps are ephemeral by definition).
+	// See: https://github.com/steveyegge/gastown/issues/1276 (historical reference)
+	analysis := analyzeMoleculeParallel(subgraph)
 	readyIDs := make(map[string]bool)
-	readyIssues, err := s.GetReadyWork(ctx, types.WorkFilter{})
-	if err == nil {
-		for _, issue := range readyIssues {
-			readyIDs[issue.ID] = true
+	for id, info := range analysis.Steps {
+		if info.IsReady {
+			readyIDs[id] = true
 		}
 	}
 
@@ -246,42 +244,34 @@ func getMoleculeProgress(ctx context.Context, s storage.Storage, moleculeID stri
 }
 
 // findInProgressMolecules finds molecules with in_progress steps for an agent
-func findInProgressMolecules(ctx context.Context, s storage.Storage, agent string) []*MoleculeProgress {
-	// Query for in_progress issues
+func findInProgressMolecules(ctx context.Context, s molReader, agent string) []*MoleculeProgress {
 	var inProgressIssues []*types.Issue
 
-	if daemonClient != nil {
-		listArgs := &rpc.ListArgs{
-			Status:   "in_progress",
-			Assignee: agent,
-		}
-		resp, err := daemonClient.List(listArgs)
-		if err == nil {
-			_ = json.Unmarshal(resp.Data, &inProgressIssues)
-		}
-	} else {
-		// Direct query - search for in_progress issues
-		status := types.StatusInProgress
-		filter := types.IssueFilter{Status: &status}
-		if agent != "" {
-			filter.Assignee = &agent
-		}
-		allIssues, err := s.SearchIssues(ctx, "", filter)
-		if err == nil {
-			inProgressIssues = allIssues
-		}
+	status := types.StatusInProgress
+	filter := types.IssueFilter{Status: &status}
+	if agent != "" {
+		filter.Assignee = &agent
+	}
+	allIssues, err := s.SearchIssues(ctx, "", filter)
+	if err == nil {
+		inProgressIssues = allIssues
 	}
 
 	if len(inProgressIssues) == 0 {
 		return nil
 	}
 
-	// For each in_progress issue, find its parent molecule
+	// Batch-find parent molecules for all in_progress issues (bd-hn4q)
+	issueIDs := make([]string, len(inProgressIssues))
+	for i, issue := range inProgressIssues {
+		issueIDs[i] = issue.ID
+	}
+	moleculeRoots := findParentMolecules(ctx, s, issueIDs)
+
 	moleculeMap := make(map[string]*MoleculeProgress)
 	for _, issue := range inProgressIssues {
-		moleculeID := findParentMolecule(ctx, s, issue.ID)
+		moleculeID := moleculeRoots[issue.ID]
 		if moleculeID == "" {
-			// Not part of a molecule, skip
 			continue
 		}
 
@@ -307,52 +297,205 @@ func findInProgressMolecules(ctx context.Context, s storage.Storage, agent strin
 	return molecules
 }
 
-// findParentMolecule walks up parent-child chain to find the root molecule
-func findParentMolecule(ctx context.Context, s storage.Storage, issueID string) string {
-	visited := make(map[string]bool)
-	currentID := issueID
+// findHookedMolecules finds molecules bonded to hooked issues for an agent.
+// This is a fallback when no in_progress steps exist but a molecule is attached
+// to the agent's hooked work via a "blocks" dependency.
+func findHookedMolecules(ctx context.Context, s molReader, agent string) []*MoleculeProgress {
+	// Query for hooked issues assigned to the agent
+	status := types.StatusHooked
+	filter := types.IssueFilter{Status: &status}
+	if agent != "" {
+		filter.Assignee = &agent
+	}
+	hookedIssues, err := s.SearchIssues(ctx, "", filter)
+	if err != nil || len(hookedIssues) == 0 {
+		return nil
+	}
 
-	for !visited[currentID] {
-		visited[currentID] = true
-
-		// Get dependencies for current issue
-		deps, err := s.GetDependencyRecords(ctx, currentID)
-		if err != nil {
-			return ""
+	// For each hooked issue, check if it IS a molecule or has blocks deps on one
+	moleculeMap := make(map[string]*MoleculeProgress)
+	for _, issue := range hookedIssues {
+		// Check if the hooked issue itself is a molecule (e.g., patrol wisps
+		// are directly hooked without a separate handoff bead). hq-3paz0m
+		if issue.IssueType == types.TypeEpic {
+			if _, exists := moleculeMap[issue.ID]; !exists {
+				progress, err := getMoleculeProgress(ctx, s, issue.ID)
+				if err == nil {
+					moleculeMap[issue.ID] = progress
+					continue
+				}
+			}
 		}
 
-		// Find parent-child dependency where current is the child
-		var parentID string
+		deps, err := s.GetDependencyRecords(ctx, issue.ID)
+		if err != nil {
+			continue
+		}
+
+		// Look for a blocks dependency pointing to a molecule (epic or template)
 		for _, dep := range deps {
-			if dep.Type == types.DepParentChild && dep.IssueID == currentID {
-				parentID = dep.DependsOnID
+			if dep.Type != types.DepBlocks {
+				continue
+			}
+			// The issue depends on (is blocked by) dep.DependsOnID
+			candidate, err := s.GetIssue(ctx, dep.DependsOnID)
+			if err != nil || candidate == nil {
+				continue
+			}
+
+			// Check if candidate is a molecule (epic or has template label)
+			isMolecule := candidate.IssueType == types.TypeEpic
+			if !isMolecule {
+				for _, label := range candidate.Labels {
+					if label == BeadsTemplateLabel {
+						isMolecule = true
+						break
+					}
+				}
+			}
+
+			if isMolecule {
+				if _, exists := moleculeMap[candidate.ID]; !exists {
+					progress, err := getMoleculeProgress(ctx, s, candidate.ID)
+					if err == nil {
+						moleculeMap[candidate.ID] = progress
+					}
+				}
+			}
+		}
+	}
+
+	// Convert to slice
+	var molecules []*MoleculeProgress
+	for _, mol := range moleculeMap {
+		molecules = append(molecules, mol)
+	}
+
+	// Sort by molecule ID for consistent output
+	sort.Slice(molecules, func(i, j int) bool {
+		return molecules[i].MoleculeID < molecules[j].MoleculeID
+	})
+
+	return molecules
+}
+
+// findParentMolecules batch-finds the root molecule for multiple issue IDs.
+// Returns a map of issueID → moleculeRootID for issues that belong to a molecule.
+// Issues not part of a molecule are omitted from the result.
+//
+// This replaces the previous N+1 pattern where findParentMolecule was called
+// in a loop, issuing GetDependencyRecords + GetIssue per level per issue.
+// Instead, this walks parent-child chains level-by-level using batch queries,
+// reducing O(N * depth) round-trips to O(depth). (bd-hn4q)
+func findParentMolecules(ctx context.Context, s molReader, issueIDs []string) map[string]string {
+	if len(issueIDs) == 0 {
+		return nil
+	}
+
+	// rootOf accumulates: startID -> rootID for chains that terminated
+	rootOf := make(map[string]string, len(issueIDs))
+
+	// current tracks: startID -> currentAncestorID (still walking up)
+	current := make(map[string]string, len(issueIDs))
+	for _, id := range issueIDs {
+		current[id] = id
+	}
+
+	// Walk up parent-child chains in batch, level by level
+	for depth := 0; depth < 50 && len(current) > 0; depth++ {
+		// Collect unique IDs at current level
+		seen := make(map[string]bool, len(current))
+		toCheck := make([]string, 0, len(current))
+		for _, curID := range current {
+			if !seen[curID] {
+				seen[curID] = true
+				toCheck = append(toCheck, curID)
+			}
+		}
+
+		// Batch fetch parent-child deps for all current ancestors
+		allDeps, err := s.GetDependencyRecordsForIssues(ctx, toCheck)
+		if err != nil {
+			return nil
+		}
+
+		// Build parent lookup: childID -> parentID
+		parentOf := make(map[string]string, len(allDeps))
+		for childID, deps := range allDeps {
+			for _, dep := range deps {
+				if dep.Type == types.DepParentChild {
+					parentOf[childID] = dep.DependsOnID
+					break
+				}
+			}
+		}
+
+		// Advance chains that have parents, finalize those that don't
+		nextCurrent := make(map[string]string)
+		for startID, curID := range current {
+			if parent, ok := parentOf[curID]; ok {
+				nextCurrent[startID] = parent
+			} else {
+				rootOf[startID] = curID
+			}
+		}
+		current = nextCurrent
+	}
+
+	// Anything still walking after max depth — treat as root
+	for startID, curID := range current {
+		rootOf[startID] = curID
+	}
+
+	// Batch fetch root issues to check if they're molecules
+	uniqueRoots := make(map[string]bool, len(rootOf))
+	for _, rootID := range rootOf {
+		uniqueRoots[rootID] = true
+	}
+	rootIDs := make([]string, 0, len(uniqueRoots))
+	for id := range uniqueRoots {
+		rootIDs = append(rootIDs, id)
+	}
+
+	rootIssues, err := s.GetIssuesByIDs(ctx, rootIDs)
+	if err != nil {
+		return nil
+	}
+
+	isMolecule := make(map[string]bool, len(rootIssues))
+	for _, issue := range rootIssues {
+		// `bd mol pour` creates roots with TypeMolecule (no template label),
+		// while distilled-from-epic templates use TypeEpic + BeadsTemplateLabel.
+		// Both shapes must be recognized so --continue can advance through
+		// poured molecules. See gastownhall/beads#3719.
+		if issue.IssueType == types.TypeEpic || issue.IssueType == types.TypeMolecule {
+			isMolecule[issue.ID] = true
+			continue
+		}
+		for _, label := range issue.Labels {
+			if label == BeadsTemplateLabel {
+				isMolecule[issue.ID] = true
 				break
 			}
 		}
-
-		if parentID == "" {
-			// No parent - check if current issue is a molecule root
-			issue, err := s.GetIssue(ctx, currentID)
-			if err != nil || issue == nil {
-				return ""
-			}
-			// Check if it has the template label (molecules are spawned from templates)
-			for _, label := range issue.Labels {
-				if label == BeadsTemplateLabel {
-					return currentID
-				}
-			}
-			// Also check if it's an epic with children (ad-hoc molecule)
-			if issue.IssueType == types.TypeEpic {
-				return currentID
-			}
-			return ""
-		}
-
-		currentID = parentID
 	}
 
-	return ""
+	// Filter to only molecule roots
+	result := make(map[string]string, len(rootOf))
+	for startID, rootID := range rootOf {
+		if isMolecule[rootID] {
+			result[startID] = rootID
+		}
+	}
+
+	return result
+}
+
+// findParentMolecule walks up the parent-child chain to find the root molecule
+// for a single issue. Returns "" if the issue is not part of a molecule.
+func findParentMolecule(ctx context.Context, s molReader, issueID string) string {
+	roots := findParentMolecules(ctx, s, []string{issueID})
+	return roots[issueID]
 }
 
 // sortStepsByDependencyOrder sorts steps by their dependency order
@@ -404,7 +547,18 @@ func printMoleculeProgress(mol *MoleculeProgress) {
 
 	if mol.NextStep != nil && mol.CurrentStep == nil {
 		fmt.Printf("\nNext ready: %s - %s\n", mol.NextStep.ID, mol.NextStep.Title)
-		fmt.Printf("  Start with: bd update %s --status in_progress\n", mol.NextStep.ID)
+		fmt.Printf("  Start with: bd update %s --claim\n", mol.NextStep.ID)
+	}
+
+	// Show hint about viewing step instructions
+	var hintStepID string
+	if mol.CurrentStep != nil {
+		hintStepID = mol.CurrentStep.ID
+	} else if mol.NextStep != nil {
+		hintStepID = mol.NextStep.ID
+	}
+	if hintStepID != "" {
+		fmt.Printf("\n%s Run `bd show %s` to see detailed instructions.\n", ui.RenderAccent("💡"), hintStepID)
 	}
 }
 
@@ -433,10 +587,13 @@ type ContinueResult struct {
 	MoleculeID   string       `json:"molecule_id,omitempty"`
 }
 
-// AdvanceToNextStep finds the next ready step in a molecule after closing a step
-// If autoClaim is true, it marks the next step as in_progress
-// Returns nil if the issue is not part of a molecule
-func AdvanceToNextStep(ctx context.Context, s storage.Storage, closedStepID string, autoClaim bool, actorName string) (*ContinueResult, error) {
+// AdvanceToNextStep finds the next ready step in a molecule after closing a step.
+// If autoClaim is true, it marks the next step as in_progress using optimistic
+// concurrency control: the step's status is re-verified before claiming to
+// guard against TOCTOU races where multiple agents identify and try to claim the
+// same step concurrently.
+// Returns nil if the issue is not part of a molecule.
+func AdvanceToNextStep(ctx context.Context, s molWriter, closedStepID string, autoClaim bool, actorName string) (*ContinueResult, error) {
 	if s == nil {
 		return nil, fmt.Errorf("no database connection")
 	}
@@ -471,31 +628,31 @@ func AdvanceToNextStep(ctx context.Context, s storage.Storage, closedStepID stri
 		return result, nil
 	}
 
-	// Find next ready step
-	var nextStep *types.Issue
+	// Collect all ready steps (not just the first) so we can fall back
+	// if a concurrent agent claims one before us.
+	var readySteps []*types.Issue
 	for _, step := range progress.Steps {
 		if step.Status == "ready" {
-			nextStep = step.Issue
-			break
+			readySteps = append(readySteps, step.Issue)
 		}
 	}
 
-	if nextStep == nil {
+	if len(readySteps) == 0 {
 		// No ready steps - might be blocked
 		return result, nil
 	}
 
-	result.NextStep = nextStep
+	result.NextStep = readySteps[0]
 
-	// Auto-claim if requested
 	if autoClaim {
-		updates := map[string]interface{}{
-			"status": types.StatusInProgress,
+		for _, candidate := range readySteps {
+			if err := s.ClaimStepIfOpen(ctx, candidate.ID, actorName); err == nil {
+				result.NextStep = candidate
+				result.AutoAdvanced = true
+				break
+			}
+			// This candidate was already claimed; try the next ready step
 		}
-		if err := s.UpdateIssue(ctx, nextStep.ID, updates, actorName); err != nil {
-			return result, fmt.Errorf("could not claim next step: %w", err)
-		}
-		result.AutoAdvanced = true
 	}
 
 	return result, nil
@@ -524,7 +681,7 @@ func PrintContinueResult(result *ContinueResult) {
 	if result.AutoAdvanced {
 		fmt.Printf("\n%s Marked in_progress (use --no-auto to skip)\n", ui.RenderWarn("→"))
 	} else {
-		fmt.Printf("\nStart with: bd update %s --status in_progress\n", result.NextStep.ID)
+		fmt.Printf("\nStart with: bd update %s --claim\n", result.NextStep.ID)
 	}
 }
 
@@ -593,6 +750,11 @@ func printLargeMoleculeSummary(stats *types.MoleculeProgressStats) {
 	fmt.Printf("  bd mol current %s --limit 50        # First 50 steps\n", stats.MoleculeID)
 	fmt.Printf("  bd mol current %s --range 1-50     # Steps 1-50\n", stats.MoleculeID)
 	fmt.Printf("  bd mol progress %s                 # Efficient progress summary\n", stats.MoleculeID)
+
+	// Show hint about viewing step instructions
+	if stats.CurrentStepID != "" {
+		fmt.Printf("\n%s Run `bd show %s` to see detailed instructions.\n", ui.RenderAccent("💡"), stats.CurrentStepID)
+	}
 }
 
 func init() {

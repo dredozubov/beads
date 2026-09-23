@@ -6,9 +6,38 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/storage/dolt"
+	"github.com/steveyegge/beads/internal/testutil"
 	"github.com/steveyegge/beads/internal/types"
 )
+
+// newTestMoleculeStore creates a dolt store on the shared database with branch isolation.
+func newTestMoleculeStore(t *testing.T) *dolt.DoltStore {
+	t.Helper()
+	if testSharedDB == "" {
+		t.Skip("shared DB not available")
+	}
+	ctx := context.Background()
+	store, err := dolt.New(ctx, &dolt.Config{
+		Path:         t.TempDir(),
+		ServerHost:   "127.0.0.1",
+		ServerPort:   testServerPort,
+		Database:     testSharedDB,
+		MaxOpenConns: 1,
+	})
+	if err != nil {
+		t.Fatalf("Failed to create dolt store: %v", err)
+	}
+
+	_, branchCleanup := testutil.StartTestBranch(t, store.DB(), testSharedDB)
+
+	t.Cleanup(func() {
+		branchCleanup()
+		store.Close()
+	})
+	return store
+}
 
 func TestLoadMoleculesFromFile(t *testing.T) {
 	// Create a temporary directory
@@ -60,25 +89,13 @@ func TestLoadMoleculesFromNonexistentFile(t *testing.T) {
 
 func TestLoader_LoadAll(t *testing.T) {
 	ctx := context.Background()
+	store := newTestMoleculeStore(t)
 
 	// Create temporary directories
 	tempDir := t.TempDir()
 	beadsDir := filepath.Join(tempDir, ".beads")
 	if err := os.MkdirAll(beadsDir, 0750); err != nil {
 		t.Fatalf("Failed to create beads dir: %v", err)
-	}
-
-	// Create a test database
-	dbPath := filepath.Join(beadsDir, "test.db")
-	store, err := sqlite.New(ctx, dbPath)
-	if err != nil {
-		t.Fatalf("Failed to create store: %v", err)
-	}
-	defer store.Close()
-
-	// Set issue prefix (required by storage)
-	if err := store.SetConfig(ctx, "issue_prefix", "test"); err != nil {
-		t.Fatalf("Failed to set prefix: %v", err)
 	}
 
 	// Create a project-level molecules.jsonl
@@ -129,6 +146,7 @@ func TestLoader_LoadAll(t *testing.T) {
 
 func TestLoader_SkipExistingMolecules(t *testing.T) {
 	ctx := context.Background()
+	store := newTestMoleculeStore(t)
 
 	// Create temporary directories
 	tempDir := t.TempDir()
@@ -137,28 +155,15 @@ func TestLoader_SkipExistingMolecules(t *testing.T) {
 		t.Fatalf("Failed to create beads dir: %v", err)
 	}
 
-	// Create a test database
-	dbPath := filepath.Join(beadsDir, "test.db")
-	store, err := sqlite.New(ctx, dbPath)
-	if err != nil {
-		t.Fatalf("Failed to create store: %v", err)
-	}
-	defer store.Close()
-
-	// Set issue prefix
-	if err := store.SetConfig(ctx, "issue_prefix", "test"); err != nil {
-		t.Fatalf("Failed to set prefix: %v", err)
-	}
-
 	// Pre-create a molecule in the database (skip prefix validation for mol-* IDs)
 	existingMol := &types.Issue{
 		ID:         "mol-existing",
 		Title:      "Existing Molecule",
-		IssueType:  types.TypeMolecule,
+		IssueType:  "molecule",
 		Status:     types.StatusOpen,
 		IsTemplate: true,
 	}
-	opts := sqlite.BatchCreateOptions{SkipPrefixValidation: true}
+	opts := storage.BatchCreateOptions{SkipPrefixValidation: true}
 	if err := store.CreateIssuesWithFullOptions(ctx, []*types.Issue{existingMol}, "test", opts); err != nil {
 		t.Fatalf("Failed to create existing molecule: %v", err)
 	}

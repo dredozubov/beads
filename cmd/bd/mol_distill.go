@@ -10,6 +10,7 @@ import (
 
 	"github.com/spf13/cobra"
 	"github.com/steveyegge/beads/internal/formula"
+	"github.com/steveyegge/beads/internal/metrics"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
 )
@@ -36,14 +37,17 @@ Variable syntax (both work - we detect which side is the concrete value):
   --var feature-auth=branch    Substitution-style: value=variable
 
 Output locations (first writable wins):
-  1. .beads/formulas/       (project-level, default)
-  2. ~/.beads/formulas/     (user-level, if project not writable)
+  1. <resolved-beads-dir>/formulas/ (project-level, default)
+  2. <checkout-root>/.beads/formulas/ (repo-local formulas)
+  3. ~/.beads/formulas/     (user-level, if project not writable)
 
 Examples:
   bd mol distill bd-o5xe my-workflow
   bd mol distill bd-abc release-workflow --var feature_name=auth-refactor`,
-	Args: cobra.RangeArgs(1, 2),
-	Run:  runMolDistill,
+	Args:          cobra.RangeArgs(1, 2),
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE:          runMolDistill,
 }
 
 // DistillResult holds the result of a distill operation
@@ -98,80 +102,96 @@ func parseDistillVar(varFlag, searchableText string) (string, string, error) {
 	}
 }
 
-// runMolDistill implements the distill command
-func runMolDistill(cmd *cobra.Command, args []string) {
+type molDistillInput struct {
+	epicID         string
+	formulaNameArg string
+	varFlags       []string
+	dryRun         bool
+	outputDir      string
+}
+
+func gatherMolDistillInput(cmd *cobra.Command, args []string) molDistillInput {
+	in := molDistillInput{epicID: args[0]}
+	in.varFlags, _ = cmd.Flags().GetStringArray("var")
+	in.dryRun, _ = cmd.Flags().GetBool("dry-run")
+	in.outputDir, _ = cmd.Flags().GetString("output")
+	if len(args) > 1 {
+		in.formulaNameArg = args[1]
+	}
+	return in
+}
+
+func runMolDistill(cmd *cobra.Command, args []string) error {
+	evt := metrics.NewCommandEvent("mol-distill")
+	defer func() {
+		if c := metrics.Global(); c != nil {
+			c.CloseEventAndAdd(evt)
+		}
+	}()
+
+	in := gatherMolDistillInput(cmd, args)
+
+	if usesProxiedServer() {
+		return runMolDistillProxiedServer(rootCtx, in)
+	}
+
 	ctx := rootCtx
 
-	// mol distill requires direct store access for reading the epic
 	if store == nil {
-		if daemonClient != nil {
-			fmt.Fprintf(os.Stderr, "Error: mol distill requires direct database access\n")
-			fmt.Fprintf(os.Stderr, "Hint: use --no-daemon flag: bd --no-daemon mol distill %s ...\n", args[0])
-		} else {
-			fmt.Fprintf(os.Stderr, "Error: no database connection\n")
-		}
-		os.Exit(1)
+		return HandleErrorRespectJSON("no database connection")
 	}
 
-	varFlags, _ := cmd.Flags().GetStringArray("var")
-	dryRun, _ := cmd.Flags().GetBool("dry-run")
-	outputDir, _ := cmd.Flags().GetString("output")
-
-	// Resolve epic ID
-	epicID, err := utils.ResolvePartialID(ctx, store, args[0])
+	epicID, err := utils.ResolvePartialID(ctx, store, in.epicID)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: '%s' not found\n", args[0])
-		os.Exit(1)
+		return HandleErrorRespectJSON("'%s' not found", in.epicID)
 	}
 
-	// Load the epic subgraph
 	subgraph, err := loadTemplateSubgraph(ctx, store, epicID)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error loading epic: %v\n", err)
-		os.Exit(1)
+		return HandleErrorRespectJSON("loading epic: %v", err)
 	}
 
-	// Determine formula name
-	formulaName := ""
-	if len(args) > 1 {
-		formulaName = args[1]
-	} else {
-		// Derive from epic title
+	return distillSubgraph(epicID, subgraph, in)
+}
+
+// distillSubgraph converts an already-loaded subgraph into a formula file
+// (dry-run preview or write-to-disk), shared by the embedded and
+// proxied-server dual.
+func distillSubgraph(epicID string, subgraph *TemplateSubgraph, in molDistillInput) error {
+	formulaName := in.formulaNameArg
+	if formulaName == "" {
 		formulaName = sanitizeFormulaName(subgraph.Root.Title)
 	}
 
-	// Parse variable substitutions with smart detection
 	replacements := make(map[string]string)
-	if len(varFlags) > 0 {
+	if len(in.varFlags) > 0 {
 		searchableText := collectSubgraphText(subgraph)
-		for _, v := range varFlags {
+		for _, v := range in.varFlags {
 			findText, varName, err := parseDistillVar(v, searchableText)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				return HandleErrorRespectJSON("%v", err)
 			}
 			replacements[findText] = varName
 		}
 	}
 
-	// Convert to formula
 	f := subgraphToFormula(subgraph, formulaName, replacements)
 
-	// Determine output path
 	outputPath := ""
-	if outputDir != "" {
-		outputPath = filepath.Join(outputDir, formulaName+formula.FormulaExt)
+	if in.outputDir != "" {
+		outputPath = filepath.Join(in.outputDir, formulaName+formula.FormulaExt)
 	} else {
-		// Find first writable formula directory
 		outputPath = findWritableFormulaDir(formulaName)
 		if outputPath == "" {
-			fmt.Fprintf(os.Stderr, "Error: no writable formula directory found\n")
-			fmt.Fprintf(os.Stderr, "Try: mkdir -p .beads/formulas\n")
-			os.Exit(1)
+			hint := "Try creating one of the formula search paths"
+			if searchPaths := getFormulaSearchPaths(); len(searchPaths) > 0 {
+				hint = fmt.Sprintf("Try: mkdir -p %s", searchPaths[0])
+			}
+			return HandleErrorWithHint("no writable formula directory found", hint)
 		}
 	}
 
-	if dryRun {
+	if in.dryRun {
 		fmt.Printf("\nDry run: would distill %d steps from %s into formula\n\n", countSteps(f.Steps), epicID)
 		fmt.Printf("Formula: %s\n", formulaName)
 		fmt.Printf("Output: %s\n", outputPath)
@@ -183,27 +203,22 @@ func runMolDistill(cmd *cobra.Command, args []string) {
 		}
 		fmt.Printf("\nStructure:\n")
 		printFormulaStepsTree(f.Steps, "")
-		return
+		return nil
 	}
 
-	// Ensure output directory exists
 	dir := filepath.Dir(outputPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
-		fmt.Fprintf(os.Stderr, "Error creating directory %s: %v\n", dir, err)
-		os.Exit(1)
+		return HandleErrorRespectJSON("creating directory %s: %v", dir, err)
 	}
 
-	// Write formula
 	data, err := json.MarshalIndent(f, "", "  ")
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error encoding formula: %v\n", err)
-		os.Exit(1)
+		return HandleErrorRespectJSON("encoding formula: %v", err)
 	}
 
 	// #nosec G306 -- Formula files are not sensitive
 	if err := os.WriteFile(outputPath, data, 0644); err != nil {
-		fmt.Fprintf(os.Stderr, "Error writing formula: %v\n", err)
-		os.Exit(1)
+		return HandleErrorRespectJSON("writing formula: %v", err)
 	}
 
 	result := &DistillResult{
@@ -214,8 +229,7 @@ func runMolDistill(cmd *cobra.Command, args []string) {
 	}
 
 	if jsonOutput {
-		outputJSON(result)
-		return
+		return outputJSON(result)
 	}
 
 	fmt.Printf("%s Distilled formula: %d steps\n", ui.RenderPass("✓"), result.Steps)
@@ -230,6 +244,7 @@ func runMolDistill(cmd *cobra.Command, args []string) {
 		fmt.Printf(" --var %s=<value>", v)
 	}
 	fmt.Println()
+	return nil
 }
 
 // sanitizeFormulaName converts a title to a valid formula name
@@ -255,8 +270,8 @@ func findWritableFormulaDir(formulaName string) string {
 			// Check if we can write to it
 			testPath := filepath.Join(dir, ".write-test")
 			if f, err := os.Create(testPath); err == nil { //nolint:gosec // testPath is constructed from known search paths
-				_ = f.Close()
-				_ = os.Remove(testPath)
+				_ = f.Close()           // Best effort cleanup
+				_ = os.Remove(testPath) // Best effort cleanup of temp file
 				return filepath.Join(dir, formulaName+formula.FormulaExt)
 			}
 		}
@@ -275,11 +290,13 @@ func getVarNames(replacements map[string]string) []string {
 
 // subgraphToFormula converts a molecule subgraph to a formula
 func subgraphToFormula(subgraph *TemplateSubgraph, name string, replacements map[string]string) *formula.Formula {
-	// Helper to apply replacements
+	// Helper to apply replacements. Uses word-boundary regex to avoid
+	// substring corruption (e.g., "4" matching inside "404").
 	applyReplacements := func(text string) string {
 		result := text
 		for value, varName := range replacements {
-			result = strings.ReplaceAll(result, value, "{{"+varName+"}}")
+			pattern := regexp.MustCompile(`\b` + regexp.QuoteMeta(value) + `\b`)
+			result = pattern.ReplaceAllString(result, "{{"+varName+"}}")
 		}
 		return result
 	}

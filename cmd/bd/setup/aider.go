@@ -23,7 +23,7 @@ This project uses **Beads (bd)** for issue tracking. Aider requires explicit com
 1. **Track ALL work in bd** (never use markdown TODOs or comment-based task lists)
 2. **Suggest 'bd ready'** to find available work
 3. **Suggest 'bd create'** for new issues/tasks/bugs
-4. **Suggest 'bd sync'** at end of session
+4. **Suggest 'bd dolt push'** at end of session
 5. **ALWAYS suggest commands** - user will run them via /run
 
 ## Quick Command Reference (suggest these to user)
@@ -31,18 +31,19 @@ This project uses **Beads (bd)** for issue tracking. Aider requires explicit com
 - ` + "`bd ready`" + ` - Show unblocked issues
 - ` + "`bd list --status=open`" + ` - List all open issues
 - ` + "`bd create --title=\"...\" --type=task`" + ` - Create new issue
-- ` + "`bd update <id> --status=in_progress`" + ` - Claim work
+- ` + "`bd update <id> --claim`" + ` - Claim work atomically
+- ` + "`bd unclaim <id>`" + ` - Release stuck issue
 - ` + "`bd close <id>`" + ` - Mark complete
 - ` + "`bd dep add <issue> <depends-on>`" + ` - Add dependency (issue depends on depends-on)
-- ` + "`bd sync`" + ` - Sync with git remote
+- ` + "`bd dolt push`" + ` - Push changes to Dolt remote
 
 ## Workflow Pattern to Suggest
 
 1. **Check ready work**: "Let's run ` + "`/run bd ready`" + ` to see what's available"
-2. **Claim task**: "Run ` + "`/run bd update <id> --status=in_progress`" + ` to claim it"
+2. **Claim task**: "Run ` + "`/run bd update <id> --claim`" + ` to claim it atomically"
 3. **Do the work**
 4. **Complete**: "Run ` + "`/run bd close <id>`" + ` when done"
-5. **Sync**: "Run ` + "`/run bd sync`" + ` to push changes"
+5. **Sync**: "Run ` + "`/run bd dolt push`" + ` to push changes"
 
 ## Context Loading
 
@@ -69,7 +70,7 @@ Suggest ` + "`/run bd prime`" + ` for complete workflow documentation (~1-2k tok
 - **Always use /run prefix** - Aider requires explicit command execution
 - **Link discovered work** - Use ` + "`--deps discovered-from:<parent-id>`" + ` when creating issues found during work
 - **Include descriptions** - Always provide meaningful context when creating issues
-- **End session with sync** - Remind user to run ` + "`/run bd sync`" + ` before ending session
+- **End session with sync** - Remind user to run ` + "`/run bd dolt push`" + ` before ending session
 
 For detailed docs: see AGENTS.md, QUICKSTART.md, or run ` + "`bd --help`" + `
 `
@@ -97,7 +98,7 @@ The AI will **suggest** bd commands, but you must confirm them.
 
 3. Claim work:
    ` + "```bash" + `
-   /run bd update bd-42 --status in_progress
+   /run bd update bd-42 --claim
    ` + "```" + `
 
 4. Complete work:
@@ -107,7 +108,7 @@ The AI will **suggest** bd commands, but you must confirm them.
 
 5. Sync at end of session:
    ` + "```bash" + `
-   /run bd sync
+   /run bd dolt push
    ` + "```" + `
 
 ## Configuration
@@ -145,39 +146,30 @@ The AI will suggest the appropriate ` + "`bd`" + ` command, which you run via ` 
 
 - Run ` + "`bd --help`" + ` for full command reference
 - See ` + "`AGENTS.md`" + ` for detailed AI integration docs
-- See ` + "`QUICKSTART.md`" + ` for human-oriented guide
+- See the beads quickstart (https://github.com/gastownhall/beads/blob/main/docs/getting-started/quickstart.md) for a human-oriented guide
 `
 
-// InstallAider installs Aider integration
-func InstallAider() {
+func InstallAider() error {
 	configPath := ".aider.conf.yml"
 	instructionsPath := ".aider/BEADS.md"
 	readmePath := ".aider/README.md"
 
 	fmt.Println("Installing Aider integration...")
 
-	// Ensure .aider directory exists
 	if err := EnsureDir(".aider", 0755); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-		os.Exit(1)
+		return HandleError("%v", err)
 	}
 
-	// Write config file
 	if err := atomicWriteFile(configPath, []byte(aiderConfigTemplate)); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: write config: %v\n", err)
-		os.Exit(1)
+		return HandleError("write config: %v", err)
 	}
 
-	// Write instructions file (loaded by AI)
 	if err := atomicWriteFile(instructionsPath, []byte(aiderBeadsInstructions)); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: write instructions: %v\n", err)
-		os.Exit(1)
+		return HandleError("write instructions: %v", err)
 	}
 
-	// Write README (for humans)
 	if err := atomicWriteFile(readmePath, []byte(aiderReadmeTemplate)); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: write README: %v\n", err)
-		os.Exit(1)
+		return HandleError("write README: %v", err)
 	}
 
 	fmt.Printf("\n✓ Aider integration installed\n")
@@ -189,23 +181,21 @@ func InstallAider() {
 	fmt.Println("  2. Ask AI for available work (it will suggest: /run bd ready)")
 	fmt.Println("  3. Run suggested commands using /run")
 	fmt.Println("\nNote: Aider requires you to explicitly run commands via /run")
+	return nil
 }
 
-// CheckAider checks if Aider integration is installed
-func CheckAider() {
+func CheckAider() error {
 	configPath := ".aider.conf.yml"
 
-	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		fmt.Println("✗ Aider integration not installed")
-		fmt.Println("  Run: bd setup aider")
-		os.Exit(1)
+	if !FileExists(configPath) {
+		return HandleErrorWithHint("Aider integration not installed", "Run: bd setup aider")
 	}
 
 	fmt.Println("✓ Aider integration installed:", configPath)
+	return nil
 }
 
-// RemoveAider removes Aider integration
-func RemoveAider() {
+func RemoveAider() error {
 	configPath := ".aider.conf.yml"
 	instructionsPath := ".aider/BEADS.md"
 	readmePath := ".aider/README.md"
@@ -215,45 +205,37 @@ func RemoveAider() {
 
 	removed := false
 
-	// Remove config
 	if err := os.Remove(configPath); err != nil {
 		if !os.IsNotExist(err) {
-			fmt.Fprintf(os.Stderr, "Error: failed to remove config: %v\n", err)
-			os.Exit(1)
+			return HandleError("failed to remove config: %v", err)
 		}
 	} else {
 		removed = true
 	}
 
-	// Remove instructions
 	if err := os.Remove(instructionsPath); err != nil {
 		if !os.IsNotExist(err) {
-			fmt.Fprintf(os.Stderr, "Error: failed to remove instructions: %v\n", err)
-			os.Exit(1)
+			return HandleError("failed to remove instructions: %v", err)
 		}
 	} else {
 		removed = true
 	}
 
-	// Remove README
 	if err := os.Remove(readmePath); err != nil {
 		if !os.IsNotExist(err) {
-			fmt.Fprintf(os.Stderr, "Error: failed to remove README: %v\n", err)
-			os.Exit(1)
+			return HandleError("failed to remove README: %v", err)
 		}
 	} else {
 		removed = true
 	}
 
-	// Try to remove .aider directory if empty
-	if err := os.Remove(aiderDir); err != nil {
-		// Ignore error - directory might not be empty or might not exist
-	}
+	_ = os.Remove(aiderDir)
 
 	if !removed {
 		fmt.Println("No Aider integration files found")
-		return
+		return nil
 	}
 
 	fmt.Println("✓ Removed Aider integration")
+	return nil
 }

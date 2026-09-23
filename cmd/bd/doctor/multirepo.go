@@ -1,16 +1,27 @@
 package doctor
 
 import (
-	"database/sql"
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 
-	"github.com/steveyegge/beads/internal/beads"
+	"gopkg.in/yaml.v3"
+
 	"github.com/steveyegge/beads/internal/config"
 	"github.com/steveyegge/beads/internal/configfile"
+	"github.com/steveyegge/beads/internal/storage/dolt"
+	"github.com/steveyegge/beads/internal/storage/issueops"
+	"github.com/steveyegge/beads/internal/types"
 )
+
+// multiRepoYAMLConfig represents the types section of config.yaml for YAML unmarshaling.
+type multiRepoYAMLConfig struct {
+	Types struct {
+		Custom []string `yaml:"custom"`
+	} `yaml:"types"`
+}
 
 // CheckMultiRepoTypes discovers and reports custom types used by child repos in multi-repo setups.
 // This is informational - the federation trust model means we don't require parent config to
@@ -75,7 +86,7 @@ func discoverChildTypes(repoPath string) []string {
 		}
 	}
 
-	beadsDir := filepath.Join(repoPath, ".beads")
+	beadsDir := ResolveBeadsDirForRepo(repoPath)
 
 	// First try reading from database config table
 	types, err := readTypesFromDB(beadsDir)
@@ -95,134 +106,90 @@ func discoverChildTypes(repoPath string) []string {
 
 // readTypesFromDB reads types.custom from the database config table
 func readTypesFromDB(beadsDir string) ([]string, error) {
-	// Get database path
-	var dbPath string
-	if cfg, err := configfile.Load(beadsDir); err == nil && cfg != nil && cfg.Database != "" {
-		dbPath = cfg.DatabasePath(beadsDir)
-	} else {
-		dbPath = filepath.Join(beadsDir, beads.CanonicalDatabaseName)
+	cfg, err := configfile.Load(beadsDir)
+	if err != nil || cfg == nil {
+		return nil, fmt.Errorf("no config")
+	}
+	if cfg.GetBackend() != configfile.BackendDolt {
+		return nil, fmt.Errorf("not dolt backend")
 	}
 
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+	doltPath := getDatabasePath(beadsDir)
+	if _, err := os.Stat(doltPath); os.IsNotExist(err) {
 		return nil, err
 	}
 
-	db, err := sql.Open("sqlite3", sqliteConnString(dbPath, true))
+	ctx := context.Background()
+	store, err := dolt.NewFromConfigWithCLIOptions(ctx, beadsDir, &dolt.Config{ReadOnly: true})
 	if err != nil {
 		return nil, err
 	}
-	defer db.Close()
+	defer func() { _ = store.Close() }()
 
-	var typesStr string
-	err = db.QueryRow("SELECT value FROM config WHERE key = 'types.custom'").Scan(&typesStr)
+	typesStr, err := store.GetConfig(ctx, "types.custom")
 	if err != nil {
 		return nil, err
 	}
 
-	if typesStr == "" {
-		return nil, nil
-	}
-
-	// Parse comma-separated list
-	var types []string
-	for _, t := range strings.Split(typesStr, ",") {
-		t = strings.TrimSpace(t)
-		if t != "" {
-			types = append(types, t)
-		}
-	}
-
-	return types, nil
+	// ParseTypesConfigValue returns nil for an empty or whitespace-only value.
+	return issueops.ParseTypesConfigValue(typesStr), nil
 }
 
 // readTypesFromYAML reads types.custom from config.yaml
 func readTypesFromYAML(beadsDir string) ([]string, error) {
 	configPath := filepath.Join(beadsDir, "config.yaml")
-	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		return nil, err
-	}
-
-	// Use viper to read the config
-	// For simplicity, we'll parse it manually to avoid viper state issues
 	content, err := os.ReadFile(configPath) // #nosec G304 - path is controlled
 	if err != nil {
 		return nil, err
 	}
 
-	// Simple YAML parsing for types.custom
-	// Looking for "types:" section with "custom:" key
-	lines := strings.Split(string(content), "\n")
-	inTypes := false
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "types:") {
-			inTypes = true
-			continue
-		}
-		if inTypes && strings.HasPrefix(trimmed, "custom:") {
-			// Parse the value
-			value := strings.TrimPrefix(trimmed, "custom:")
-			value = strings.TrimSpace(value)
-			// Handle array format [a, b, c] or string format "a,b,c"
-			value = strings.Trim(value, "[]\"'")
-			if value == "" {
-				return nil, nil
-			}
-			var types []string
-			for _, t := range strings.Split(value, ",") {
-				t = strings.TrimSpace(t)
-				t = strings.Trim(t, "\"'")
-				if t != "" {
-					types = append(types, t)
-				}
-			}
-			return types, nil
-		}
-		// Exit types section if we hit another top-level key
-		if inTypes && len(line) > 0 && line[0] != ' ' && line[0] != '\t' {
-			break
-		}
+	var cfg multiRepoYAMLConfig
+	if err := yaml.Unmarshal(content, &cfg); err != nil {
+		return nil, fmt.Errorf("parsing config.yaml: %w", err)
 	}
 
-	return nil, nil
+	if len(cfg.Types.Custom) == 0 {
+		return nil, nil
+	}
+
+	return cfg.Types.Custom, nil
 }
 
 // findUnknownTypesInHydratedIssues checks if any hydrated issues use types not found in any config
 func findUnknownTypesInHydratedIssues(repoPath string, multiRepo *config.MultiRepoConfig) []string {
-	beadsDir := filepath.Join(repoPath, ".beads")
+	beadsDir := ResolveBeadsDirForRepo(repoPath)
 
-	// Get database path
-	var dbPath string
-	if cfg, err := configfile.Load(beadsDir); err == nil && cfg != nil && cfg.Database != "" {
-		dbPath = cfg.DatabasePath(beadsDir)
-	} else {
-		dbPath = filepath.Join(beadsDir, beads.CanonicalDatabaseName)
+	cfg, err := configfile.Load(beadsDir)
+	if err != nil || cfg == nil {
+		return nil
 	}
-
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+	if cfg.GetBackend() != configfile.BackendDolt {
 		return nil
 	}
 
-	db, err := sql.Open("sqlite3", sqliteConnString(dbPath, true))
+	doltPath := getDatabasePath(beadsDir)
+	if _, err := os.Stat(doltPath); os.IsNotExist(err) {
+		return nil
+	}
+
+	ctx := context.Background()
+	store, err := dolt.NewFromConfigWithCLIOptions(ctx, beadsDir, &dolt.Config{ReadOnly: true})
 	if err != nil {
 		return nil
 	}
-	defer db.Close()
+	defer func() { _ = store.Close() }()
 
-	// Collect all known types (built-in + parent custom + all child custom)
-	knownTypes := map[string]bool{
-		"bug": true, "feature": true, "task": true, "epic": true, "chore": true,
-		"message": true, "merge-request": true, "molecule": true, "gate": true, "event": true,
-	}
+	// Collect known custom types (parent custom + all child custom).
+	// Built-in types — including orchestrator types like gate, molecule,
+	// spike, story, and milestone — are recognized via IsBuiltIn below, so
+	// this map only needs the configured custom types.
+	knownTypes := make(map[string]bool)
 
 	// Add parent's custom types
-	var parentTypes string
-	if err := db.QueryRow("SELECT value FROM config WHERE key = 'types.custom'").Scan(&parentTypes); err == nil {
-		for _, t := range strings.Split(parentTypes, ",") {
-			t = strings.TrimSpace(t)
-			if t != "" {
-				knownTypes[t] = true
-			}
+	parentTypes, err := store.GetConfig(ctx, "types.custom")
+	if err == nil && parentTypes != "" {
+		for _, t := range issueops.ParseTypesConfigValue(parentTypes) {
+			knownTypes[t] = true
 		}
 	}
 
@@ -235,9 +202,10 @@ func findUnknownTypesInHydratedIssues(repoPath string, multiRepo *config.MultiRe
 	}
 
 	// Find issues with types not in knownTypes
-	rows, err := db.Query(`
+	db := store.UnderlyingDB()
+	rows, err := db.QueryContext(ctx, `
 		SELECT DISTINCT issue_type FROM issues
-		WHERE status != 'tombstone' AND source_repo != '' AND source_repo != '.'
+		WHERE source_repo != '' AND source_repo != '.'
 	`)
 	if err != nil {
 		return nil
@@ -251,11 +219,13 @@ func findUnknownTypesInHydratedIssues(repoPath string, multiRepo *config.MultiRe
 		if err := rows.Scan(&issueType); err != nil {
 			continue
 		}
-		if !knownTypes[issueType] && !seen[issueType] {
+		if !types.IssueType(issueType).IsBuiltIn() && !knownTypes[issueType] && !seen[issueType] {
 			unknownTypes = append(unknownTypes, issueType)
 			seen[issueType] = true
 		}
 	}
+	// Best effort: rows.Err() ignored since partial results are acceptable for type discovery
+	_ = rows.Err()
 
 	return unknownTypes
 }

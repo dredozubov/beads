@@ -84,7 +84,7 @@ func TestPadRight(t *testing.T) {
 			name:  "empty string",
 			s:     "",
 			width: 3,
-			want:   "   ",
+			want:  "   ",
 		},
 		{
 			name:  "unicode safe",
@@ -106,9 +106,9 @@ func TestPadRight(t *testing.T) {
 
 func TestRenderNodeBox(t *testing.T) {
 	tests := []struct {
-		name   string
-		node   *GraphNode
-		width  int
+		name     string
+		node     *GraphNode
+		width    int
 		notEmpty bool
 	}{
 		{
@@ -408,6 +408,265 @@ func TestComputeLayout(t *testing.T) {
 		// test-2 depends on test-1, should be layer 1
 		if layout.Nodes["test-2"].Layer != 1 {
 			t.Errorf("test-2 layer = %d, want 1", layout.Nodes["test-2"].Layer)
+		}
+	})
+
+	t.Run("children lifted to parent layer (GH#1748)", func(t *testing.T) {
+		// Scenario: epic is blocked by a blocker (layer 1),
+		// children have no blocking deps but should be in the same layer as parent.
+		blocker := &types.Issue{ID: "blocker-1", Title: "Blocker issue"}
+		epic := &types.Issue{ID: "epic-1", Title: "My Epic", IssueType: "epic"}
+		child1 := &types.Issue{ID: "child-1", Title: "Task A"}
+		child2 := &types.Issue{ID: "child-2", Title: "Task B"}
+		subgraph := &TemplateSubgraph{
+			Root:   blocker,
+			Issues: []*types.Issue{blocker, epic, child1, child2},
+			Dependencies: []*types.Dependency{
+				{IssueID: "epic-1", DependsOnID: "blocker-1", Type: types.DepBlocks},
+				{IssueID: "child-1", DependsOnID: "epic-1", Type: types.DepParentChild},
+				{IssueID: "child-2", DependsOnID: "epic-1", Type: types.DepParentChild},
+			},
+			IssueMap: map[string]*types.Issue{
+				"blocker-1": blocker, "epic-1": epic,
+				"child-1": child1, "child-2": child2,
+			},
+		}
+		layout := computeLayout(subgraph)
+		// blocker has no deps → layer 0
+		if layout.Nodes["blocker-1"].Layer != 0 {
+			t.Errorf("blocker layer = %d, want 0", layout.Nodes["blocker-1"].Layer)
+		}
+		// epic is blocked → layer 1
+		if layout.Nodes["epic-1"].Layer != 1 {
+			t.Errorf("epic layer = %d, want 1", layout.Nodes["epic-1"].Layer)
+		}
+		// children should be lifted to parent's layer (1), not layer 0
+		if layout.Nodes["child-1"].Layer != 1 {
+			t.Errorf("child-1 layer = %d, want 1 (should match parent)", layout.Nodes["child-1"].Layer)
+		}
+		if layout.Nodes["child-2"].Layer != 1 {
+			t.Errorf("child-2 layer = %d, want 1 (should match parent)", layout.Nodes["child-2"].Layer)
+		}
+	})
+
+	t.Run("child with own blocker stays in higher layer", func(t *testing.T) {
+		// If a child has its own blocking dep putting it higher than the parent,
+		// keep the child's higher layer.
+		blocker := &types.Issue{ID: "blocker-1", Title: "Blocker"}
+		epic := &types.Issue{ID: "epic-1", Title: "Epic", IssueType: "epic"}
+		child := &types.Issue{ID: "child-1", Title: "Child"}
+		subgraph := &TemplateSubgraph{
+			Root:   blocker,
+			Issues: []*types.Issue{blocker, epic, child},
+			Dependencies: []*types.Dependency{
+				{IssueID: "epic-1", DependsOnID: "blocker-1", Type: types.DepBlocks},
+				{IssueID: "child-1", DependsOnID: "epic-1", Type: types.DepParentChild},
+				{IssueID: "child-1", DependsOnID: "blocker-1", Type: types.DepBlocks},
+			},
+			IssueMap: map[string]*types.Issue{
+				"blocker-1": blocker, "epic-1": epic, "child-1": child,
+			},
+		}
+		layout := computeLayout(subgraph)
+		// child blocked by blocker → layer 1 (same as epic, which is also correct)
+		if layout.Nodes["child-1"].Layer < layout.Nodes["epic-1"].Layer {
+			t.Errorf("child layer = %d, should be >= parent layer %d",
+				layout.Nodes["child-1"].Layer, layout.Nodes["epic-1"].Layer)
+		}
+	})
+
+	t.Run("nil root does not panic", func(t *testing.T) {
+		subgraph := &TemplateSubgraph{
+			Root:         nil,
+			Issues:       []*types.Issue{{ID: "orphan-1", Title: "Orphan"}},
+			Dependencies: []*types.Dependency{},
+			IssueMap:     map[string]*types.Issue{"orphan-1": {ID: "orphan-1", Title: "Orphan"}},
+		}
+		layout := computeLayout(subgraph)
+		if layout == nil {
+			t.Fatal("computeLayout returned nil")
+		}
+		if layout.RootID != "" {
+			t.Errorf("RootID = %q, want empty string for nil root", layout.RootID)
+		}
+		if len(layout.Nodes) != 1 {
+			t.Errorf("len(Nodes) = %d, want 1", len(layout.Nodes))
+		}
+	})
+}
+
+func TestFilterSubgraphOpen(t *testing.T) {
+	t.Run("nil subgraph", func(t *testing.T) {
+		if filterSubgraphOpen(nil) != nil {
+			t.Error("expected nil for nil input")
+		}
+	})
+
+	t.Run("all closed returns nil", func(t *testing.T) {
+		sg := &TemplateSubgraph{
+			Root:   &types.Issue{ID: "a", Status: types.StatusClosed},
+			Issues: []*types.Issue{{ID: "a", Status: types.StatusClosed}},
+			IssueMap: map[string]*types.Issue{
+				"a": {ID: "a", Status: types.StatusClosed},
+			},
+		}
+		if filterSubgraphOpen(sg) != nil {
+			t.Error("expected nil when all issues are closed")
+		}
+	})
+
+	t.Run("removes closed issues", func(t *testing.T) {
+		open := &types.Issue{ID: "open-1", Title: "Open", Status: types.StatusOpen, Priority: 1}
+		closed := &types.Issue{ID: "closed-1", Title: "Closed", Status: types.StatusClosed, Priority: 0}
+		sg := &TemplateSubgraph{
+			Root:   open,
+			Issues: []*types.Issue{open, closed},
+			IssueMap: map[string]*types.Issue{
+				"open-1": open, "closed-1": closed,
+			},
+		}
+		f := filterSubgraphOpen(sg)
+		if f == nil {
+			t.Fatal("expected non-nil filtered subgraph")
+		}
+		if len(f.Issues) != 1 {
+			t.Errorf("len(Issues) = %d, want 1", len(f.Issues))
+		}
+		if f.Issues[0].ID != "open-1" {
+			t.Errorf("remaining issue = %q, want open-1", f.Issues[0].ID)
+		}
+	})
+
+	t.Run("removes deferred issues", func(t *testing.T) {
+		open := &types.Issue{ID: "open-1", Title: "Open", Status: types.StatusOpen, Priority: 1}
+		deferred := &types.Issue{ID: "def-1", Title: "Deferred", Status: types.StatusDeferred, Priority: 2}
+		sg := &TemplateSubgraph{
+			Root:   open,
+			Issues: []*types.Issue{open, deferred},
+			IssueMap: map[string]*types.Issue{
+				"open-1": open, "def-1": deferred,
+			},
+		}
+		f := filterSubgraphOpen(sg)
+		if len(f.Issues) != 1 || f.Issues[0].ID != "open-1" {
+			t.Errorf("expected only open-1, got %d issues", len(f.Issues))
+		}
+	})
+
+	t.Run("transitive closure through closed node", func(t *testing.T) {
+		// A(open) blocks B(closed) blocks C(open) → synthetic A blocks C
+		a := &types.Issue{ID: "a", Title: "A", Status: types.StatusOpen, Priority: 1}
+		b := &types.Issue{ID: "b", Title: "B", Status: types.StatusClosed, Priority: 2}
+		c := &types.Issue{ID: "c", Title: "C", Status: types.StatusOpen, Priority: 2}
+		sg := &TemplateSubgraph{
+			Root:   a,
+			Issues: []*types.Issue{a, b, c},
+			Dependencies: []*types.Dependency{
+				{IssueID: "b", DependsOnID: "a", Type: types.DepBlocks},
+				{IssueID: "c", DependsOnID: "b", Type: types.DepBlocks},
+			},
+			IssueMap: map[string]*types.Issue{"a": a, "b": b, "c": c},
+		}
+		f := filterSubgraphOpen(sg)
+		if f == nil {
+			t.Fatal("expected non-nil")
+		}
+		if len(f.Issues) != 2 {
+			t.Fatalf("expected 2 issues, got %d", len(f.Issues))
+		}
+
+		// Should have a synthetic blocks edge from a→c
+		foundEdge := false
+		for _, dep := range f.Dependencies {
+			if dep.Type == types.DepBlocks && dep.DependsOnID == "a" && dep.IssueID == "c" {
+				foundEdge = true
+			}
+		}
+		if !foundEdge {
+			t.Error("expected transitive blocking edge a→c, not found")
+		}
+	})
+
+	t.Run("preserves direct edges between open nodes", func(t *testing.T) {
+		a := &types.Issue{ID: "a", Title: "A", Status: types.StatusOpen, Priority: 1}
+		b := &types.Issue{ID: "b", Title: "B", Status: types.StatusInProgress, Priority: 2}
+		sg := &TemplateSubgraph{
+			Root:   a,
+			Issues: []*types.Issue{a, b},
+			Dependencies: []*types.Dependency{
+				{IssueID: "b", DependsOnID: "a", Type: types.DepBlocks},
+			},
+			IssueMap: map[string]*types.Issue{"a": a, "b": b},
+		}
+		f := filterSubgraphOpen(sg)
+		if len(f.Dependencies) != 1 {
+			t.Errorf("expected 1 dep, got %d", len(f.Dependencies))
+		}
+	})
+
+	t.Run("root fallback when root is closed", func(t *testing.T) {
+		root := &types.Issue{ID: "root", Title: "Root", Status: types.StatusClosed, Priority: 0}
+		hi := &types.Issue{ID: "hi", Title: "High", Status: types.StatusOpen, Priority: 1}
+		lo := &types.Issue{ID: "lo", Title: "Low", Status: types.StatusOpen, Priority: 3}
+		sg := &TemplateSubgraph{
+			Root:   root,
+			Issues: []*types.Issue{root, hi, lo},
+			IssueMap: map[string]*types.Issue{
+				"root": root, "hi": hi, "lo": lo,
+			},
+		}
+		f := filterSubgraphOpen(sg)
+		if f.Root == nil || f.Root.ID != "hi" {
+			rootID := "<nil>"
+			if f.Root != nil {
+				rootID = f.Root.ID
+			}
+			t.Errorf("expected root=hi (highest priority), got %s", rootID)
+		}
+	})
+
+	t.Run("no duplicate edges", func(t *testing.T) {
+		// Direct edge a→c exists AND transitive path a→(closed b)→c exists.
+		// Should produce exactly one blocking edge a→c, not two.
+		a := &types.Issue{ID: "a", Title: "A", Status: types.StatusOpen, Priority: 1}
+		b := &types.Issue{ID: "b", Title: "B", Status: types.StatusClosed, Priority: 2}
+		c := &types.Issue{ID: "c", Title: "C", Status: types.StatusOpen, Priority: 2}
+		sg := &TemplateSubgraph{
+			Root:   a,
+			Issues: []*types.Issue{a, b, c},
+			Dependencies: []*types.Dependency{
+				{IssueID: "b", DependsOnID: "a", Type: types.DepBlocks},
+				{IssueID: "c", DependsOnID: "b", Type: types.DepBlocks},
+				{IssueID: "c", DependsOnID: "a", Type: types.DepBlocks},
+			},
+			IssueMap: map[string]*types.Issue{"a": a, "b": b, "c": c},
+		}
+		f := filterSubgraphOpen(sg)
+		blockCount := 0
+		for _, dep := range f.Dependencies {
+			if dep.Type == types.DepBlocks && dep.DependsOnID == "a" && dep.IssueID == "c" {
+				blockCount++
+			}
+		}
+		if blockCount != 1 {
+			t.Errorf("expected exactly 1 blocking edge a→c, got %d", blockCount)
+		}
+	})
+
+	t.Run("preserves non-blocks deps between open nodes", func(t *testing.T) {
+		a := &types.Issue{ID: "a", Title: "A", Status: types.StatusOpen, Priority: 1}
+		b := &types.Issue{ID: "b", Title: "B", Status: types.StatusOpen, Priority: 2}
+		sg := &TemplateSubgraph{
+			Root:   a,
+			Issues: []*types.Issue{a, b},
+			Dependencies: []*types.Dependency{
+				{IssueID: "b", DependsOnID: "a", Type: types.DepParentChild},
+			},
+			IssueMap: map[string]*types.Issue{"a": a, "b": b},
+		}
+		f := filterSubgraphOpen(sg)
+		if len(f.Dependencies) != 1 || f.Dependencies[0].Type != types.DepParentChild {
+			t.Error("expected parent-child dep to be preserved")
 		}
 	})
 }

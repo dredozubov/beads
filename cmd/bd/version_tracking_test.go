@@ -1,20 +1,20 @@
+//go:build cgo
+
 package main
 
 import (
-	"context"
 	"os"
 	"path/filepath"
 	"testing"
 
 	"github.com/steveyegge/beads/internal/git"
-	"github.com/steveyegge/beads/internal/storage/sqlite"
 )
 
 func TestGetVersionsSince(t *testing.T) {
 	// Get current version counts dynamically from versionChanges
-	latestVersion := versionChanges[0].Version              // First element is latest
+	latestVersion := versionChanges[0].Version                     // First element is latest
 	oldestVersion := versionChanges[len(versionChanges)-1].Version // Last element is oldest
-	versionsAfterOldest := len(versionChanges) - 1          // All except oldest
+	versionsAfterOldest := len(versionChanges) - 1                 // All except oldest
 
 	tests := []struct {
 		name          string
@@ -46,6 +46,18 @@ func TestGetVersionsSince(t *testing.T) {
 			expectedCount: 0,
 			description:   "Should return empty slice when already on latest in changelog",
 		},
+		{
+			name:          "brew HEAD stamp returns empty",
+			sinceVersion:  "HEAD-f925f3f",
+			expectedCount: 0,
+			description:   "A --HEAD stamp names no changelog entry and must not dump the full history",
+		},
+		{
+			name:          "bare brew HEAD stamp returns empty",
+			sinceVersion:  "HEAD",
+			expectedCount: 0,
+			description:   "A bare HEAD stamp names no changelog entry and must not dump the full history",
+		},
 	}
 
 	for _, tt := range tests {
@@ -54,6 +66,28 @@ func TestGetVersionsSince(t *testing.T) {
 			if len(result) != tt.expectedCount {
 				t.Errorf("getVersionsSince(%q) returned %d versions, want %d: %s",
 					tt.sinceVersion, len(result), tt.expectedCount, tt.description)
+			}
+		})
+	}
+}
+
+func TestDisplayVersion(t *testing.T) {
+	tests := []struct {
+		name    string
+		version string
+		want    string
+	}{
+		{name: "release", version: "1.3.0", want: "v1.3.0"},
+		{name: "pre-release", version: "1.3.0-rc.1", want: "v1.3.0-rc.1"},
+		{name: "brew HEAD stamp", version: "HEAD-f925f3f", want: "HEAD-f925f3f"},
+		{name: "bare brew HEAD stamp", version: "HEAD", want: "HEAD"},
+		{name: "brew HEAD stamp with revision", version: "HEAD-f925f3f_1", want: "HEAD-f925f3f_1"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := displayVersion(tt.version); got != tt.want {
+				t.Fatalf("displayVersion(%q) = %q, want %q", tt.version, got, tt.want)
 			}
 		})
 	}
@@ -245,6 +279,166 @@ func TestTrackBdVersion_UpgradeDetection(t *testing.T) {
 	}
 }
 
+func TestTrackBdVersion_DowngradeIgnored(t *testing.T) {
+	// Reset global state for test isolation
+	ensureCleanGlobalState(t)
+
+	// Create temp .beads directory
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("Failed to create .beads: %v", err)
+	}
+
+	// Set BEADS_DIR to force FindBeadsDir to use our temp directory
+	t.Setenv("BEADS_DIR", beadsDir)
+
+	// Change to temp directory
+	t.Chdir(tmpDir)
+
+	// Create minimal metadata.json so FindBeadsDir can find the directory
+	metadataPath := filepath.Join(beadsDir, "metadata.json")
+	if err := os.WriteFile(metadataPath, []byte(`{"database":"beads.db"}`), 0600); err != nil {
+		t.Fatalf("Failed to create metadata.json: %v", err)
+	}
+
+	// Create .local_version with a NEWER version than current (simulating downgrade)
+	localVersionPath := filepath.Join(beadsDir, localVersionFile)
+	if err := writeLocalVersion(localVersionPath, "99.99.99"); err != nil {
+		t.Fatalf("Failed to write local version: %v", err)
+	}
+
+	// Save original state
+	origUpgradeDetected := versionUpgradeDetected
+	origPreviousVersion := previousVersion
+	defer func() {
+		versionUpgradeDetected = origUpgradeDetected
+		previousVersion = origPreviousVersion
+	}()
+
+	// Reset state
+	versionUpgradeDetected = false
+	previousVersion = ""
+
+	// trackBdVersion should NOT detect upgrade (this is a downgrade)
+	trackBdVersion()
+
+	if versionUpgradeDetected {
+		t.Error("Expected no upgrade detection when version is a downgrade")
+	}
+
+	if previousVersion != "" {
+		t.Errorf("previousVersion = %q, want empty string for downgrade", previousVersion)
+	}
+
+	// Should still update .local_version to current version
+	localVersion := readLocalVersion(localVersionPath)
+	if localVersion != Version {
+		t.Errorf(".local_version = %q, want %q", localVersion, Version)
+	}
+}
+
+// newTrackingWorkspace prepares the minimal .beads a trackBdVersion call needs
+// and pins the globals it mutates, returning the .local_version path.
+func newTrackingWorkspace(t *testing.T, lastVersion, binVersion string) string {
+	t.Helper()
+	ensureCleanGlobalState(t)
+
+	tmpDir := t.TempDir()
+	beadsDir := filepath.Join(tmpDir, ".beads")
+	if err := os.MkdirAll(beadsDir, 0755); err != nil {
+		t.Fatalf("Failed to create .beads: %v", err)
+	}
+	t.Setenv("BEADS_DIR", beadsDir)
+	t.Chdir(tmpDir)
+
+	metadataPath := filepath.Join(beadsDir, "metadata.json")
+	if err := os.WriteFile(metadataPath, []byte(`{"database":"beads.db"}`), 0600); err != nil {
+		t.Fatalf("Failed to create metadata.json: %v", err)
+	}
+
+	localVersionPath := filepath.Join(beadsDir, localVersionFile)
+	if err := writeLocalVersion(localVersionPath, lastVersion); err != nil {
+		t.Fatalf("Failed to write local version: %v", err)
+	}
+
+	origVersion, origDetected, origPrevious := Version, versionUpgradeDetected, previousVersion
+	t.Cleanup(func() {
+		Version, versionUpgradeDetected, previousVersion = origVersion, origDetected, origPrevious
+	})
+	Version = binVersion
+	versionUpgradeDetected = false
+	previousVersion = ""
+
+	return localVersionPath
+}
+
+// TestTrackBdVersion_HeadStampChangeDetectedAsUpgrade covers the stamp changes
+// CompareVersions cannot see: it reads every HEAD stamp as 0.0.0, so a HEAD
+// reinstall looked like no change and a release-to-HEAD move looked like a
+// downgrade. Both skipped the one-shot post-upgrade reconciliation entirely.
+func TestTrackBdVersion_HeadStampChangeDetectedAsUpgrade(t *testing.T) {
+	tests := []struct {
+		name         string
+		lastVersion  string
+		binVersion   string
+		wantDetected bool
+	}{
+		{name: "HEAD stamp to different HEAD stamp", lastVersion: "HEAD-423afdc", binVersion: "HEAD-f925f3f", wantDetected: true},
+		{name: "release to HEAD stamp", lastVersion: "1.1.2", binVersion: "HEAD-f925f3f", wantDetected: true},
+		{name: "HEAD stamp to release", lastVersion: "HEAD-423afdc", binVersion: "1.3.0", wantDetected: true},
+		{name: "same HEAD stamp", lastVersion: "HEAD-f925f3f", binVersion: "HEAD-f925f3f", wantDetected: false},
+		{name: "non-HEAD garbage change stays undetected", lastVersion: "not-a-version", binVersion: "also-not-one", wantDetected: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			localVersionPath := newTrackingWorkspace(t, tt.lastVersion, tt.binVersion)
+
+			trackBdVersion()
+
+			if versionUpgradeDetected != tt.wantDetected {
+				t.Errorf("versionUpgradeDetected = %v, want %v", versionUpgradeDetected, tt.wantDetected)
+			}
+			wantPrevious := ""
+			if tt.wantDetected {
+				wantPrevious = tt.lastVersion
+			}
+			if previousVersion != wantPrevious {
+				t.Errorf("previousVersion = %q, want %q", previousVersion, wantPrevious)
+			}
+			if got := readLocalVersion(localVersionPath); got != tt.binVersion {
+				t.Errorf(".local_version = %q, want %q", got, tt.binVersion)
+			}
+		})
+	}
+}
+
+// TestTrackBdVersion_HeadStampNeverReachesPreV56Recovery walks the whole
+// #5603 shape end to end: a workspace last touched by a Homebrew --HEAD build,
+// a .dolt with no .bd-dolt-ok marker, and a release install on top. Detection
+// and the recovery gate have to compose — widening detection is what puts a
+// HEAD stamp into previousVersion in the first place.
+func TestTrackBdVersion_HeadStampNeverReachesPreV56Recovery(t *testing.T) {
+	newTrackingWorkspace(t, "HEAD-f925f3f", "1.3.0")
+	doltDir, sentinel := writePreV56DoltFixture(t)
+
+	trackBdVersion()
+
+	if !versionUpgradeDetected {
+		t.Fatal("installing a release over a --HEAD build should register as an upgrade")
+	}
+	if previousVersion != "HEAD-f925f3f" {
+		t.Fatalf("previousVersion = %q, want the HEAD stamp", previousVersion)
+	}
+
+	recoverPreV56IfNeeded(previousVersion, doltDir)
+
+	if _, err := os.Stat(sentinel); err != nil {
+		t.Fatalf("a --HEAD predecessor routed a live workspace into the pre-v56 recovery: %v", err)
+	}
+}
+
 func TestTrackBdVersion_SameVersion(t *testing.T) {
 	// Create temp .beads directory
 	tmpDir := t.TempDir()
@@ -252,6 +446,10 @@ func TestTrackBdVersion_SameVersion(t *testing.T) {
 	if err := os.MkdirAll(beadsDir, 0755); err != nil {
 		t.Fatalf("Failed to create .beads: %v", err)
 	}
+
+	// Override BEADS_DIR so FindBeadsDir() returns our temp .beads,
+	// not the rig's .beads (which happens in worktree environments).
+	t.Setenv("BEADS_DIR", beadsDir)
 
 	// Change to temp directory
 	t.Chdir(tmpDir)
@@ -332,6 +530,69 @@ func TestMaybeShowUpgradeNotification(t *testing.T) {
 	}
 }
 
+// writePreV56DoltFixture builds the workspace shape RecoverPreV56DoltDir
+// destroys: a .dolt/ directory with no .bd-dolt-ok compatibility marker. It
+// returns a path inside .dolt/ whose survival tells the caller whether the
+// recovery ran.
+func writePreV56DoltFixture(t *testing.T) (doltDir, sentinel string) {
+	t.Helper()
+	doltDir = t.TempDir()
+	sentinel = filepath.Join(doltDir, ".dolt", "sentinel.txt")
+	if err := os.MkdirAll(filepath.Dir(sentinel), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(sentinel, []byte("live workspace data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return doltDir, sentinel
+}
+
+// TestRecoverPreV56IfNeeded_OnlySemverPredecessorsAreRecovered pins the
+// destructive edge from #5603/#5625: CompareVersions reads any unparsable
+// version part as 0, so a non-semver predecessor compares as pre-0.56 and
+// hands a live workspace to a path that deletes .dolt. The Homebrew --HEAD
+// stamp and the v-prefixed Go pseudo-version from #5650 are both such
+// predecessors and both reach this call today.
+func TestRecoverPreV56IfNeeded_OnlySemverPredecessorsAreRecovered(t *testing.T) {
+	tests := []struct {
+		name         string
+		previous     string
+		wantRecovery bool
+	}{
+		{name: "brew HEAD stamp", previous: "HEAD-f925f3f"},
+		{name: "bare brew HEAD stamp", previous: "HEAD"},
+		{name: "brew HEAD stamp with revision", previous: "HEAD-f925f3f_1"},
+		{name: "go pseudo-version", previous: "v1.1.1-0.20260805093327-bf97b73749ac"},
+		{name: "unreadable witness", previous: "not-a-version"},
+		{name: "no predecessor", previous: ""},
+		{name: "current release", previous: "1.1.2"},
+		{name: "0.56.0 itself", previous: "0.56.0"},
+		{name: "pre-0.56 release", previous: "0.55.4", wantRecovery: true},
+		{name: "pre-0.56 pre-release", previous: "0.55.4-rc.1", wantRecovery: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			doltDir, sentinel := writePreV56DoltFixture(t)
+
+			recoverPreV56IfNeeded(tt.previous, doltDir)
+
+			_, err := os.Stat(sentinel)
+			if tt.wantRecovery {
+				// The reinitializing `dolt init` may fail in a bare
+				// environment; the removal that precedes it is the assertion.
+				if !os.IsNotExist(err) {
+					t.Fatalf("predecessor %q: expected pre-v56 recovery to rebuild .dolt, but %s survived", tt.previous, sentinel)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("predecessor %q: pre-v56 recovery deleted a live .dolt: %v", tt.previous, err)
+			}
+		})
+	}
+}
+
 func TestAutoMigrateOnVersionBump_NoUpgrade(t *testing.T) {
 	// Save original state
 	origUpgradeDetected := versionUpgradeDetected
@@ -343,15 +604,14 @@ func TestAutoMigrateOnVersionBump_NoUpgrade(t *testing.T) {
 	versionUpgradeDetected = false
 
 	// Should return early without doing anything
-	autoMigrateOnVersionBump("/tmp/test.db")
+	autoMigrateOnVersionBump(t.TempDir())
 
 	// Test passes if no panic occurs
 }
 
 func TestAutoMigrateOnVersionBump_NoDatabase(t *testing.T) {
-	// Create temp directory
+	// Create temp directory (no database file inside)
 	tmpDir := t.TempDir()
-	nonExistentDB := filepath.Join(tmpDir, "nonexistent.db")
 
 	// Save original state
 	origUpgradeDetected := versionUpgradeDetected
@@ -363,129 +623,14 @@ func TestAutoMigrateOnVersionBump_NoDatabase(t *testing.T) {
 	versionUpgradeDetected = true
 
 	// Should handle gracefully when database doesn't exist
-	autoMigrateOnVersionBump(nonExistentDB)
+	autoMigrateOnVersionBump(tmpDir)
 
 	// Test passes if no panic occurs
 }
 
-func TestAutoMigrateOnVersionBump_MigratesVersion(t *testing.T) {
-	// NOTE: Cannot use t.Parallel() because we modify global variables
-
-	// Save original state FIRST - critical to avoid test pollution from previous tests
-	origUpgradeDetected := versionUpgradeDetected
-	origUpgradeAcknowledged := upgradeAcknowledged
-	origPreviousVersion := previousVersion
-	defer func() {
-		versionUpgradeDetected = origUpgradeDetected
-		upgradeAcknowledged = origUpgradeAcknowledged
-		previousVersion = origPreviousVersion
-	}()
-
-	// Create temp directory with unique name to avoid any possible interference
-	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "test-migrate-version-unique.db")
-
-	// Create database with old version
-	ctx := context.Background()
-	store, err := sqlite.New(ctx, dbPath)
-	if err != nil {
-		t.Fatalf("Failed to create database: %v", err)
-	}
-
-	// Set old database version
-	oldVersion := "0.22.0"
-	if err := store.SetMetadata(ctx, "bd_version", oldVersion); err != nil {
-		t.Fatalf("Failed to set old version: %v", err)
-	}
-	if err := store.Close(); err != nil {
-		t.Fatalf("Failed to close database: %v", err)
-	}
-
-	// Simulate version upgrade (must be set to true for migration to run)
-	// Set this AFTER closing the database to ensure clean state
-	upgradeAcknowledged = false
-	previousVersion = oldVersion
-
-	// Verify dbPath before migration
-	if dbPath == "" {
-		t.Fatalf("dbPath is empty!")
-	}
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-		t.Fatalf("database doesn't exist before migration: %s", dbPath)
-	}
-
-	// Set versionUpgradeDetected immediately before calling to avoid races
-	versionUpgradeDetected = true
-	t.Logf("Calling autoMigrateOnVersionBump with dbPath=%s, versionUpgradeDetected=%v", dbPath, versionUpgradeDetected)
-	// Immediately call migration while flag is still true
-	autoMigrateOnVersionBump(dbPath)
-
-	// Verify the flag is still true after migration
-	if !versionUpgradeDetected {
-		t.Fatalf("version Upgrade detected flag was cleared during migration")
-	}
-
-	// Verify database version was updated
-	store, err = sqlite.New(ctx, dbPath)
-	if err != nil {
-		t.Fatalf("Failed to open database: %v", err)
-	}
-	defer store.Close()
-
-	newVersion, err := store.GetMetadata(ctx, "bd_version")
-	if err != nil {
-		t.Fatalf("Failed to read database version: %v", err)
-	}
-
-	if newVersion != Version {
-		t.Errorf("Database version not updated: got %q, want %q (versionUpgradeDetected=%v)",
-			newVersion, Version, versionUpgradeDetected)
-	}
-}
-
-func TestAutoMigrateOnVersionBump_AlreadyMigrated(t *testing.T) {
-	// Create temp directory
-	tmpDir := t.TempDir()
-	dbPath := filepath.Join(tmpDir, "test.db")
-
-	// Create database with current version
-	ctx := context.Background()
-	store, err := sqlite.New(ctx, dbPath)
-	if err != nil {
-		t.Fatalf("Failed to create database: %v", err)
-	}
-
-	// Set current database version
-	if err := store.SetMetadata(ctx, "bd_version", Version); err != nil {
-		t.Fatalf("Failed to set version: %v", err)
-	}
-	_ = store.Close()
-
-	// Save original state
-	origUpgradeDetected := versionUpgradeDetected
-	defer func() {
-		versionUpgradeDetected = origUpgradeDetected
-	}()
-
-	// Simulate version upgrade
-	versionUpgradeDetected = true
-
-	// Call auto-migration - should be a no-op
-	autoMigrateOnVersionBump(dbPath)
-
-	// Verify database version is still current
-	store, err = sqlite.New(ctx, dbPath)
-	if err != nil {
-		t.Fatalf("Failed to open database: %v", err)
-	}
-	defer store.Close()
-
-	currentVersion, err := store.GetMetadata(ctx, "bd_version")
-	if err != nil {
-		t.Fatalf("Failed to read database version: %v", err)
-	}
-
-	if currentVersion != Version {
-		t.Errorf("Database version changed unexpectedly: got %q, want %q", currentVersion, Version)
-	}
-}
+// NOTE: TestAutoMigrateOnVersionBump_MigratesVersion, TestAutoMigrateOnVersionBump_AlreadyMigrated,
+// TestAutoMigrateOnVersionBump_RefusesDowngrade, and TestAutoMigrateOnVersionBump_TracksMaxVersion
+// were removed because they depended on the SQLite storage backend (sqlite.New) for round-trip
+// persistence testing through autoMigrateOnVersionBump -> dolt.NewFromConfig.
+// Automatic schema migration is exercised here through the Dolt backend.
+// Dolt-based migration testing is covered by TestInitDoltMetadata in init_test.go.

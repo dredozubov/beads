@@ -22,11 +22,17 @@ func TestScripts(t *testing.T) {
 		t.Skip("scripttest uses Unix shell commands (sh -c), skipping on Windows")
 	}
 
-	// Build the bd binary
+	// Locate or build the bd binary. Prebuilt fast path (scripts/test.sh and
+	// CI export BEADS_TEST_BD_BINARY, wy-4mtr0); the scripts invoke plain
+	// `bd` via `sh -c`, so the prebuilt is only usable when its basename is
+	// exactly the expected executable name.
 	exeName := "bd"
 	binDir := t.TempDir()
 	exe := filepath.Join(binDir, exeName)
-	if err := exec.Command("go", "build", "-o", exe, ".").Run(); err != nil {
+	if prebuilt, err := findPrebuiltBDBinary(); err == nil && prebuilt != "" && filepath.Base(prebuilt) == exeName {
+		exe = prebuilt
+		binDir = filepath.Dir(prebuilt)
+	} else if err := exec.Command("go", "build", "-tags", "gms_pure_go", "-o", exe, ".").Run(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -34,11 +40,11 @@ func TestScripts(t *testing.T) {
 	timeout := 2 * time.Second
 	engine := script.NewEngine()
 	engine.Cmds["bd"] = script.Program(exe, nil, timeout)
-	
+
 	// Add binDir to PATH so 'sh -c bd ...' works in test scripts
 	currentPath := os.Getenv("PATH")
 	env := []string{"PATH=" + binDir + ":" + currentPath}
-	
+
 	// Run all tests
 	scripttest.Test(t, context.Background(), engine, env, "testdata/*.txt")
 }

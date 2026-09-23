@@ -1,24 +1,35 @@
 """Pydantic models for beads issue tracker types."""
 
 from datetime import datetime
-from typing import Literal, Any
+from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
 # Type aliases for issue statuses, types, and dependencies
 #
-# IssueStatus and IssueType are strings (not Literals) to support custom
-# statuses and types configured via:
-#   bd config set status.custom "awaiting_review,awaiting_testing"
+# IssueStatus, IssueType, and DependencyType are strings (not Literals) so the
+# MCP layer doesn't have to be kept in lockstep with every dep type / status /
+# issue type the bd CLI emits. The CLI is the source of truth and validates
+# these values against the configured (or built-in) options.
+#
+# Custom statuses and types are configured via:
+#   bd config set status.custom "in_review:active,qa_testing:wip,on_hold:frozen"
 #   bd config set types.custom "agent,molecule,event"
 #
-# The CLI handles validation of these values against the configured options.
+# Custom statuses support optional category annotations (active, wip, done, frozen)
+# that control behavior in bd ready and bd list. See docs/CLI_REFERENCE.md.
+#
 # Built-in statuses: open, in_progress, blocked, deferred, closed
-# Built-in types: bug, feature, task, epic, chore
+# Built-in types: bug, feature, task, epic, chore, decision
+# Built-in dependency types (see internal/types/types.go):
+#   blocks, parent-child, conditional-blocks, waits-for, related,
+#   discovered-from, replies-to, relates-to, duplicates, supersedes,
+#   authored-by, assigned-to, approved-by, attests, tracks, until,
+#   caused-by, validates, delegated-from
 IssueStatus = str
 IssueType = str
-DependencyType = Literal["blocks", "related", "parent-child", "discovered-from"]
-OperationAction = Literal["created", "updated", "closed", "reopened"]
+DependencyType = str
+OperationAction = Literal["created", "updated", "claimed", "closed", "reopened"]
 
 
 # =============================================================================
@@ -27,12 +38,14 @@ OperationAction = Literal["created", "updated", "closed", "reopened"]
 # These lightweight models reduce context window usage by ~80% for list operations.
 # Use full Issue model only when detailed information is needed (show command).
 
+
 class IssueMinimal(BaseModel):
     """Minimal issue model for list views (~80% smaller than full Issue).
-    
+
     Use this for ready_work, list_issues, and other bulk operations.
     For full details including dependencies, use Issue model via show().
     """
+
     id: str
     title: str
     status: IssueStatus
@@ -57,6 +70,7 @@ class CompactedResult(BaseModel):
     When results exceed threshold, returns preview + metadata instead of full data.
     This prevents context window overflow for large issue lists.
     """
+
     compacted: bool = True
     total_count: int
     preview: list[IssueMinimal]
@@ -70,6 +84,7 @@ class BriefIssue(BaseModel):
     Use for quick scans where only identification + priority needed.
     ~95% smaller than full Issue.
     """
+
     id: str
     title: str
     status: IssueStatus
@@ -82,6 +97,7 @@ class BriefDep(BaseModel):
     Use with brief_deps=True to get full issue but compact dependencies.
     ~90% smaller than full LinkedIssue.
     """
+
     id: str
     title: str
     status: IssueStatus
@@ -95,6 +111,7 @@ class OperationResult(BaseModel):
     Default response for create/update/close/reopen when verbose=False.
     ~97% smaller than returning full Issue object.
     """
+
     id: str
     action: OperationAction
     message: str | None = None
@@ -103,6 +120,7 @@ class OperationResult(BaseModel):
 # =============================================================================
 # ORIGINAL MODELS (unchanged for backward compatibility)
 # =============================================================================
+
 
 class IssueBase(BaseModel):
     """Base issue model with shared fields."""
@@ -186,6 +204,12 @@ class UpdateIssueParams(BaseModel):
     external_ref: str | None = None
 
 
+class ClaimIssueParams(BaseModel):
+    """Parameters for atomically claiming an issue."""
+
+    issue_id: str
+
+
 class CloseIssueParams(BaseModel):
     """Parameters for closing an issue."""
 
@@ -213,6 +237,7 @@ class ReadyWorkParams(BaseModel):
 
     limit: int = Field(default=10, ge=1, le=100)
     priority: int | None = Field(default=None, ge=0, le=4)
+    issue_type: str | None = None
     assignee: str | None = None
     labels: list[str] | None = None  # AND: must have ALL labels
     labels_any: list[str] | None = None  # OR: must have at least one
@@ -247,16 +272,39 @@ class ShowIssueParams(BaseModel):
     issue_id: str
 
 
-class Stats(BaseModel):
-    """Beads task statistics."""
+class StatsSummary(BaseModel):
+    """Summary statistics from bd stats."""
 
     total_issues: int
     open_issues: int
     in_progress_issues: int
     closed_issues: int
     blocked_issues: int
+    deferred_issues: int = 0
     ready_issues: int
+    tombstone_issues: int = 0
+    pinned_issues: int = 0
+    epics_eligible_for_closure: int = 0
     average_lead_time_hours: float
+
+
+class RecentActivity(BaseModel):
+    """Recent activity from bd stats."""
+
+    hours_tracked: int = 24
+    commit_count: int = 0
+    issues_created: int = 0
+    issues_closed: int = 0
+    issues_updated: int = 0
+    issues_reopened: int = 0
+    total_changes: int = 0
+
+
+class Stats(BaseModel):
+    """Beads task statistics matching bd stats --json output."""
+
+    summary: StatsSummary
+    recent_activity: RecentActivity | None = None
 
 
 class BlockedIssue(Issue):
@@ -278,3 +326,38 @@ class InitResult(BaseModel):
     database: str
     prefix: str
     message: str
+
+
+# =============================================================================
+# COMMENTS & NOTES
+# =============================================================================
+
+
+class Comment(BaseModel):
+    """A comment on an issue (matches `bd comments <id> --json`)."""
+
+    id: str
+    issue_id: str
+    author: str | None = None
+    text: str
+    created_at: datetime
+
+
+class AddCommentParams(BaseModel):
+    """Parameters for adding a comment to an issue."""
+
+    issue_id: str
+    text: str
+
+
+class ListCommentsParams(BaseModel):
+    """Parameters for listing comments on an issue."""
+
+    issue_id: str
+
+
+class AddNoteParams(BaseModel):
+    """Parameters for appending a note to an issue's notes field."""
+
+    issue_id: str
+    text: str

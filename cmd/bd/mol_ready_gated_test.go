@@ -1,3 +1,5 @@
+//go:build cgo
+
 package main
 
 import (
@@ -8,12 +10,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 )
 
 // setupGatedTestDB creates a temporary file-based test database
-func setupGatedTestDB(t *testing.T) (*sqlite.SQLiteStorage, func()) {
+func setupGatedTestDB(t *testing.T) (*dolt.DoltStore, func()) {
 	t.Helper()
 	tmpDir, err := os.MkdirTemp("", "bd-test-gated-*")
 	if err != nil {
@@ -21,10 +23,10 @@ func setupGatedTestDB(t *testing.T) (*sqlite.SQLiteStorage, func()) {
 	}
 
 	testDB := filepath.Join(tmpDir, "test.db")
-	store, err := sqlite.New(context.Background(), testDB)
+	store, err := dolt.New(context.Background(), &dolt.Config{Path: testDB})
 	if err != nil {
 		os.RemoveAll(tmpDir)
-		t.Fatalf("Failed to create test database: %v", err)
+		t.Skipf("skipping: Dolt server not available: %v", err)
 	}
 
 	// Set issue_prefix (required for beads)
@@ -33,6 +35,13 @@ func setupGatedTestDB(t *testing.T) (*sqlite.SQLiteStorage, func()) {
 		store.Close()
 		os.RemoveAll(tmpDir)
 		t.Fatalf("Failed to set issue_prefix: %v", err)
+	}
+
+	// Configure orchestrator custom types for test compatibility (bd-find4)
+	if err := store.SetConfig(ctx, "types.custom", "molecule,gate,convoy,merge-request,slot,agent,role,rig,event,message"); err != nil {
+		store.Close()
+		os.RemoveAll(tmpDir)
+		t.Fatalf("Failed to set types.custom: %v", err)
 	}
 
 	cleanup := func() {
@@ -120,7 +129,7 @@ func TestFindGateReadyMolecules_ClosedGate(t *testing.T) {
 	gate := &types.Issue{
 		ID:        "test-mol-002.gate-await-ci",
 		Title:     "Gate: gh:run ci-workflow",
-		IssueType: types.TypeGate,
+		IssueType: "gate",
 		Status:    types.StatusClosed, // Gate has closed
 		AwaitType: "gh:run",
 		AwaitID:   "ci-workflow",
@@ -215,7 +224,7 @@ func TestFindGateReadyMolecules_OpenGate(t *testing.T) {
 	gate := &types.Issue{
 		ID:        "test-mol-003.gate-await-ci",
 		Title:     "Gate: gh:run ci-workflow",
-		IssueType: types.TypeGate,
+		IssueType: "gate",
 		Status:    types.StatusOpen, // Gate is still open
 		AwaitType: "gh:run",
 		AwaitID:   "ci-workflow",
@@ -295,7 +304,7 @@ func TestFindGateReadyMolecules_HookedMolecule(t *testing.T) {
 	gate := &types.Issue{
 		ID:        "test-mol-004.gate-await-ci",
 		Title:     "Gate: gh:run ci-workflow",
-		IssueType: types.TypeGate,
+		IssueType: "gate",
 		Status:    types.StatusClosed,
 		AwaitType: "gh:run",
 		AwaitID:   "ci-workflow",
@@ -377,7 +386,7 @@ func TestFindGateReadyMolecules_MultipleGates(t *testing.T) {
 		gate := &types.Issue{
 			ID:        fmt.Sprintf("%s.gate", molID),
 			Title:     "Gate: gh:run",
-			IssueType: types.TypeGate,
+			IssueType: "gate",
 			Status:    types.StatusClosed,
 			AwaitType: "gh:run",
 			CreatedAt: time.Now(),
@@ -436,4 +445,3 @@ func TestFindGateReadyMolecules_MultipleGates(t *testing.T) {
 		t.Errorf("Expected 2 gate-ready molecules, got %d", len(molecules))
 	}
 }
-

@@ -6,28 +6,22 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 
-	_ "github.com/ncruces/go-sqlite3/driver"
-	_ "github.com/ncruces/go-sqlite3/embed"
-	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/configfile"
-	"github.com/steveyegge/beads/internal/types"
 )
 
 // DeepValidationResult holds all deep validation check results
 type DeepValidationResult struct {
-	ParentConsistency    DoctorCheck   `json:"parent_consistency"`
-	DependencyIntegrity  DoctorCheck   `json:"dependency_integrity"`
-	EpicCompleteness     DoctorCheck   `json:"epic_completeness"`
-	AgentBeadIntegrity   DoctorCheck   `json:"agent_bead_integrity"`
-	MailThreadIntegrity  DoctorCheck   `json:"mail_thread_integrity"`
-	MoleculeIntegrity    DoctorCheck   `json:"molecule_integrity"`
-	AllChecks            []DoctorCheck `json:"all_checks"`
-	TotalIssues          int           `json:"total_issues"`
-	TotalDependencies    int           `json:"total_dependencies"`
-	OverallOK            bool          `json:"overall_ok"`
+	ParentConsistency   DoctorCheck   `json:"parent_consistency"`
+	DependencyIntegrity DoctorCheck   `json:"dependency_integrity"`
+	EpicCompleteness    DoctorCheck   `json:"epic_completeness"`
+	MailThreadIntegrity DoctorCheck   `json:"mail_thread_integrity"`
+	MoleculeIntegrity   DoctorCheck   `json:"molecule_integrity"`
+	AllChecks           []DoctorCheck `json:"all_checks"`
+	TotalIssues         int           `json:"total_issues"`
+	TotalDependencies   int           `json:"total_dependencies"`
+	OverallOK           bool          `json:"overall_ok"`
 }
 
 // RunDeepValidation runs all deep validation checks on the issue graph.
@@ -37,19 +31,28 @@ func RunDeepValidation(path string) DeepValidationResult {
 		OverallOK: true,
 	}
 
-	// Follow redirect to resolve actual beads directory
-	beadsDir := resolveBeadsDir(filepath.Join(path, ".beads"))
+	beadsDir := ResolveBeadsDirForRepo(path)
 
-	// Get database path
-	var dbPath string
-	if cfg, err := configfile.Load(beadsDir); err == nil && cfg != nil && cfg.Database != "" {
-		dbPath = cfg.DatabasePath(beadsDir)
-	} else {
-		dbPath = filepath.Join(beadsDir, beads.CanonicalDatabaseName)
+	// Check backend
+	backend := configfile.BackendDolt
+	if cfg, err := configfile.Load(beadsDir); err == nil && cfg != nil {
+		backend = cfg.GetBackend()
 	}
 
-	// Skip if database doesn't exist
-	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
+	if backend != configfile.BackendDolt {
+		check := DoctorCheck{
+			Name:     "Deep Validation",
+			Status:   StatusWarning,
+			Message:  fmt.Sprintf("N/A (deep validation requires Dolt; configured backend is %q)", backend),
+			Category: CategoryMaintenance,
+		}
+		result.AllChecks = append(result.AllChecks, check)
+		return result
+	}
+
+	// Check if Dolt directory exists
+	doltPath := getDatabasePath(beadsDir)
+	if _, err := os.Stat(doltPath); os.IsNotExist(err) {
 		check := DoctorCheck{
 			Name:     "Deep Validation",
 			Status:   StatusOK,
@@ -60,8 +63,8 @@ func RunDeepValidation(path string) DeepValidationResult {
 		return result
 	}
 
-	// Open database
-	db, err := sql.Open("sqlite3", sqliteConnString(dbPath, true))
+	// Open Dolt connection
+	conn, err := openDoltConn(beadsDir)
 	if err != nil {
 		check := DoctorCheck{
 			Name:     "Deep Validation",
@@ -74,11 +77,16 @@ func RunDeepValidation(path string) DeepValidationResult {
 		result.OverallOK = false
 		return result
 	}
-	defer db.Close()
+	db := conn.db
+	defer conn.Close()
 
 	// Get counts for progress reporting
-	_ = db.QueryRow("SELECT COUNT(*) FROM issues WHERE status != 'tombstone'").Scan(&result.TotalIssues)
-	_ = db.QueryRow("SELECT COUNT(*) FROM dependencies").Scan(&result.TotalDependencies)
+	_ = db.QueryRow("SELECT COUNT(*) FROM issues").Scan(&result.TotalIssues)             // Best effort: zero counts are safe defaults for diagnostic display
+	_ = db.QueryRow("SELECT COUNT(*) FROM dependencies").Scan(&result.TotalDependencies) // Best effort: zero counts are safe defaults for diagnostic display
+	var wispDependencyCount int
+	if err := db.QueryRow("SELECT COUNT(*) FROM wisp_dependencies").Scan(&wispDependencyCount); err == nil {
+		result.TotalDependencies += wispDependencyCount
+	}
 
 	// Run all deep checks
 	result.ParentConsistency = checkParentConsistency(db)
@@ -97,12 +105,6 @@ func RunDeepValidation(path string) DeepValidationResult {
 	result.AllChecks = append(result.AllChecks, result.EpicCompleteness)
 	if result.EpicCompleteness.Status == StatusWarning {
 		// Epic completeness is informational, not an error
-	}
-
-	result.AgentBeadIntegrity = checkAgentBeadIntegrity(db)
-	result.AllChecks = append(result.AllChecks, result.AgentBeadIntegrity)
-	if result.AgentBeadIntegrity.Status == StatusError {
-		result.OverallOK = false
 	}
 
 	result.MailThreadIntegrity = checkMailThreadIntegrity(db)
@@ -127,14 +129,19 @@ func checkParentConsistency(db *sql.DB) DoctorCheck {
 		Category: CategoryMetadata,
 	}
 
-	// Find parent-child deps where either side doesn't exist or is a tombstone
+	// Find parent-child deps where either side doesn't exist
+	//nolint:gosec // G202: doctorDependencyUnionSQL returns a fixed internal SELECT fragment.
 	query := `
 		SELECT d.issue_id, d.depends_on_id
-		FROM dependencies d
+		FROM (` + doctorDependencyUnionSQL() + `) d
 		WHERE d.type = 'parent-child'
 		  AND (
-		    NOT EXISTS (SELECT 1 FROM issues WHERE id = d.issue_id AND status != 'tombstone')
-		    OR NOT EXISTS (SELECT 1 FROM issues WHERE id = d.depends_on_id AND status != 'tombstone')
+		    (d.dep_table = 'dependencies' AND NOT EXISTS (SELECT 1 FROM issues WHERE id = d.issue_id))
+		    OR (d.dep_table = 'wisp_dependencies' AND NOT EXISTS (SELECT 1 FROM wisps WHERE id = d.issue_id))
+		    OR (
+		      NOT EXISTS (SELECT 1 FROM issues WHERE id = d.depends_on_id)
+		      AND NOT EXISTS (SELECT 1 FROM wisps WHERE id = d.depends_on_id)
+		    )
 		  )
 		LIMIT 10`
 
@@ -153,6 +160,12 @@ func checkParentConsistency(db *sql.DB) DoctorCheck {
 		if err := rows.Scan(&issueID, &parentID); err == nil {
 			orphanedDeps = append(orphanedDeps, fmt.Sprintf("%s→%s", issueID, parentID))
 		}
+	}
+	if err := rows.Err(); err != nil {
+		check.Status = StatusWarning
+		check.Message = "Row iteration error checking parent consistency"
+		check.Detail = err.Error()
+		return check
 	}
 
 	if len(orphanedDeps) == 0 {
@@ -175,13 +188,19 @@ func checkDependencyIntegrity(db *sql.DB) DoctorCheck {
 		Category: CategoryMetadata,
 	}
 
-	// Find any deps where either side is missing (excluding tombstones from check)
+	// Find any deps where either side is missing
+	//nolint:gosec // G202: doctorDependencyUnionSQL returns a fixed internal SELECT fragment.
 	query := `
 		SELECT d.issue_id, d.depends_on_id, d.type
-		FROM dependencies d
+		FROM (` + doctorDependencyUnionSQL() + `) d
 		WHERE (
-		    NOT EXISTS (SELECT 1 FROM issues WHERE id = d.issue_id)
-		    OR NOT EXISTS (SELECT 1 FROM issues WHERE id = d.depends_on_id)
+		    (d.dep_table = 'dependencies' AND NOT EXISTS (SELECT 1 FROM issues WHERE id = d.issue_id))
+		    OR (d.dep_table = 'wisp_dependencies' AND NOT EXISTS (SELECT 1 FROM wisps WHERE id = d.issue_id))
+		    OR (
+		      d.depends_on_id NOT LIKE 'external:%'
+		      AND NOT EXISTS (SELECT 1 FROM issues WHERE id = d.depends_on_id)
+		      AND NOT EXISTS (SELECT 1 FROM wisps WHERE id = d.depends_on_id)
+		    )
 		  )
 		LIMIT 10`
 
@@ -200,6 +219,12 @@ func checkDependencyIntegrity(db *sql.DB) DoctorCheck {
 		if err := rows.Scan(&issueID, &dependsOnID, &depType); err == nil {
 			brokenDeps = append(brokenDeps, fmt.Sprintf("%s→%s (%s)", issueID, dependsOnID, depType))
 		}
+	}
+	if err := rows.Err(); err != nil {
+		check.Status = StatusWarning
+		check.Message = "Row iteration error checking dependency integrity"
+		check.Detail = err.Error()
+		return check
 	}
 
 	if len(brokenDeps) == 0 {
@@ -223,15 +248,18 @@ func checkEpicCompleteness(db *sql.DB) DoctorCheck {
 	}
 
 	// Find epics where all children are closed but epic is still open
+	//nolint:gosec // G202: doctorDependencyUnionSQL returns a fixed internal SELECT fragment.
 	query := `
 		SELECT e.id, e.title,
-		       COUNT(c.id) as total_children,
-		       SUM(CASE WHEN c.status = 'closed' THEN 1 ELSE 0 END) as closed_children
+		       COUNT(COALESCE(c.id, cw.id)) as total_children,
+		       SUM(CASE WHEN COALESCE(c.status, cw.status) = 'closed' THEN 1 ELSE 0 END) as closed_children
 		FROM issues e
-		JOIN dependencies d ON d.depends_on_id = e.id AND d.type = 'parent-child'
-		JOIN issues c ON c.id = d.issue_id AND c.status != 'tombstone'
+		JOIN (` + doctorDependencyUnionSQL() + `) d ON d.depends_on_id = e.id AND d.type = 'parent-child'
+		LEFT JOIN issues c ON c.id = d.issue_id
+		LEFT JOIN wisps cw ON cw.id = d.issue_id
 		WHERE e.issue_type = 'epic'
-		  AND e.status NOT IN ('closed', 'tombstone')
+		  AND e.status != 'closed'
+		  AND COALESCE(c.id, cw.id) IS NOT NULL
 		GROUP BY e.id
 		HAVING total_children > 0 AND total_children = closed_children
 		LIMIT 20`
@@ -253,6 +281,12 @@ func checkEpicCompleteness(db *sql.DB) DoctorCheck {
 			completedEpics = append(completedEpics, fmt.Sprintf("%s (%d/%d)", id, closed, total))
 		}
 	}
+	if err := rows.Err(); err != nil {
+		check.Status = StatusWarning
+		check.Message = "Row iteration error checking epic completeness"
+		check.Detail = err.Error()
+		return check
+	}
 
 	if len(completedEpics) == 0 {
 		check.Status = StatusOK
@@ -267,101 +301,6 @@ func checkEpicCompleteness(db *sql.DB) DoctorCheck {
 	return check
 }
 
-// agentBeadInfo holds info about an agent bead for integrity checking
-type agentBeadInfo struct {
-	ID         string
-	Title      string
-	RoleBead   string
-	AgentState string
-	RoleType   string
-}
-
-// checkAgentBeadIntegrity verifies that agent beads have required fields
-func checkAgentBeadIntegrity(db *sql.DB) DoctorCheck {
-	check := DoctorCheck{
-		Name:     "Agent Bead Integrity",
-		Category: CategoryMetadata,
-	}
-
-	// Check if agent bead columns exist (may not in older schemas)
-	var hasColumns bool
-	err := db.QueryRow(`
-		SELECT COUNT(*) > 0 FROM pragma_table_info('issues')
-		WHERE name IN ('role_bead', 'agent_state', 'role_type')
-	`).Scan(&hasColumns)
-	if err != nil || !hasColumns {
-		check.Status = StatusOK
-		check.Message = "N/A (schema doesn't support agent beads)"
-		return check
-	}
-
-	// Find agent beads missing required role_bead
-	// Note: We query JSON metadata from notes field or check for role_bead column
-	query := `
-		SELECT id, title,
-		       COALESCE(json_extract(notes, '$.role_bead'), '') as role_bead,
-		       COALESCE(json_extract(notes, '$.agent_state'), '') as agent_state,
-		       COALESCE(json_extract(notes, '$.role_type'), '') as role_type
-		FROM issues
-		WHERE issue_type = 'agent'
-		  AND status != 'tombstone'
-		LIMIT 100`
-
-	rows, err := db.Query(query)
-	if err != nil {
-		// Try alternate approach without JSON extraction
-		query = `
-			SELECT id, title, '', '', ''
-			FROM issues
-			WHERE issue_type = 'agent'
-			  AND status != 'tombstone'
-			LIMIT 100`
-		rows, err = db.Query(query)
-		if err != nil {
-			check.Status = StatusOK
-			check.Message = "No agent beads found"
-			return check
-		}
-	}
-	defer rows.Close()
-
-	var agents []agentBeadInfo
-	var invalidAgents []string
-
-	for rows.Next() {
-		var agent agentBeadInfo
-		if err := rows.Scan(&agent.ID, &agent.Title, &agent.RoleBead, &agent.AgentState, &agent.RoleType); err == nil {
-			agents = append(agents, agent)
-
-			// Validate agent state
-			if agent.AgentState != "" {
-				state := types.AgentState(agent.AgentState)
-				if !state.IsValid() {
-					invalidAgents = append(invalidAgents, fmt.Sprintf("%s (invalid state: %s)", agent.ID, agent.AgentState))
-				}
-			}
-		}
-	}
-
-	if len(agents) == 0 {
-		check.Status = StatusOK
-		check.Message = "No agent beads to validate"
-		return check
-	}
-
-	if len(invalidAgents) > 0 {
-		check.Status = StatusError
-		check.Message = fmt.Sprintf("Found %d agents with invalid data", len(invalidAgents))
-		check.Detail = fmt.Sprintf("Examples: %s", strings.Join(invalidAgents[:min(3, len(invalidAgents))], ", "))
-		check.Fix = "Update agent beads with valid agent_state values"
-		return check
-	}
-
-	check.Status = StatusOK
-	check.Message = fmt.Sprintf("%d agent beads validated", len(agents))
-	return check
-}
-
 // checkMailThreadIntegrity verifies that mail thread_id references are valid
 func checkMailThreadIntegrity(db *sql.DB) DoctorCheck {
 	check := DoctorCheck{
@@ -369,25 +308,36 @@ func checkMailThreadIntegrity(db *sql.DB) DoctorCheck {
 		Category: CategoryMetadata,
 	}
 
-	// Check if thread_id column exists
+	// Check if both dependency tables can supply thread_id before using the
+	// union query below.
 	var hasThreadID bool
 	err := db.QueryRow(`
-		SELECT COUNT(*) > 0 FROM pragma_table_info('dependencies')
-		WHERE name = 'thread_id'
+		SELECT COUNT(DISTINCT TABLE_NAME) = 2 FROM INFORMATION_SCHEMA.COLUMNS
+		WHERE TABLE_SCHEMA = DATABASE()
+		  AND TABLE_NAME IN ('dependencies', 'wisp_dependencies')
+		  AND COLUMN_NAME = 'thread_id'
 	`).Scan(&hasThreadID)
-	if err != nil || !hasThreadID {
+	if err != nil {
+		check.Status = StatusWarning
+		check.Message = "Unable to check thread integrity schema"
+		check.Detail = err.Error()
+		return check
+	}
+	if !hasThreadID {
 		check.Status = StatusOK
 		check.Message = "N/A (schema doesn't support thread_id)"
 		return check
 	}
 
 	// Find thread_ids that don't point to existing issues
+	//nolint:gosec // G202: doctorDependencyUnionWithThreadSQL returns a fixed internal SELECT fragment.
 	query := `
 		SELECT d.thread_id, COUNT(*) as refs
-		FROM dependencies d
+		FROM (` + doctorDependencyUnionWithThreadSQL() + `) d
 		WHERE d.thread_id != ''
 		  AND d.thread_id IS NOT NULL
 		  AND NOT EXISTS (SELECT 1 FROM issues WHERE id = d.thread_id)
+		  AND NOT EXISTS (SELECT 1 FROM wisps WHERE id = d.thread_id)
 		GROUP BY d.thread_id
 		LIMIT 10`
 
@@ -409,6 +359,12 @@ func checkMailThreadIntegrity(db *sql.DB) DoctorCheck {
 			orphanedThreads = append(orphanedThreads, fmt.Sprintf("%s (%d refs)", threadID, refs))
 			totalOrphaned += refs
 		}
+	}
+	if err := rows.Err(); err != nil {
+		check.Status = StatusWarning
+		check.Message = "Row iteration error checking mail thread integrity"
+		check.Detail = err.Error()
+		return check
 	}
 
 	if len(orphanedThreads) == 0 {
@@ -447,7 +403,6 @@ func checkMoleculeIntegrity(db *sql.DB) DoctorCheck {
 		FROM issues i
 		LEFT JOIN labels l ON l.issue_id = i.id
 		WHERE (i.issue_type = 'molecule' OR l.label = 'beads:template')
-		  AND i.status != 'tombstone'
 		LIMIT 100`
 
 	rows, err := db.Query(query)
@@ -466,6 +421,12 @@ func checkMoleculeIntegrity(db *sql.DB) DoctorCheck {
 			molecules = append(molecules, mol)
 		}
 	}
+	if err := rows.Err(); err != nil {
+		check.Status = StatusWarning
+		check.Message = "Row iteration error checking molecule integrity"
+		check.Detail = err.Error()
+		return check
+	}
 
 	if len(molecules) == 0 {
 		check.Status = StatusOK
@@ -473,20 +434,43 @@ func checkMoleculeIntegrity(db *sql.DB) DoctorCheck {
 		return check
 	}
 
-	// For each molecule, check if all children exist
+	// Find molecules with missing children using batched IN clauses
+	// to avoid full table scans on Dolt with large molecule sets.
+	const batchSize = 200
 	var brokenMolecules []string
-	for _, mol := range molecules {
-		// Count children that don't exist
-		var orphanCount int
-		err := db.QueryRow(`
-			SELECT COUNT(*)
-			FROM dependencies d
-			WHERE d.depends_on_id = ?
+	for start := 0; start < len(molecules); start += batchSize {
+		end := start + batchSize
+		if end > len(molecules) {
+			end = len(molecules)
+		}
+		batch := molecules[start:end]
+		molIDs := make([]interface{}, len(batch))
+		placeholders := make([]string, len(batch))
+		for i, mol := range batch {
+			molIDs[i] = mol.ID
+			placeholders[i] = "?"
+		}
+
+		// nolint:gosec // G201: placeholders contains only ? markers, actual values passed via args
+		brokenQuery := fmt.Sprintf(`
+			SELECT d.depends_on_id, COUNT(*) AS orphan_count
+			FROM (`+doctorDependencyUnionSQL()+`) d
+			WHERE d.depends_on_id IN (%s)
 			  AND d.type = 'parent-child'
-			  AND NOT EXISTS (SELECT 1 FROM issues WHERE id = d.issue_id AND status != 'tombstone')
-		`, mol.ID).Scan(&orphanCount)
-		if err == nil && orphanCount > 0 {
-			brokenMolecules = append(brokenMolecules, fmt.Sprintf("%s (%d missing children)", mol.ID, orphanCount))
+			  AND NOT EXISTS (SELECT 1 FROM issues WHERE id = d.issue_id)
+			  AND NOT EXISTS (SELECT 1 FROM wisps WHERE id = d.issue_id)
+			GROUP BY d.depends_on_id`, strings.Join(placeholders, ","))
+
+		brokenRows, err := db.Query(brokenQuery, molIDs...)
+		if err == nil {
+			for brokenRows.Next() {
+				var molID string
+				var orphanCount int
+				if err := brokenRows.Scan(&molID, &orphanCount); err == nil {
+					brokenMolecules = append(brokenMolecules, fmt.Sprintf("%s (%d missing children)", molID, orphanCount))
+				}
+			}
+			_ = brokenRows.Close()
 		}
 	}
 
@@ -501,14 +485,6 @@ func checkMoleculeIntegrity(db *sql.DB) DoctorCheck {
 	check.Status = StatusOK
 	check.Message = fmt.Sprintf("%d molecules validated", len(molecules))
 	return check
-}
-
-// min returns the smaller of two integers
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
 
 // PrintDeepValidationResult prints the deep validation results

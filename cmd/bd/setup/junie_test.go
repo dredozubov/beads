@@ -13,7 +13,7 @@ func TestJunieGuidelinesTemplate(t *testing.T) {
 		"bd create",
 		"bd update",
 		"bd close",
-		"bd sync",
+		"bd dolt push",
 		"mcp_beads_ready",
 		"mcp_beads_list",
 		"mcp_beads_create",
@@ -366,8 +366,9 @@ func TestCheckJunie_NotInstalled(t *testing.T) {
 		}
 	}()
 
-	// CheckJunie calls os.Exit(1) when not installed
-	// We can't easily test that, but we document expected behavior
+	if err := CheckJunie(); err == nil {
+		t.Fatal("CheckJunie should return error when not installed")
+	}
 }
 
 func TestCheckJunie_Installed(t *testing.T) {
@@ -417,8 +418,9 @@ func TestCheckJunie_PartialInstall_GuidelinesOnly(t *testing.T) {
 		t.Fatalf("failed to create guidelines file: %v", err)
 	}
 
-	// CheckJunie calls os.Exit(1) for partial installation
-	// We can't easily test that, but we document expected behavior
+	if err := CheckJunie(); err == nil {
+		t.Fatal("CheckJunie should return error for partial installation")
+	}
 }
 
 func TestCheckJunie_PartialInstall_MCPOnly(t *testing.T) {
@@ -447,8 +449,9 @@ func TestCheckJunie_PartialInstall_MCPOnly(t *testing.T) {
 		t.Fatalf("failed to create MCP config file: %v", err)
 	}
 
-	// CheckJunie calls os.Exit(1) for partial installation
-	// We can't easily test that, but we document expected behavior
+	if err := CheckJunie(); err == nil {
+		t.Fatal("CheckJunie should return error for partial installation")
+	}
 }
 
 func TestJunieFilePaths(t *testing.T) {
@@ -490,8 +493,8 @@ func TestJunieGuidelinesWorkflowPattern(t *testing.T) {
 	if !strings.Contains(guidelines, "bd ready") {
 		t.Error("Should mention bd ready")
 	}
-	if !strings.Contains(guidelines, "bd sync") {
-		t.Error("Should mention bd sync")
+	if !strings.Contains(guidelines, "bd dolt push") {
+		t.Error("Should mention bd dolt push")
 	}
 
 	// Should explain MCP tools

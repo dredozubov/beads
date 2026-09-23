@@ -2,19 +2,19 @@ package main
 
 import (
 	"context"
-	"database/sql"
 	"fmt"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/metrics"
+	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/types"
 )
 
 var migrateIssuesCmd = &cobra.Command{
-	Use:     "issues",
-	Short:   "Move issues between repositories",
+	Use:   "issues",
+	Short: "Move issues between repositories",
 	Long: `Move issues from one source repository to another with filtering and dependency preservation.
 
 This command updates the source_repo field for selected issues, allowing you to:
@@ -34,17 +34,24 @@ Examples:
 
   # Move issues with label filter
   bd migrate-issues --from . --to ~/feature-work --label frontend --label urgent`,
-	Run: func(cmd *cobra.Command, args []string) {
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		evt := metrics.NewCommandEvent("migrate-issues")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
+
 		dryRun, _ := cmd.Flags().GetBool("dry-run")
 
-		// Block writes in readonly mode
 		if !dryRun {
 			CheckReadonly("migrate-issues")
 		}
 
 		ctx := rootCtx
 
-		// Parse flags
 		from, _ := cmd.Flags().GetString("from")
 		to, _ := cmd.Flags().GetString("to")
 		statusStr, _ := cmd.Flags().GetString("status")
@@ -58,49 +65,22 @@ Examples:
 		strict, _ := cmd.Flags().GetBool("strict")
 		yes, _ := cmd.Flags().GetBool("yes")
 
-		// Validate required flags
 		if from == "" || to == "" {
-			if jsonOutput {
-				outputJSON(map[string]interface{}{
-					"error":   "missing_required_flags",
-					"message": "Both --from and --to are required",
-				})
-			} else {
-				fmt.Fprintln(os.Stderr, "Error: both --from and --to flags are required")
-			}
-			os.Exit(1)
+			return HandleErrorRespectJSON("both --from and --to flags are required")
 		}
 
 		if from == to {
-			if jsonOutput {
-				outputJSON(map[string]interface{}{
-					"error":   "same_source_and_dest",
-					"message": "Source and destination repositories must be different",
-				})
-			} else {
-				fmt.Fprintln(os.Stderr, "Error: --from and --to must be different repositories")
-			}
-			os.Exit(1)
+			return HandleErrorRespectJSON("--from and --to must be different repositories")
 		}
 
-		// Load IDs from file if specified
 		if idsFile != "" {
 			fileIDs, err := loadIDsFromFile(idsFile)
 			if err != nil {
-				if jsonOutput {
-					outputJSON(map[string]interface{}{
-						"error":   "ids_file_read_failed",
-						"message": err.Error(),
-					})
-				} else {
-					fmt.Fprintf(os.Stderr, "Error reading IDs file: %v\n", err)
-				}
-				os.Exit(1)
+				return HandleErrorRespectJSON("reading IDs file: %v", err)
 			}
 			ids = append(ids, fileIDs...)
 		}
 
-		// Execute migration
 		if err := executeMigrateIssues(ctx, migrateIssuesParams{
 			from:           from,
 			to:             to,
@@ -115,16 +95,9 @@ Examples:
 			strict:         strict,
 			yes:            yes,
 		}); err != nil {
-			if jsonOutput {
-				outputJSON(map[string]interface{}{
-					"error":   "migration_failed",
-					"message": err.Error(),
-				})
-			} else {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			}
-			os.Exit(1)
+			return HandleErrorRespectJSON("%v", err)
 		}
+		return nil
 	},
 }
 
@@ -156,43 +129,37 @@ type migrationPlan struct {
 }
 
 func executeMigrateIssues(ctx context.Context, p migrateIssuesParams) error {
-	// Get database connection (use global store)
-	sqlStore, ok := store.(*sqlite.SQLiteStorage)
-	if !ok {
-		return fmt.Errorf("migrate-issues requires SQLite storage")
-	}
-	db := sqlStore.UnderlyingDB()
+	s := store // use global Storage interface
 
 	// Step 1: Validate repositories exist
-	if err := validateRepos(ctx, db, p.from, p.to, p.strict); err != nil {
+	if err := validateRepos(ctx, s, p.from, p.to, p.strict); err != nil {
 		return err
 	}
 
 	// Step 2: Build initial candidate set C using filters
-	candidates, err := findCandidateIssues(ctx, db, p)
+	candidates, err := findCandidateIssues(ctx, s, p)
 	if err != nil {
 		return fmt.Errorf("failed to find candidate issues: %w", err)
 	}
 
 	if len(candidates) == 0 {
 		if jsonOutput {
-			outputJSON(map[string]interface{}{
+			return outputJSON(map[string]interface{}{
 				"message": "No issues match the specified filters",
 			})
-		} else {
-			fmt.Println("Nothing to do: no issues match the specified filters")
 		}
+		fmt.Println("Nothing to do: no issues match the specified filters")
 		return nil
 	}
 
 	// Step 3: Expand set to M (migration set) based on --include
-	migrationSet, dependencyStats, err := expandMigrationSet(ctx, db, candidates, p)
+	migrationSet, dependencyStats, err := expandMigrationSet(ctx, s, candidates, p)
 	if err != nil {
 		return fmt.Errorf("failed to compute migration set: %w", err)
 	}
 
 	// Step 4: Check for orphaned dependencies
-	orphans, err := checkOrphanedDependencies(ctx, db)
+	orphans, err := checkOrphanedDependencies(ctx, s)
 	if err != nil {
 		return fmt.Errorf("failed to check dependencies: %w", err)
 	}
@@ -218,33 +185,38 @@ func executeMigrateIssues(ctx context.Context, p migrateIssuesParams) error {
 			}
 		}
 
-		if err := executeMigration(ctx, db, migrationSet, p.to); err != nil {
+		if err := executeMigration(ctx, s, migrationSet, p.to); err != nil {
 			return fmt.Errorf("migration failed: %w", err)
 		}
 
 		if jsonOutput {
-			outputJSON(map[string]interface{}{
+			return outputJSON(map[string]interface{}{
 				"success": true,
 				"message": fmt.Sprintf("Migrated %d issues from %s to %s", len(migrationSet), p.from, p.to),
 				"plan":    plan,
 			})
-		} else {
-			fmt.Printf("\n✓ Successfully migrated %d issues from %s to %s\n", len(migrationSet), p.from, p.to)
 		}
+		fmt.Printf("\n✓ Successfully migrated %d issues from %s to %s\n", len(migrationSet), p.from, p.to)
 	}
 
 	return nil
 }
 
-func validateRepos(ctx context.Context, db *sql.DB, from, to string, strict bool) error {
-	// Check if source repo exists
-	var fromCount int
-	err := db.QueryRowContext(ctx, "SELECT COUNT(*) FROM issues WHERE source_repo = ?", from).Scan(&fromCount)
+func validateRepos(ctx context.Context, s storage.DoltStorage, from, to string, strict bool) error {
+	// migrate-issues is a round-trip path — opt out of BEADS_MAX_ROWS
+	// (designer §4.1) so a misconfigured env doesn't abort migration.
+	// Check if source repo has any issues
+	fromIssues, err := s.SearchIssues(ctx, "", types.IssueFilter{
+		SourceRepo:    &from,
+		Limit:         1,
+		MaxRows:       0,
+		MaxRowsSource: "",
+	})
 	if err != nil {
 		return fmt.Errorf("failed to check source repository: %w", err)
 	}
 
-	if fromCount == 0 {
+	if len(fromIssues) == 0 {
 		msg := fmt.Sprintf("source repository '%s' has no issues", from)
 		if strict {
 			return fmt.Errorf("%s", msg)
@@ -255,87 +227,67 @@ func validateRepos(ctx context.Context, db *sql.DB, from, to string, strict bool
 	}
 
 	// Check if destination repo exists (just a warning)
-	var toCount int
-	err = db.QueryRowContext(ctx, "SELECT COUNT(*) FROM issues WHERE source_repo = ?", to).Scan(&toCount)
+	toIssues, err := s.SearchIssues(ctx, "", types.IssueFilter{
+		SourceRepo:    &to,
+		Limit:         1,
+		MaxRows:       0,
+		MaxRowsSource: "",
+	})
 	if err != nil {
 		return fmt.Errorf("failed to check destination repository: %w", err)
 	}
 
-	if toCount == 0 && !jsonOutput {
+	if len(toIssues) == 0 && !jsonOutput {
 		fmt.Fprintf(os.Stderr, "Info: destination repository '%s' will be created\n", to)
 	}
 
 	return nil
 }
 
-func findCandidateIssues(ctx context.Context, db *sql.DB, p migrateIssuesParams) ([]string, error) {
-	// Build WHERE clause
-	var conditions []string
-	var args []interface{}
-
-	// Always filter by source_repo
-	conditions = append(conditions, "source_repo = ?")
-	args = append(args, p.from)
+func findCandidateIssues(ctx context.Context, s storage.DoltStorage, p migrateIssuesParams) ([]string, error) {
+	// Build filter from params. Opt out of BEADS_MAX_ROWS (designer §4.1) —
+	// migrate-issues is round-trip and must enumerate every candidate.
+	filter := types.IssueFilter{
+		SourceRepo:    &p.from,
+		MaxRows:       0,
+		MaxRowsSource: "",
+	}
 
 	// Filter by status
 	if p.status != "" && p.status != "all" {
-		conditions = append(conditions, "status = ?")
-		args = append(args, p.status)
+		status := types.Status(p.status)
+		filter.Status = &status
 	}
 
 	// Filter by priority
 	if p.priority >= 0 {
-		conditions = append(conditions, "priority = ?")
-		args = append(args, p.priority)
+		filter.Priority = &p.priority
 	}
 
 	// Filter by type
 	if p.issueType != "" && p.issueType != "all" {
-		conditions = append(conditions, "issue_type = ?")
-		args = append(args, p.issueType)
+		issueType := types.IssueType(p.issueType)
+		filter.IssueType = &issueType
 	}
 
-	// Filter by labels
+	// Filter by labels (AND semantics)
 	if len(p.labels) > 0 {
-		// Issues must have ALL specified labels (AND logic)
-		for _, label := range p.labels {
-			conditions = append(conditions, `id IN (SELECT issue_id FROM issue_labels WHERE label = ?)`)
-			args = append(args, label)
-		}
+		filter.Labels = p.labels
 	}
 
-	// Build query
-	query := "SELECT id FROM issues WHERE " + strings.Join(conditions, " AND ") // #nosec G202 -- query fragments are constant strings with parameter placeholders
+	// Filter by explicit IDs if provided (intersect with other filters)
+	if len(p.ids) > 0 {
+		filter.IDs = p.ids
+	}
 
-	rows, err := db.QueryContext(ctx, query, args...)
+	issues, err := s.SearchIssues(ctx, "", filter)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
-	var candidates []string
-	for rows.Next() {
-		var id string
-		if err := rows.Scan(&id); err != nil {
-			return nil, err
-		}
-		candidates = append(candidates, id)
-	}
-
-	// Filter by explicit ID list if provided
-	if len(p.ids) > 0 {
-		idSet := make(map[string]bool)
-		for _, id := range p.ids {
-			idSet[id] = true
-		}
-
-		var filtered []string
-		for _, id := range candidates {
-			if idSet[id] {
-				filtered = append(filtered, id)
-			}
-		}
-		candidates = filtered
+	candidates := make([]string, len(issues))
+	for i, issue := range issues {
+		candidates[i] = issue.ID
 	}
 
 	return candidates, nil
@@ -346,7 +298,7 @@ type dependencyStats struct {
 	outgoingEdges int
 }
 
-func expandMigrationSet(ctx context.Context, db *sql.DB, candidates []string, p migrateIssuesParams) ([]string, dependencyStats, error) {
+func expandMigrationSet(ctx context.Context, s storage.DoltStorage, candidates []string, p migrateIssuesParams) ([]string, dependencyStats, error) {
 	if p.include == "none" || p.include == "" {
 		return candidates, dependencyStats{}, nil
 	}
@@ -377,12 +329,12 @@ func expandMigrationSet(ctx context.Context, db *sql.DB, candidates []string, p 
 
 		switch p.include {
 		case "upstream":
-			deps, err = getUpstreamDependencies(ctx, db, current, p.from, p.withinFromOnly)
+			deps, err = getUpstreamDependencies(ctx, s, current, p.from, p.withinFromOnly)
 		case "downstream":
-			deps, err = getDownstreamDependencies(ctx, db, current, p.from, p.withinFromOnly)
+			deps, err = getDownstreamDependencies(ctx, s, current, p.from, p.withinFromOnly)
 		case "closure":
-			upDeps, err1 := getUpstreamDependencies(ctx, db, current, p.from, p.withinFromOnly)
-			downDeps, err2 := getDownstreamDependencies(ctx, db, current, p.from, p.withinFromOnly)
+			upDeps, err1 := getUpstreamDependencies(ctx, s, current, p.from, p.withinFromOnly)
+			downDeps, err2 := getDownstreamDependencies(ctx, s, current, p.from, p.withinFromOnly)
 			if err1 != nil {
 				err = err1
 			} else if err2 != nil {
@@ -411,7 +363,7 @@ func expandMigrationSet(ctx context.Context, db *sql.DB, candidates []string, p 
 	}
 
 	// Count cross-repo edges
-	stats, err := countCrossRepoEdges(ctx, db, result)
+	stats, err := countCrossRepoEdges(ctx, s, result)
 	if err != nil {
 		return nil, dependencyStats{}, err
 	}
@@ -419,108 +371,98 @@ func expandMigrationSet(ctx context.Context, db *sql.DB, candidates []string, p 
 	return result, stats, nil
 }
 
-func getUpstreamDependencies(ctx context.Context, db *sql.DB, issueID, fromRepo string, withinFromOnly bool) ([]string, error) {
-	query := `SELECT depends_on_id FROM dependencies WHERE issue_id = ?`
-	if withinFromOnly {
-		query = `SELECT d.depends_on_id FROM dependencies d 
-		         JOIN issues i ON d.depends_on_id = i.id 
-		         WHERE d.issue_id = ? AND i.source_repo = ?`
-	}
-
-	var rows *sql.Rows
-	var err error
-
-	if withinFromOnly {
-		rows, err = db.QueryContext(ctx, query, issueID, fromRepo)
-	} else {
-		rows, err = db.QueryContext(ctx, query, issueID)
-	}
-
+// getUpstreamDependencies returns IDs of issues that the given issue depends on.
+// If withinFromOnly is true, only returns dependencies whose issues are in fromRepo.
+func getUpstreamDependencies(ctx context.Context, s storage.DoltStorage, issueID, fromRepo string, withinFromOnly bool) ([]string, error) {
+	// GetDependencyRecords returns deps where issue_id = issueID
+	depRecords, err := s.GetDependencyRecords(ctx, issueID)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
 	var deps []string
-	for rows.Next() {
-		var dep string
-		if err := rows.Scan(&dep); err != nil {
-			return nil, err
+	for _, dep := range depRecords {
+		if withinFromOnly {
+			// Check if the depended-on issue is in the source repo
+			depIssue, err := s.GetIssue(ctx, dep.DependsOnID)
+			if err != nil {
+				return nil, err
+			}
+			if depIssue == nil || depIssue.SourceRepo != fromRepo {
+				continue
+			}
 		}
-		deps = append(deps, dep)
+		deps = append(deps, dep.DependsOnID)
 	}
 
 	return deps, nil
 }
 
-func getDownstreamDependencies(ctx context.Context, db *sql.DB, issueID, fromRepo string, withinFromOnly bool) ([]string, error) {
-	query := `SELECT issue_id FROM dependencies WHERE depends_on_id = ?`
-	if withinFromOnly {
-		query = `SELECT d.issue_id FROM dependencies d 
-		         JOIN issues i ON d.issue_id = i.id 
-		         WHERE d.depends_on_id = ? AND i.source_repo = ?`
-	}
-
-	var rows *sql.Rows
-	var err error
-
-	if withinFromOnly {
-		rows, err = db.QueryContext(ctx, query, issueID, fromRepo)
-	} else {
-		rows, err = db.QueryContext(ctx, query, issueID)
-	}
-
+// getDownstreamDependencies returns IDs of issues that depend on the given issue.
+// If withinFromOnly is true, only returns dependents whose issues are in fromRepo.
+func getDownstreamDependencies(ctx context.Context, s storage.DoltStorage, issueID, fromRepo string, withinFromOnly bool) ([]string, error) {
+	// GetDependents returns full Issue objects that depend on issueID
+	dependents, err := s.GetDependents(ctx, issueID)
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 
 	var deps []string
-	for rows.Next() {
-		var dep string
-		if err := rows.Scan(&dep); err != nil {
-			return nil, err
+	for _, issue := range dependents {
+		if withinFromOnly && issue.SourceRepo != fromRepo {
+			continue
 		}
-		deps = append(deps, dep)
+		deps = append(deps, issue.ID)
 	}
 
 	return deps, nil
 }
 
-func countCrossRepoEdges(ctx context.Context, db *sql.DB, migrationSet []string) (dependencyStats, error) {
+func countCrossRepoEdges(ctx context.Context, s storage.DoltStorage, migrationSet []string) (dependencyStats, error) {
 	if len(migrationSet) == 0 {
 		return dependencyStats{}, nil
 	}
 
-	// Build placeholders for IN clause
-	placeholders := make([]string, len(migrationSet))
-	args := make([]interface{}, len(migrationSet))
-	for i, id := range migrationSet {
-		placeholders[i] = "?"
-		args[i] = id
-	}
-	inClause := strings.Join(placeholders, ",")
-
-	// Count incoming edges (external issues depend on migrated issues)
-	incomingQuery := fmt.Sprintf(`
-		SELECT COUNT(*) FROM dependencies 
-		WHERE depends_on_id IN (%s) 
-		AND issue_id NOT IN (%s)`, inClause, inClause) // #nosec G201 -- inClause generated from sanitized placeholders
-
-	var incoming int
-	if err := db.QueryRowContext(ctx, incomingQuery, append(args, args...)...).Scan(&incoming); err != nil {
-		return dependencyStats{}, err
+	setMap := make(map[string]bool, len(migrationSet))
+	for _, id := range migrationSet {
+		setMap[id] = true
 	}
 
-	// Count outgoing edges (migrated issues depend on external issues)
-	outgoingQuery := fmt.Sprintf(`
-		SELECT COUNT(*) FROM dependencies 
-		WHERE issue_id IN (%s) 
-		AND depends_on_id NOT IN (%s)`, inClause, inClause) // #nosec G201 -- inClause generated from sanitized placeholders
+	// Get all dependency records for migration set issues (outgoing direction)
+	depsByIssue, err := s.GetDependencyRecordsForIssues(ctx, migrationSet)
+	if err != nil {
+		return dependencyStats{}, fmt.Errorf("failed to get dependency records: %w", err)
+	}
 
-	var outgoing int
-	if err := db.QueryRowContext(ctx, outgoingQuery, append(args, args...)...).Scan(&outgoing); err != nil {
-		return dependencyStats{}, err
+	// Count outgoing edges: migrated issues depend on external issues
+	outgoing := 0
+	for _, deps := range depsByIssue {
+		for _, dep := range deps {
+			if !setMap[dep.DependsOnID] {
+				outgoing++
+			}
+		}
+	}
+
+	// For incoming edges, we need to find all deps whose resolved target is in
+	// the migration set but whose issue_id is not. Use GetAllDependencyRecords;
+	// the returned records expose the target via dep.DependsOnID (resolved from
+	// the typed columns).
+	allDeps, err := s.GetAllDependencyRecords(ctx)
+	if err != nil {
+		return dependencyStats{}, fmt.Errorf("failed to get all dependency records: %w", err)
+	}
+
+	incoming := 0
+	for issueID, deps := range allDeps {
+		if setMap[issueID] {
+			continue // Skip edges from within the migration set
+		}
+		for _, dep := range deps {
+			if setMap[dep.DependsOnID] {
+				incoming++
+			}
+		}
 	}
 
 	return dependencyStats{
@@ -529,33 +471,48 @@ func countCrossRepoEdges(ctx context.Context, db *sql.DB, migrationSet []string)
 	}, nil
 }
 
-func checkOrphanedDependencies(ctx context.Context, db *sql.DB) ([]string, error) {
-	// Check for dependencies referencing non-existent issues
-	query := `
-		SELECT DISTINCT d.depends_on_id 
-		FROM dependencies d 
-		LEFT JOIN issues i ON d.depends_on_id = i.id 
-		WHERE i.id IS NULL
-		UNION
-		SELECT DISTINCT d.issue_id 
-		FROM dependencies d 
-		LEFT JOIN issues i ON d.issue_id = i.id 
-		WHERE i.id IS NULL
-	`
-
-	rows, err := db.QueryContext(ctx, query)
+func checkOrphanedDependencies(ctx context.Context, s storage.DoltStorage) ([]string, error) {
+	// Get all dependency records to check for orphans
+	allDeps, err := s.GetAllDependencyRecords(ctx)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get dependency records: %w", err)
 	}
-	defer rows.Close()
 
-	var orphans []string
-	for rows.Next() {
-		var orphan string
-		if err := rows.Scan(&orphan); err != nil {
-			return nil, err
+	// Collect all unique IDs referenced in dependencies
+	referencedIDs := make(map[string]bool)
+	for issueID, deps := range allDeps {
+		referencedIDs[issueID] = true
+		for _, dep := range deps {
+			referencedIDs[dep.DependsOnID] = true
 		}
-		orphans = append(orphans, orphan)
+	}
+
+	// Batch-check which IDs exist
+	idList := make([]string, 0, len(referencedIDs))
+	for id := range referencedIDs {
+		idList = append(idList, id)
+	}
+
+	existingIssues, err := s.SearchIssues(ctx, "", types.IssueFilter{
+		IDs:           idList,
+		MaxRows:       0,
+		MaxRowsSource: "",
+	})
+	if err != nil {
+		return nil, fmt.Errorf("failed to check issue existence: %w", err)
+	}
+
+	existingSet := make(map[string]bool, len(existingIssues))
+	for _, issue := range existingIssues {
+		existingSet[issue.ID] = true
+	}
+
+	// Find orphans (referenced but non-existent)
+	var orphans []string
+	for id := range referencedIDs {
+		if !existingSet[id] {
+			orphans = append(orphans, id)
+		}
 	}
 
 	return orphans, nil
@@ -582,15 +539,12 @@ func buildMigrationPlan(candidates, migrationSet []string, stats dependencyStats
 
 func displayMigrationPlan(plan migrationPlan, dryRun bool) error {
 	if jsonOutput {
-		output := map[string]interface{}{
+		return outputJSON(map[string]interface{}{
 			"plan":    plan,
 			"dry_run": dryRun,
-		}
-		outputJSON(output)
-		return nil
+		})
 	}
 
-	// Human-readable output
 	fmt.Println("\n=== Migration Plan ===")
 	fmt.Printf("From: %s\n", plan.From)
 	fmt.Printf("To:   %s\n", plan.To)
@@ -641,33 +595,17 @@ func confirmMigration(plan migrationPlan) bool {
 	return strings.ToLower(strings.TrimSpace(response)) == "y"
 }
 
-func executeMigration(ctx context.Context, db *sql.DB, migrationSet []string, to string) error {
-	tx, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("failed to begin transaction: %w", err)
-	}
-	defer tx.Rollback()
-
-	now := time.Now()
-
-	// Update source_repo for all issues in migration set
-	for _, id := range migrationSet {
-		_, err := tx.ExecContext(ctx,
-			"UPDATE issues SET source_repo = ?, updated_at = ? WHERE id = ?",
-			to, now, id)
-		if err != nil {
-			return fmt.Errorf("failed to update issue %s: %w", id, err)
+func executeMigration(ctx context.Context, s storage.DoltStorage, migrationSet []string, to string) error {
+	return transact(ctx, s, fmt.Sprintf("bd: migrate %d issues to %s", len(migrationSet), to), func(tx storage.Transaction) error {
+		for _, id := range migrationSet {
+			if err := tx.UpdateIssue(ctx, id, map[string]interface{}{
+				"source_repo": to,
+			}, actor); err != nil {
+				return fmt.Errorf("failed to update issue %s: %w", id, err)
+			}
 		}
-
-		// Mark as dirty for export
-		_, err = tx.ExecContext(ctx,
-			"INSERT OR IGNORE INTO dirty_issues(issue_id) VALUES (?)", id)
-		if err != nil {
-			return fmt.Errorf("failed to mark issue %s as dirty: %w", id, err)
-		}
-	}
-
-	return tx.Commit()
+		return nil
+	})
 }
 
 func loadIDsFromFile(path string) ([]string, error) {
@@ -696,7 +634,7 @@ func init() {
 	migrateIssuesCmd.Flags().String("to", "", "Destination repository (required)")
 	migrateIssuesCmd.Flags().String("status", "", "Filter by status (open/closed/all)")
 	migrateIssuesCmd.Flags().Int("priority", -1, "Filter by priority (0-4)")
-	migrateIssuesCmd.Flags().String("type", "", "Filter by issue type (bug/feature/task/epic/chore)")
+	migrateIssuesCmd.Flags().String("type", "", "Filter by issue type (bug/feature/task/epic/chore/decision)")
 	migrateIssuesCmd.Flags().StringSlice("label", nil, "Filter by labels (can specify multiple)")
 	migrateIssuesCmd.Flags().StringSlice("id", nil, "Specific issue IDs to migrate (can specify multiple)")
 	migrateIssuesCmd.Flags().String("ids-file", "", "File containing issue IDs (one per line)")

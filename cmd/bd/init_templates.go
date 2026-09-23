@@ -7,7 +7,8 @@ import (
 )
 
 // createConfigYaml creates the config.yaml template in the specified directory
-func createConfigYaml(beadsDir string, noDbMode bool) error {
+// In --no-db mode, the prefix is saved here since there's no database to store it.
+func createConfigYaml(beadsDir string, noDbMode bool, prefix string) error {
 	configYamlPath := filepath.Join(beadsDir, "config.yaml")
 
 	// Skip if already exists
@@ -15,12 +16,26 @@ func createConfigYaml(beadsDir string, noDbMode bool) error {
 		return nil
 	}
 
-	noDbLine := "# no-db: false"
-	if noDbMode {
-		noDbLine = "no-db: true  # JSONL-only mode, no SQLite database"
+	body := renderInitConfigYAML(prefix, noDbMode)
+	if err := os.WriteFile(configYamlPath, body, 0600); err != nil {
+		return fmt.Errorf("failed to write config.yaml: %w", err)
 	}
 
-	configYamlTemplate := fmt.Sprintf(`# Beads Configuration File
+	return nil
+}
+
+func renderInitConfigYAML(prefix string, noDbMode bool) []byte {
+	noDbLine := "# no-db: false"
+	if noDbMode {
+		noDbLine = "no-db: true  # JSONL-only mode, no database"
+	}
+
+	prefixLine := "# issue-prefix: \"\""
+	if noDbMode && prefix != "" {
+		prefixLine = fmt.Sprintf("issue-prefix: %q", prefix)
+	}
+
+	body := fmt.Sprintf(`# Beads Configuration File
 # This file configures default behavior for all bd commands in this repository
 # All settings can also be set via environment variables (BD_* prefix)
 # or overridden with command-line flags
@@ -28,79 +43,75 @@ func createConfigYaml(beadsDir string, noDbMode bool) error {
 # Issue prefix for this repository (used by bd init)
 # If not set, bd init will auto-detect from directory name
 # Example: issue-prefix: "myproject" creates issues like "myproject-1", "myproject-2", etc.
-# issue-prefix: ""
-
-# Use no-db mode: load from JSONL, no SQLite, write back after each command
-# When true, bd will use .beads/issues.jsonl as the source of truth
-# instead of SQLite database
 %s
 
-# Disable daemon for RPC communication (forces direct database access)
-# no-daemon: false
-
-# Disable auto-flush of database to JSONL after mutations
-# no-auto-flush: false
-
-# Disable auto-import from JSONL when it's newer than database
-# no-auto-import: false
+# Use no-db mode: JSONL-only, no Dolt database
+# When true, .beads/issues.jsonl is the only local store
+%s
 
 # Enable JSON output by default
 # json: false
 
-# Default actor for audit trails (overridden by BD_ACTOR or --actor)
+# Feedback title formatting for mutating commands (create/update/close/dep/edit)
+# 0 = hide titles, N > 0 = truncate to N characters
+# output:
+#   title-length: 255
+
+# Default actor for audit trails (overridden by BEADS_ACTOR or --actor)
 # actor: ""
 
-# Path to database (overridden by BEADS_DB or --db)
-# db: ""
+# Optional JSONL sidecar for explicit agent/tool interaction audit records.
+# Issue history is always recorded in the database and is visible with
+# bd history <id> --events; this only controls .beads/interactions.jsonl.
+# audit:
+#   enabled: false
 
-# Auto-start daemon if not running (can also use BEADS_AUTO_START_DAEMON)
-# auto-start-daemon: true
-
-# Debounce interval for auto-flush (can also use BEADS_FLUSH_DEBOUNCE)
-# flush-debounce: "5s"
-
-# Git branch for beads commits (bd sync will commit to this branch)
-# IMPORTANT: Set this for team projects so all clones use the same sync branch.
-# This setting persists across clones (unlike database config which is gitignored).
-# Can also use BEADS_SYNC_BRANCH env var for local override.
-# If not set, bd sync will require you to run 'bd config set sync.branch <branch>'.
-# sync-branch: "beads-sync"
+# Export events (audit trail) to .beads/events.jsonl on each flush/sync
+# When enabled, new events are appended incrementally using a high-water mark.
+# Use 'bd export --events' to trigger manually regardless of this setting.
+# events-export: false
 
 # Multi-repo configuration (experimental - bd-307)
-# Allows hydrating from multiple repositories and routing writes to the correct JSONL
+# Allows hydrating from multiple repositories and routing writes to the correct database
 # repos:
 #   primary: "."  # Primary repo (where this database lives)
 #   additional:   # Additional repos to hydrate from (read-only)
 #     - ~/beads-planning  # Personal planning repo
 #     - ~/work-planning   # Work planning repo
 
+# Dolt-native backup (periodic backup for off-machine recovery)
+# This is full database backup only. Cross-machine sync uses Dolt remotes.
+# backup:
+#   enabled: false     # Disable auto-backup entirely
+#   interval: 15m      # Minimum time between auto-backups
+#   git-push: false    # Disable git push (backup locally only)
+#   git-repo: ""       # Separate git repo for backups (default: project repo)
+
+# Optional JSONL auto-export for viewers, interchange, and issue-level migration.
+# Disabled by default; enable only when an integration needs fresh .beads/issues.jsonl.
+# Use relative paths under .beads/ for JSONL import/export filenames.
+# export:
+#   auto: false
+#   path: issues.jsonl
+#   interval: 60s
+#   git-add: false
+# import:
+#   path: issues.jsonl
+
 # Integration settings (access with 'bd config get/set')
-# These are stored in the database, not in this file:
-# - jira.url
-# - jira.project
-# - linear.url
-# - linear.api-key
-# - github.org
-# - github.repo
-`, noDbLine)
-
-	if err := os.WriteFile(configYamlPath, []byte(configYamlTemplate), 0600); err != nil {
-		return fmt.Errorf("failed to write config.yaml: %w", err)
-	}
-
-	return nil
+# Non-secret keys (stored in the database):
+# - jira.url, jira.project
+# - linear.team_id
+# - github.org, github.repo
+#
+# Secret keys (stored in this file but prefer env vars to avoid git exposure):
+# - linear.api_key  → use LINEAR_API_KEY env var instead
+# - github.token    → use GITHUB_TOKEN env var instead
+`, prefixLine, noDbLine)
+	return []byte(body)
 }
 
-// createReadme creates the README.md file in the .beads directory
-func createReadme(beadsDir string) error {
-	readmePath := filepath.Join(beadsDir, "README.md")
-
-	// Skip if already exists
-	if _, err := os.Stat(readmePath); err == nil {
-		return nil
-	}
-
-	readmeTemplate := `# Beads - AI-Native Issue Tracking
+const BeadsReadmeTemplate = `# Beads - AI-Native Issue Tracking
 
 Welcome to Beads! This repository uses **Beads** for issue tracking - a modern, AI-native tool designed to live directly in your codebase alongside your code.
 
@@ -125,20 +136,20 @@ bd list
 bd show <issue-id>
 
 # Update issue status
-bd update <issue-id> --status in_progress
+bd update <issue-id> --claim
 bd update <issue-id> --status done
 
-# Sync with git remote
-bd sync
+# Sync with Dolt remote
+bd dolt push
 ` + "```" + `
 
 ### Working with Issues
 
 Issues in Beads are:
-- **Git-native**: Stored in ` + "`.beads/issues.jsonl`" + ` and synced like code
+- **Git-native**: Stored in Dolt database with version control and branching
 - **AI-friendly**: CLI-first design works perfectly with AI coding agents
 - **Branch-aware**: Issues can follow your branch workflow
-- **Always in sync**: Auto-syncs with your commits
+- **Sync-ready**: Uses Dolt remotes for backup and team sharing
 
 ## Why Beads?
 
@@ -153,9 +164,9 @@ Issues in Beads are:
 - Fast, lightweight, and stays out of your way
 
 🔧 **Git Integration**
-- Automatic sync with git commits
+- Dolt-native sync via bd dolt push / bd dolt pull
 - Branch-aware issue tracking
-- Intelligent JSONL merge resolution
+- Dolt-native three-way merge resolution
 
 ## Get Started with Beads
 
@@ -183,9 +194,17 @@ bd create "Try out Beads"
 *Beads: Issue tracking that moves at the speed of thought* ⚡
 `
 
+func createReadme(beadsDir string) error {
+	readmePath := filepath.Join(beadsDir, "README.md")
+
+	// Skip if already exists
+	if _, err := os.Stat(readmePath); err == nil {
+		return nil
+	}
+
 	// Write README.md (0644 is standard for markdown files)
 	// #nosec G306 - README needs to be readable
-	if err := os.WriteFile(readmePath, []byte(readmeTemplate), 0644); err != nil {
+	if err := os.WriteFile(readmePath, []byte(BeadsReadmeTemplate), 0644); err != nil {
 		return fmt.Errorf("failed to write README.md: %w", err)
 	}
 

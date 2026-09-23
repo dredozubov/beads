@@ -1,17 +1,17 @@
 package main
 
 import (
-	"bufio"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/beads"
 	"github.com/steveyegge/beads/internal/git"
+	"github.com/steveyegge/beads/internal/metrics"
 	"github.com/steveyegge/beads/internal/ui"
+	"github.com/steveyegge/beads/internal/utils"
 )
 
 var resetCmd = &cobra.Command{
@@ -22,7 +22,6 @@ var resetCmd = &cobra.Command{
 This command removes:
   - The .beads directory (database, JSONL, config)
   - Git hooks installed by bd
-  - Merge driver configuration
   - Sync branch worktrees
 
 By default, shows what would be deleted (dry-run mode).
@@ -31,7 +30,9 @@ Use --force to actually perform the reset.
 Examples:
   bd reset              # Show what would be deleted
   bd reset --force      # Actually delete everything`,
-	Run: runReset,
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE:          runReset,
 }
 
 func init() {
@@ -39,50 +40,66 @@ func init() {
 	// Note: resetCmd is added to adminCmd in admin.go
 }
 
-func runReset(cmd *cobra.Command, args []string) {
+func runReset(cmd *cobra.Command, args []string) error {
+	if usesProxiedServer() {
+		return HandleErrorRespectJSON("admin reset is not supported in proxied-server mode")
+	}
+	evt := metrics.NewCommandEvent("admin-reset")
+	defer func() {
+		if c := metrics.Global(); c != nil {
+			c.CloseEventAndAdd(evt)
+		}
+	}()
+
+	if err := requireServerMode("reset"); err != nil {
+		return HandleError("%v", err)
+	}
 	CheckReadonly("reset")
 
 	force, _ := cmd.Flags().GetBool("force")
 
-	// Check if we're in a git repo
-	gitDir, err := git.GetGitDir()
+	gitCommonDir, err := git.GetGitCommonDir()
 	if err != nil {
 		if jsonOutput {
-			outputJSON(map[string]interface{}{
+			if jerr := outputJSON(map[string]interface{}{
 				"error": "not a git repository",
-			})
-		} else {
-			fmt.Fprintf(os.Stderr, "Error: not a git repository\n")
+			}); jerr != nil {
+				return jerr
+			}
+			return SilentExit()
 		}
-		os.Exit(1)
+		return HandleError("not a git repository")
 	}
 
-	// Check if .beads directory exists
-	beadsDir := ".beads"
-	if _, err := os.Stat(beadsDir); os.IsNotExist(err) {
+	beadsDir := beads.FindBeadsDir()
+	if beadsDir == "" {
 		if jsonOutput {
-			outputJSON(map[string]interface{}{
+			return outputJSON(map[string]interface{}{
 				"message": "beads not initialized",
 				"reset":   false,
 			})
-		} else {
-			fmt.Println("Beads is not initialized in this repository.")
-			fmt.Println("Nothing to reset.")
 		}
-		return
+		fmt.Println("Beads is not initialized in this repository.")
+		fmt.Println("Nothing to reset.")
+		return nil
 	}
 
-	// Collect what would be deleted
-	items := collectResetItems(gitDir, beadsDir)
+	home, _ := os.UserHomeDir()
+	repoRoot := git.GetRepoRoot()
+	if repoRoot == "" {
+		repoRoot = filepath.Dir(gitCommonDir)
+	}
+	if err := refuseGlobalBeadsDir(beadsDir, repoRoot, home); err != nil {
+		return HandleErrorRespectJSON("%v", err)
+	}
+
+	items, preserved := collectResetItems(gitCommonDir, beadsDir)
 
 	if !force {
-		// Dry-run mode: show what would be deleted
-		showResetPreview(items)
-		return
+		return showResetPreview(items, preserved)
 	}
 
-	// Actually perform the reset
-	performReset(items, gitDir, beadsDir)
+	return performReset(items, preserved, gitCommonDir, beadsDir)
 }
 
 type resetItem struct {
@@ -91,58 +108,40 @@ type resetItem struct {
 	Description string `json:"description"`
 }
 
-func collectResetItems(gitDir, beadsDir string) []resetItem {
-	var items []resetItem
-
-	// Check for running daemon
-	pidFile := filepath.Join(beadsDir, "daemon.pid")
-	if _, err := os.Stat(pidFile); err == nil {
-		if isRunning, pid := isDaemonRunning(pidFile); isRunning {
-			items = append(items, resetItem{
-				Type:        "daemon",
-				Path:        pidFile,
-				Description: fmt.Sprintf("Stop running daemon (PID %d)", pid),
-			})
-		}
-	}
-
-	// Check for git hooks
+// collectResetItems returns what reset will remove, and separately what it
+// found but will leave alone. The second list is not cosmetic: a hook bd only
+// injected a section into is the user's file, and saying nothing about it is
+// how a reset looks like it did less than it did — or, before ownership was
+// checked properly, more.
+func collectResetItems(gitCommonDir, beadsDir string) (items, preserved []resetItem) {
+	// Check for git hooks (hooks are in common git dir, shared across worktrees)
 	hookNames := []string{"pre-commit", "post-merge", "pre-push", "post-checkout"}
-	hooksDir := filepath.Join(gitDir, "hooks")
+	hooksDir := filepath.Join(gitCommonDir, "hooks")
 	for _, hookName := range hookNames {
 		hookPath := filepath.Join(hooksDir, hookName)
-		if _, err := os.Stat(hookPath); err == nil {
-			// Check if it's a beads hook by looking for version marker
-			if isBdHook(hookPath) {
-				items = append(items, resetItem{
-					Type:        "hook",
-					Path:        hookPath,
-					Description: fmt.Sprintf("Remove git hook: %s", hookName),
-				})
-			}
+		if _, err := os.Stat(hookPath); err != nil {
+			continue
+		}
+		switch classifyResetHook(hookPath) {
+		case hookBdOwned:
+			items = append(items, resetItem{
+				Type:        "hook",
+				Path:        hookPath,
+				Description: fmt.Sprintf("Remove git hook: %s", hookName),
+			})
+		case hookUserOwnedWithBdSection:
+			preserved = append(preserved, resetItem{
+				Type:        "hook",
+				Path:        hookPath,
+				Description: fmt.Sprintf("Keep git hook %s: it is your file with a beads section in it (remove the section with 'bd hooks uninstall')", hookName),
+			})
+		case hookNotOurs:
+			// No bd marker at all. Not ours to mention, let alone remove.
 		}
 	}
 
-	// Check for merge driver config
-	if hasMergeDriverConfig() {
-		items = append(items, resetItem{
-			Type:        "config",
-			Path:        "merge.beads.*",
-			Description: "Remove merge driver configuration",
-		})
-	}
-
-	// Check for .gitattributes entry
-	if hasGitattributesEntry() {
-		items = append(items, resetItem{
-			Type:        "gitattributes",
-			Path:        ".gitattributes",
-			Description: "Remove beads entry from .gitattributes",
-		})
-	}
-
-	// Check for sync branch worktrees
-	worktreesDir := filepath.Join(gitDir, "beads-worktrees")
+	// Check for sync branch worktrees (in common git dir, shared across worktrees)
+	worktreesDir := filepath.Join(gitCommonDir, "beads-worktrees")
 	if info, err := os.Stat(worktreesDir); err == nil && info.IsDir() {
 		items = append(items, resetItem{
 			Type:        "worktrees",
@@ -158,55 +157,158 @@ func collectResetItems(gitDir, beadsDir string) []resetItem {
 		Description: "Remove .beads directory (database, JSONL, config)",
 	})
 
-	return items
+	return items, preserved
 }
 
-func isBdHook(hookPath string) bool {
+// refuseGlobalBeadsDir stops a repo-scoped reset from deleting the user-global
+// ~/.beads directory.
+//
+// bd admin reset removes whatever FindBeadsDir returns, and FindBeadsDir walks
+// up from the working directory with no upper boundary — repoRoot is used to
+// classify a hit, never to stop the climb. So in any git repository under the
+// home directory that has no .beads of its own, the walk continues past the repo
+// and lands on ~/.beads. hasBeadsProjectFiles is documented as the thing that
+// prevents this, but it is a content guard, not a boundary guard: it holds only
+// while the global directory is not itself a real project. Once a user has one,
+// it stops holding, and that is when it matters.
+//
+// That is the shape of the 2026-07-21 incident, where a reset aimed at a temp
+// repository removed the global .beads along with hooks from an unrelated
+// checkout.
+//
+// The narrow rule here decides nothing about what -C should mean or how the two
+// target resolutions in runReset ought to be reconciled — both are open
+// questions. It only says that a reset run inside some project is never a
+// request to delete the user's global directory. When the repository root IS the
+// home directory, ~/.beads is that repository's own beads dir and the reset is
+// exactly what was asked for.
+func refuseGlobalBeadsDir(beadsDir, repoRoot, home string) error {
+	if home == "" {
+		// Without a home directory there is no global location to protect.
+		return nil
+	}
+	if !utils.PathsEqual(beadsDir, filepath.Join(home, ".beads")) {
+		return nil
+	}
+	if utils.PathsEqual(repoRoot, home) {
+		// The home directory is the repository. ~/.beads is its beads dir.
+		return nil
+	}
+
+	return fmt.Errorf("refusing to reset: this repository has no .beads of its own, so beads resolved to the "+
+		"user-global directory\n  repository:  %s\n  would remove: %s\n"+
+		"Removing global beads state is not part of resetting a repository. "+
+		"Delete that directory yourself if you mean to.", repoRoot, beadsDir)
+}
+
+// hookOwnership says how much of a git hook file bd is responsible for, which
+// is the only question that licenses `bd admin reset` to delete it.
+type hookOwnership int
+
+const (
+	// hookNotOurs: no bd provenance marker. bd did not write this file and
+	// must not remove it.
+	hookNotOurs hookOwnership = iota
+	// hookBdOwned: bd wrote the whole file. Removing it restores exactly the
+	// state before bd touched the repo, so reset removes it.
+	hookBdOwned
+	// hookUserOwnedWithBdSection: the user's own hook, with bd's block injected
+	// between section markers (the v0.49+ model). The file is theirs; deleting
+	// it would take their content with it, and reset has no backup to restore
+	// because it never displaced anything here.
+	hookUserOwnedWithBdSection
+)
+
+// classifyResetHook decides ownership from the file's content, using the same
+// markers bd writes when it installs and the same rules preservePreexistingHooks
+// applies (GH#3536), rather than a heuristic of its own.
+//
+// It used to ask whether any of the first ten lines contained the substring
+// "beads", anywhere, in any context. That matched a comment, a path, or a call
+// to any other tool that happens to spell the word — including this project's
+// own hand-composed, git-tracked .githooks/pre-commit, which chains
+// `bd hooks run` alongside guards bd knows nothing about. Such a hook was
+// deleted as if bd had installed it, and performReset's restore path does not
+// help: it renames <hook>.backup back into place, and a backup exists only for
+// hooks bd itself displaced. A hand-written hook went with no way back.
+func classifyResetHook(hookPath string) hookOwnership {
 	// #nosec G304 -- hook path is constructed from git dir, not user input
-	file, err := os.Open(hookPath)
+	data, err := os.ReadFile(hookPath)
 	if err != nil {
-		return false
+		return hookNotOurs
 	}
-	defer file.Close()
+	content := string(data)
 
-	scanner := bufio.NewScanner(file)
-	lineCount := 0
-	for scanner.Scan() && lineCount < 10 {
-		line := scanner.Text()
-		if strings.Contains(line, "bd-hooks-version:") || strings.Contains(line, "beads") {
-			return true
+	// Order matters, and matches shouldPreserveHookContent: a sectioned file is
+	// user-owned unless stripping bd's block leaves nothing but a shebang, in
+	// which case bd effectively wrote all of it. What counts as "nothing" is
+	// where the two part company — see isOnlyShebangOrBlank.
+	if strings.Contains(content, hookSectionBeginPrefix) {
+		if stripped, _ := removeHookSection(content); isOnlyShebangOrBlank(stripped) {
+			return hookBdOwned
 		}
-		lineCount++
+		return hookUserOwnedWithBdSection
 	}
-	return false
+	if strings.Contains(content, inlineHookMarker) ||
+		strings.Contains(content, hookVersionPrefix) ||
+		strings.Contains(content, shimVersionPrefix) {
+		return hookBdOwned
+	}
+	return hookNotOurs
 }
 
-func hasMergeDriverConfig() bool {
-	cmd := exec.Command("git", "config", "--get", "merge.beads.driver")
-	if err := cmd.Run(); err == nil {
-		return true
-	}
-	return false
-}
-
-func hasGitattributesEntry() bool {
-	// #nosec G304 -- fixed path
-	content, err := os.ReadFile(".gitattributes")
-	if err != nil {
+// isOnlyShebangOrBlank reports whether what is left of a hook after bd's
+// section is stripped is nothing but an optional shebang and blank lines.
+// Comments count as content.
+//
+// This is deliberately stricter than isOnlyShebangOrEmpty (hooks.go), which
+// answers the same shape of question for shouldPreserveHookContent and treats
+// comments as nothing (GH#3536). The two callers are not symmetric and must not
+// share a predicate:
+//
+//   - Preservation copies a hook forward into .beads/hooks. Declining to copy a
+//     comment-only file loses a comment; the original is still on disk.
+//   - Reset deletes. Getting it wrong destroys the user's file, and
+//     performReset cannot undo it — its restore path renames <hook>.backup back
+//     into place, and a backup exists only for hooks bd itself displaced, which
+//     is never the case for a hook bd only injected a section into.
+//
+// So a hook of the user's whose own content is a shebang and comments — a
+// header they wrote, a note to whoever edits it next, hook logic they commented
+// out for now — is theirs. Reset leaves it and says so. Sharing the looser
+// predicate meant a comment was once again enough to make a hook bd's to
+// delete, which is the failure classifyResetHook exists to close.
+func isOnlyShebangOrBlank(content string) bool {
+	seenContent := false
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		// Only the leading line can be a shebang; `#!` below it is a comment,
+		// and comments are content here. Anchoring on the first non-blank line
+		// rather than index 0 keeps this from depending on whether stripping
+		// bd's section left a blank line above the shebang.
+		if !seenContent && strings.HasPrefix(trimmed, "#!") {
+			seenContent = true
+			continue
+		}
 		return false
 	}
-	return strings.Contains(string(content), "merge=beads")
+	return true
 }
 
-func showResetPreview(items []resetItem) {
+func showResetPreview(items, preserved []resetItem) error {
 	if jsonOutput {
-		outputJSON(map[string]interface{}{
+		result := map[string]interface{}{
 			"dry_run": true,
 			"items":   items,
-		})
-		return
+		}
+		if len(preserved) > 0 {
+			result["preserved"] = preserved
+		}
+		return outputJSON(result)
 	}
-
 
 	fmt.Println(ui.RenderWarn("Reset preview (dry-run mode)"))
 	fmt.Println()
@@ -220,25 +322,37 @@ func showResetPreview(items []resetItem) {
 		}
 	}
 
+	printPreservedHooks(preserved)
+
 	fmt.Println()
 	fmt.Println(ui.RenderFail("⚠ This operation cannot be undone!"))
 	fmt.Println()
 	fmt.Printf("To proceed, run: %s\n", ui.RenderWarn("bd reset --force"))
+	return nil
 }
 
-func performReset(items []resetItem, _, beadsDir string) {
+// printPreservedHooks reports the hooks reset deliberately did not touch.
+// Silence here is the failure mode worth avoiding: the user asked for a reset
+// and needs to know a beads section is still live in a hook of theirs.
+func printPreservedHooks(preserved []resetItem) {
+	if len(preserved) == 0 {
+		return
+	}
+	fmt.Println()
+	fmt.Println("Left in place (not installed by bd):")
+	fmt.Println()
+	for _, item := range preserved {
+		fmt.Printf("  %s %s\n", ui.RenderPass("•"), item.Description)
+		fmt.Printf("    %s\n", item.Path)
+	}
+}
+
+func performReset(items, preserved []resetItem, _, _ string) error {
 
 	var errors []string
 
 	for _, item := range items {
 		switch item.Type {
-		case "daemon":
-			pidFile := filepath.Join(beadsDir, "daemon.pid")
-			stopDaemonQuiet(pidFile)
-			if !jsonOutput {
-				fmt.Printf("%s Stopped daemon\n", ui.RenderPass("✓"))
-			}
-
 		case "hook":
 			if err := os.Remove(item.Path); err != nil {
 				errors = append(errors, fmt.Sprintf("failed to remove hook %s: %v", item.Path, err))
@@ -251,21 +365,6 @@ func performReset(items []resetItem, _, beadsDir string) {
 				if err := os.Rename(backupPath, item.Path); err == nil && !jsonOutput {
 					fmt.Printf("  Restored backup hook\n")
 				}
-			}
-
-		case "config":
-			// Remove merge driver config (ignore errors - may not exist)
-			_ = exec.Command("git", "config", "--unset", "merge.beads.driver").Run()
-			_ = exec.Command("git", "config", "--unset", "merge.beads.name").Run()
-			if !jsonOutput {
-				fmt.Printf("%s Removed merge driver config\n", ui.RenderPass("✓"))
-			}
-
-		case "gitattributes":
-			if err := removeGitattributesEntry(); err != nil {
-				errors = append(errors, fmt.Sprintf("failed to update .gitattributes: %v", err))
-			} else if !jsonOutput {
-				fmt.Printf("%s Updated .gitattributes\n", ui.RenderPass("✓"))
 			}
 
 		case "worktrees":
@@ -292,9 +391,13 @@ func performReset(items []resetItem, _, beadsDir string) {
 		if len(errors) > 0 {
 			result["errors"] = errors
 		}
-		outputJSON(result)
-		return
+		if len(preserved) > 0 {
+			result["preserved"] = preserved
+		}
+		return outputJSON(result)
 	}
+
+	printPreservedHooks(preserved)
 
 	fmt.Println()
 	if len(errors) > 0 {
@@ -307,60 +410,5 @@ func performReset(items []resetItem, _, beadsDir string) {
 		fmt.Println()
 		fmt.Println("To reinitialize beads, run: bd init")
 	}
-}
-
-// stopDaemonQuiet stops the daemon without printing status messages
-func stopDaemonQuiet(pidFile string) {
-	isRunning, pid := isDaemonRunning(pidFile)
-	if !isRunning {
-		return
-	}
-
-	process, err := os.FindProcess(pid)
-	if err != nil {
-		return
-	}
-
-	_ = sendStopSignal(process) // Best-effort graceful stop
-
-	// Wait for daemon to stop gracefully
-	for i := 0; i < daemonShutdownAttempts; i++ {
-		time.Sleep(daemonShutdownPollInterval)
-		if isRunning, _ := isDaemonRunning(pidFile); !isRunning {
-			return
-		}
-	}
-
-	// Force kill if still running
-	_ = process.Kill() // Best-effort force kill, process may have already exited
-}
-
-func removeGitattributesEntry() error {
-	// #nosec G304 -- fixed path
-	content, err := os.ReadFile(".gitattributes")
-	if err != nil {
-		return err
-	}
-
-	lines := strings.Split(string(content), "\n")
-	var newLines []string
-	for _, line := range lines {
-		if !strings.Contains(line, "merge=beads") {
-			newLines = append(newLines, line)
-		}
-	}
-
-	newContent := strings.Join(newLines, "\n")
-	// Remove trailing empty lines
-	newContent = strings.TrimRight(newContent, "\n")
-
-	// If file is now empty or only whitespace, remove it
-	if strings.TrimSpace(newContent) == "" {
-		return os.Remove(".gitattributes")
-	}
-
-	// Add single trailing newline
-	newContent += "\n"
-	//nolint:gosec // G306: .gitattributes must be world-readable (0644)
-	return os.WriteFile(".gitattributes", []byte(newContent), 0644)
+	return nil
 }

@@ -1,6 +1,12 @@
 package types
 
 import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"regexp"
+	"strings"
 	"testing"
 	"time"
 )
@@ -171,6 +177,44 @@ func TestIssueValidation(t *testing.T) {
 			},
 			wantErr: false,
 		},
+		{
+			name: "ephemeral and no_history both set",
+			issue: Issue{
+				ID:        "test-1",
+				Title:     "Test",
+				Status:    StatusOpen,
+				Priority:  2,
+				IssueType: TypeFeature,
+				Ephemeral: true,
+				NoHistory: true,
+			},
+			wantErr: true,
+			errMsg:  "ephemeral and no_history are mutually exclusive",
+		},
+		{
+			name: "ephemeral without no_history",
+			issue: Issue{
+				ID:        "test-1",
+				Title:     "Test",
+				Status:    StatusOpen,
+				Priority:  2,
+				IssueType: TypeFeature,
+				Ephemeral: true,
+			},
+			wantErr: false,
+		},
+		{
+			name: "no_history without ephemeral",
+			issue: Issue{
+				ID:        "test-1",
+				Title:     "Test",
+				Status:    StatusOpen,
+				Priority:  2,
+				IssueType: TypeFeature,
+				NoHistory: true,
+			},
+			wantErr: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -202,7 +246,6 @@ func TestStatusIsValid(t *testing.T) {
 		{StatusInProgress, true},
 		{StatusBlocked, true},
 		{StatusClosed, true},
-		{StatusTombstone, true},
 		{Status("invalid"), false},
 		{Status(""), false},
 	}
@@ -211,79 +254,6 @@ func TestStatusIsValid(t *testing.T) {
 		t.Run(string(tt.status), func(t *testing.T) {
 			if got := tt.status.IsValid(); got != tt.valid {
 				t.Errorf("Status(%q).IsValid() = %v, want %v", tt.status, got, tt.valid)
-			}
-		})
-	}
-}
-
-func TestIsTombstone(t *testing.T) {
-	tests := []struct {
-		name   string
-		issue  Issue
-		expect bool
-	}{
-		{
-			name: "tombstone issue",
-			issue: Issue{
-				ID:        "test-1",
-				Title:     "(deleted)",
-				Status:    StatusTombstone,
-				Priority:  0,
-				IssueType: TypeTask,
-			},
-			expect: true,
-		},
-		{
-			name: "open issue",
-			issue: Issue{
-				ID:        "test-1",
-				Title:     "Open issue",
-				Status:    StatusOpen,
-				Priority:  2,
-				IssueType: TypeTask,
-			},
-			expect: false,
-		},
-		{
-			name: "closed issue",
-			issue: Issue{
-				ID:        "test-1",
-				Title:     "Closed issue",
-				Status:    StatusClosed,
-				Priority:  2,
-				IssueType: TypeTask,
-				ClosedAt:  timePtr(time.Now()),
-			},
-			expect: false,
-		},
-		{
-			name: "in_progress issue",
-			issue: Issue{
-				ID:        "test-1",
-				Title:     "In progress issue",
-				Status:    StatusInProgress,
-				Priority:  2,
-				IssueType: TypeTask,
-			},
-			expect: false,
-		},
-		{
-			name: "blocked issue",
-			issue: Issue{
-				ID:        "test-1",
-				Title:     "Blocked issue",
-				Status:    StatusBlocked,
-				Priority:  2,
-				IssueType: TypeTask,
-			},
-			expect: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := tt.issue.IsTombstone(); got != tt.expect {
-				t.Errorf("Issue.IsTombstone() = %v, want %v", got, tt.expect)
 			}
 		})
 	}
@@ -442,12 +412,12 @@ func TestValidateForImport(t *testing.T) {
 			wantErr: false, // Should pass - federation trust model
 		},
 		{
-			name: "built-in type agent passes",
+			name: "custom type passes (federation trust)",
 			issue: Issue{
 				Title:     "Test Issue",
 				Status:    StatusOpen,
 				Priority:  1,
-				IssueType: TypeAgent, // Gas Town built-in type
+				IssueType: IssueType("agent"), // Custom type (no longer built-in)
 			},
 			wantErr: false,
 		},
@@ -539,20 +509,27 @@ func TestIssueTypeIsValid(t *testing.T) {
 		issueType IssueType
 		valid     bool
 	}{
+		// Core work types are always valid
 		{TypeBug, true},
 		{TypeFeature, true},
 		{TypeTask, true},
 		{TypeEpic, true},
 		{TypeChore, true},
+		{TypeDecision, true},
 		{TypeMessage, true},
-		{TypeMergeRequest, true},
-		{TypeMolecule, true},
-		{TypeGate, true},
-		{TypeAgent, true},
-		{TypeRole, true},
-		{TypeConvoy, true},
-		{TypeEvent, true},
-		{TypeSlot, true},
+		// Molecule is a core type (used by swarm create)
+		{IssueType("molecule"), true},
+		// Gate is a core type (used by bd gate, formula gates — GH#3213)
+		{IssueType("gate"), true},
+		// Remaining orchestrator types are custom types (not built-in)
+		{IssueType("merge-request"), false},
+		{IssueType("agent"), false},
+		{IssueType("role"), false},
+		{IssueType("convoy"), false},
+		{TypeEvent, false},
+		{IssueType("slot"), false},
+		{IssueType("rig"), false},
+		// Invalid types
 		{IssueType("invalid"), false},
 		{IssueType(""), false},
 	}
@@ -566,6 +543,68 @@ func TestIssueTypeIsValid(t *testing.T) {
 	}
 }
 
+// TestEventTypeValidation verifies that event type is accepted by validation
+// even without being in types.custom, since set-state creates event beads
+// internally for audit trail (GH#1356).
+func TestEventTypeValidation(t *testing.T) {
+	now := time.Now()
+	event := Issue{
+		Title:     "state change event",
+		Status:    StatusOpen,
+		Priority:  4,
+		IssueType: TypeEvent,
+		CreatedAt: now,
+		UpdatedAt: now,
+	}
+
+	// event is not a core work type
+	if TypeEvent.IsValid() {
+		t.Fatal("event should not be a core work type")
+	}
+
+	// event is an internal built-in type
+	if !TypeEvent.IsBuiltIn() {
+		t.Error("TypeEvent.IsBuiltIn() = false, want true")
+	}
+
+	// event should be accepted by IsValidWithCustom without explicit config
+	if !TypeEvent.IsValidWithCustom(nil) {
+		t.Error("TypeEvent.IsValidWithCustom(nil) = false, want true")
+	}
+
+	// ValidateWithCustom should accept event without custom types config
+	if err := event.ValidateWithCustom(nil, nil); err != nil {
+		t.Errorf("ValidateWithCustom() should accept event type, got: %v", err)
+	}
+
+	// event should also work alongside other custom types
+	if !TypeEvent.IsValidWithCustom([]string{"molecule", "gate"}) {
+		t.Error("TypeEvent.IsValidWithCustom(custom list) = false, want true")
+	}
+
+	// molecule is now a built-in type (used by swarm create)
+	if !IssueType("molecule").IsBuiltIn() {
+		t.Error("IssueType(molecule).IsBuiltIn() = false, want true")
+	}
+	// gate is now a built-in type (used by bd gate, formula gates — GH#3213)
+	if !IssueType("gate").IsBuiltIn() {
+		t.Error("IssueType(gate).IsBuiltIn() = false, want true")
+	}
+
+	// Normalize must not map event to a core type
+	if TypeEvent.Normalize() != TypeEvent {
+		t.Errorf("TypeEvent.Normalize() = %q, want %q", TypeEvent.Normalize(), TypeEvent)
+	}
+
+	// decision aliases
+	if IssueType("dec").Normalize() != TypeDecision {
+		t.Errorf("IssueType(dec).Normalize() = %q, want %q", IssueType("dec").Normalize(), TypeDecision)
+	}
+	if IssueType("adr").Normalize() != TypeDecision {
+		t.Errorf("IssueType(adr).Normalize() = %q, want %q", IssueType("adr").Normalize(), TypeDecision)
+	}
+}
+
 func TestIssueTypeRequiredSections(t *testing.T) {
 	tests := []struct {
 		issueType     IssueType
@@ -576,13 +615,14 @@ func TestIssueTypeRequiredSections(t *testing.T) {
 		{TypeFeature, 1, "## Acceptance Criteria"},
 		{TypeTask, 1, "## Acceptance Criteria"},
 		{TypeEpic, 1, "## Success Criteria"},
+		{TypeDecision, 3, "## Decision"},
 		{TypeChore, 0, ""},
 		{TypeMessage, 0, ""},
-		{TypeMolecule, 0, ""},
-		{TypeGate, 0, ""},
+		// Orchestrator types are now custom and have no required sections
+		{IssueType("molecule"), 0, ""},
+		{IssueType("gate"), 0, ""},
 		{TypeEvent, 0, ""},
-		{TypeMergeRequest, 0, ""},
-		// Gas Town types (agent, role, rig, convoy, slot) have been removed
+		{IssueType("merge-request"), 0, ""},
 	}
 
 	for _, tt := range tests {
@@ -595,26 +635,6 @@ func TestIssueTypeRequiredSections(t *testing.T) {
 			if tt.expectCount > 0 && sections[0].Heading != tt.expectHeading {
 				t.Errorf("IssueType(%q).RequiredSections()[0].Heading = %q, want %q",
 					tt.issueType, sections[0].Heading, tt.expectHeading)
-			}
-		})
-	}
-}
-
-func TestAgentStateIsValid(t *testing.T) {
-	cases := []struct {
-		name  string
-		state AgentState
-		want  bool
-	}{
-		{"idle", StateIdle, true},
-		{"running", StateRunning, true},
-		{"empty", AgentState(""), true}, // empty allowed for non-agent beads
-		{"invalid", AgentState("dormant"), false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := tc.state.IsValid(); got != tc.want {
-				t.Fatalf("AgentState(%q).IsValid() = %v, want %v", tc.state, got, tc.want)
 			}
 		})
 	}
@@ -661,7 +681,11 @@ func TestIssueCompoundHelpers(t *testing.T) {
 }
 
 func TestDependencyTypeIsValid(t *testing.T) {
-	// IsValid now accepts any non-empty string up to 50 chars (Decision 004)
+	// IsValid accepts any non-empty string the type column can hold (Decision
+	// 004 for the open vocabulary; MaxDependencyTypeLen for the bound). The
+	// boundary cases below are the load-bearing ones: at the limit the type is
+	// storable and must be accepted, one past it no edge could carry it and a
+	// filter built from it would match nothing, so it is refused up front.
 	tests := []struct {
 		depType DependencyType
 		valid   bool
@@ -680,6 +704,8 @@ func TestDependencyTypeIsValid(t *testing.T) {
 		{DependencyType("custom-type"), true}, // Custom types are now valid
 		{DependencyType("any-string"), true},  // Any non-empty string is valid
 		{DependencyType(""), false},           // Empty is still invalid
+		{DependencyType(strings.Repeat("x", MaxDependencyTypeLen)), true},                            // Exactly the column width
+		{DependencyType(strings.Repeat("x", MaxDependencyTypeLen+1)), false},                         // One past it: unstorable
 		{DependencyType("this-is-a-very-long-dependency-type-that-exceeds-fifty-characters"), false}, // Too long
 	}
 
@@ -761,6 +787,49 @@ func TestDependencyTypeAffectsReadyWork(t *testing.T) {
 	}
 }
 
+func TestParseWaitsForGateMetadata(t *testing.T) {
+	tests := []struct {
+		name     string
+		metadata string
+		want     string
+	}{
+		{
+			name:     "empty defaults to all-children",
+			metadata: "",
+			want:     WaitsForAllChildren,
+		},
+		{
+			name:     "invalid json defaults to all-children",
+			metadata: "{bad",
+			want:     WaitsForAllChildren,
+		},
+		{
+			name:     "all-children metadata",
+			metadata: `{"gate":"all-children"}`,
+			want:     WaitsForAllChildren,
+		},
+		{
+			name:     "any-children metadata",
+			metadata: `{"gate":"any-children"}`,
+			want:     WaitsForAnyChildren,
+		},
+		{
+			name:     "unknown gate defaults to all-children",
+			metadata: `{"gate":"something-else"}`,
+			want:     WaitsForAllChildren,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := ParseWaitsForGateMetadata(tt.metadata)
+			if got != tt.want {
+				t.Fatalf("ParseWaitsForGateMetadata(%q) = %q, want %q", tt.metadata, got, tt.want)
+			}
+		})
+	}
+}
+
 func TestIsFailureClose(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -828,6 +897,224 @@ func TestIssueStructFields(t *testing.T) {
 	}
 	if issue.ClosedAt == nil || *issue.ClosedAt != closedAt {
 		t.Errorf("ClosedAt = %v, want %v", issue.ClosedAt, closedAt)
+	}
+}
+
+// TestIssueLeaseJSONSerialization verifies the leasing columns (migration 0054)
+// are surfaced in JSON when present and omitted when absent, while the internal
+// row_lock is never exposed. Backs `bd show <id> --json` (wy-9cdw).
+func TestIssueLeaseJSONSerialization(t *testing.T) {
+	now := time.Now().UTC()
+	expires := now.Add(15 * time.Minute)
+
+	// With an active lease: both keys appear, row_lock never does.
+	leased := IssueDetails{Issue: Issue{
+		ID:             "test-1",
+		Title:          "Leased",
+		Status:         StatusInProgress,
+		LeaseExpiresAt: &expires,
+		HeartbeatAt:    &now,
+	}}
+	b, err := json.Marshal(leased)
+	if err != nil {
+		t.Fatalf("marshal leased issue: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if _, ok := m["lease_expires_at"]; !ok {
+		t.Errorf("expected lease_expires_at in JSON, got: %s", b)
+	}
+	if _, ok := m["heartbeat_at"]; !ok {
+		t.Errorf("expected heartbeat_at in JSON, got: %s", b)
+	}
+	if _, ok := m["row_lock"]; ok {
+		t.Errorf("row_lock must never be surfaced, got: %s", b)
+	}
+
+	// Without a lease (the common case): keys are omitted, not null.
+	unleased := IssueDetails{Issue: Issue{ID: "test-2", Title: "Open", Status: StatusOpen}}
+	b2, err := json.Marshal(unleased)
+	if err != nil {
+		t.Fatalf("marshal unleased issue: %v", err)
+	}
+	if strings.Contains(string(b2), "lease_expires_at") {
+		t.Errorf("lease_expires_at should be omitted when nil, got: %s", b2)
+	}
+	if strings.Contains(string(b2), "heartbeat_at") {
+		t.Errorf("heartbeat_at should be omitted when nil, got: %s", b2)
+	}
+}
+
+// TestRowVersionNeverSerialized locks in the storage/interchange boundary:
+// RowVersion stays absent from generic Issue JSON and from the LIST/INTERCHANGE
+// wrapper, whatever the detail view publishes. IssueWithCounts is the row
+// `bd export` writes to JSONL, so a token there would put a per-write-random
+// value into a git-tracked file; the detail view neither lists nor
+// interchanges, which is why it is the one shape allowed to project the token
+// (see TestNewIssueDetailsProjectsTheRevisionToken).
+func TestRowVersionNeverSerialized(t *testing.T) {
+	iss := Issue{ID: "test-1", Title: "Versioned", Status: StatusOpen, RowVersion: 123456789}
+
+	// The Go field stays populated — this is what library call sites read.
+	if iss.RowVersion != 123456789 {
+		t.Fatalf("RowVersion Go field = %d, want 123456789", iss.RowVersion)
+	}
+
+	surfaces := []struct {
+		name string
+		v    any
+	}{
+		{"Issue", iss},
+		{"IssueWithCounts", IssueWithCounts{Issue: &iss}},
+	}
+	for _, tc := range surfaces {
+		b, err := json.Marshal(tc.v)
+		if err != nil {
+			t.Fatalf("marshal %s: %v", tc.name, err)
+		}
+		s := string(b)
+		for _, forbidden := range []string{"row_version", "RowVersion", "row_lock", "123456789"} {
+			if strings.Contains(s, forbidden) {
+				t.Errorf("%s JSON must not contain %q, got: %s", tc.name, forbidden, s)
+			}
+		}
+	}
+}
+
+// TestNewIssueDetailsProjectsTheRevisionToken pins the constructor that is the
+// only door to the published token: it reads RowVersion off the row and writes
+// it under the storage-neutral wire name, always present and never under a
+// storage spelling.
+//
+// The zero case is not a formality. 0 is the migration-0054 backfill token, a
+// legitimate value a guarded client must be able to send, so `revision` carries
+// no omitempty and an absent member never stands in for a legacy-zero row.
+func TestNewIssueDetailsProjectsTheRevisionToken(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		token int64
+		want  string
+	}{
+		{"a mutated row", 123456789, `"revision":"123456789"`},
+		{"a legacy un-mutated row", 0, `"revision":"0"`},
+		{"a negative token", -3819021935081927, `"revision":"-3819021935081927"`},
+		{"a token past 2^53", 9007199254740993, `"revision":"9007199254740993"`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			details := NewIssueDetails(Issue{ID: "test-1", Title: "Versioned", RowVersion: tc.token})
+			if details.Revision != RevisionToken(tc.token) {
+				t.Errorf("Revision = %q, want %q", details.Revision, RevisionToken(tc.token))
+			}
+
+			b, err := json.Marshal(details)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			s := string(b)
+			if !strings.Contains(s, tc.want) {
+				t.Errorf("IssueDetails JSON missing %s, got: %s", tc.want, s)
+			}
+			for _, forbidden := range []string{"row_version", "RowVersion", "row_lock"} {
+				if strings.Contains(s, forbidden) {
+					t.Errorf("IssueDetails JSON leaked storage field %q: %s", forbidden, s)
+				}
+			}
+		})
+	}
+}
+
+// TestRevisionTokenIsAJSONString is the JS-safety pin: whatever the token, the
+// marshaled member is a QUOTED decimal, so no consumer that decodes JSON numbers
+// as IEEE-754 doubles can round it.
+//
+// It matches the bytes with a regexp rather than comparing a decoded value,
+// because a decoded value is exactly what the defect hides behind — Go's own
+// `any` decode of a JSON number is a float64 too, so a test that unmarshaled and
+// compared would agree with the broken wire shape for small tokens and disagree
+// with it for large ones for the wrong reason.
+func TestRevisionTokenIsAJSONString(t *testing.T) {
+	member := regexp.MustCompile(`"revision":"-?\d+"`)
+	for _, token := range []int64{0, 1, -1, 123456789, math.MaxInt64, math.MinInt64, 1 << 53, (1 << 53) + 1} {
+		b, err := json.Marshal(NewIssueDetails(Issue{ID: "test-1", Title: "Versioned", RowVersion: token}))
+		if err != nil {
+			t.Fatalf("marshal with token %d: %v", token, err)
+		}
+		if !member.Match(b) {
+			t.Errorf("token %d marshaled to %s, want a quoted decimal `revision` member", token, b)
+		}
+	}
+}
+
+// TestRevisionTokenRoundTrips pins that the wire spelling is lossless across the
+// whole int64 range — the property the string exists for. A JSON number would
+// fail this above 2^53 in any double-based consumer.
+func TestRevisionTokenRoundTrips(t *testing.T) {
+	for _, token := range []int64{
+		math.MinInt64, -3819021935081927, -(1 << 53) - 1, -1, 0, 1,
+		1 << 53, (1 << 53) + 1, 9007199254740993, math.MaxInt64,
+	} {
+		got, err := ParseRevisionToken(RevisionToken(token))
+		if err != nil {
+			t.Errorf("ParseRevisionToken(RevisionToken(%d)): %v", token, err)
+			continue
+		}
+		if got != token {
+			t.Errorf("ParseRevisionToken(RevisionToken(%d)) = %d, want %d", token, got, token)
+		}
+	}
+}
+
+// TestRevisionTokenSurvivesAJavaScriptRealisticParse walks the round trip a
+// browser client actually performs — marshal, decode the member as the string it
+// is, parse it back — and proves the token that motivated this shape survives it.
+//
+// The float64 leg is the control: it is what a consumer got when the member was
+// a JSON number, and it is WRONG by 1 for this token. Without it the test would
+// pass on a broken wire shape too.
+func TestRevisionTokenSurvivesAJavaScriptRealisticParse(t *testing.T) {
+	const token = int64(9007199254740993) // 2^53 + 1, the smallest int64 a double cannot hold
+
+	b, err := json.Marshal(NewIssueDetails(Issue{ID: "test-1", Title: "Versioned", RowVersion: token}))
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded struct {
+		Revision string `json:"revision"`
+	}
+	if err := json.Unmarshal(b, &decoded); err != nil {
+		t.Fatalf("decode revision as a string: %v (a number-typed member would fail here): %s", err, b)
+	}
+	got, err := ParseRevisionToken(decoded.Revision)
+	if err != nil {
+		t.Fatalf("ParseRevisionToken(%q): %v", decoded.Revision, err)
+	}
+	if got != token {
+		t.Errorf("round trip gave %d, want %d", got, token)
+	}
+	if lossy := int64(float64(token)); lossy == token {
+		t.Fatalf("the control is broken: %d survives a float64 round trip, so this test proves nothing", token)
+	}
+}
+
+func TestReclaimedLeaseJSONSerialization(t *testing.T) {
+	b, err := json.Marshal(ReclaimedLease{ID: "bd-1", PreviousOwner: "worker-a"})
+	if err != nil {
+		t.Fatalf("marshal reclaimed lease: %v", err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatalf("unmarshal reclaimed lease: %v", err)
+	}
+	if m["id"] != "bd-1" || m["previous_owner"] != "worker-a" {
+		t.Fatalf("reclaimed lease JSON = %s, want snake_case id/previous_owner", b)
+	}
+	if _, ok := m["ID"]; ok {
+		t.Fatalf("reclaimed lease JSON leaked Go field name: %s", b)
+	}
+	if _, ok := m["PreviousOwner"]; ok {
+		t.Fatalf("reclaimed lease JSON leaked Go field name: %s", b)
 	}
 }
 
@@ -949,238 +1236,6 @@ func TestSortPolicyIsValid(t *testing.T) {
 	}
 }
 
-func TestIsExpired(t *testing.T) {
-	now := time.Now()
-
-	tests := []struct {
-		name    string
-		issue   Issue
-		ttl     time.Duration
-		expired bool
-	}{
-		{
-			name: "non-tombstone issue never expires",
-			issue: Issue{
-				ID:        "test-1",
-				Title:     "Open issue",
-				Status:    StatusOpen,
-				Priority:  2,
-				IssueType: TypeTask,
-			},
-			ttl:     0,
-			expired: false,
-		},
-		{
-			name: "closed issue never expires",
-			issue: Issue{
-				ID:        "test-2",
-				Title:     "Closed issue",
-				Status:    StatusClosed,
-				Priority:  2,
-				IssueType: TypeTask,
-				ClosedAt:  timePtr(now),
-			},
-			ttl:     0,
-			expired: false,
-		},
-		{
-			name: "tombstone without DeletedAt does not expire",
-			issue: Issue{
-				ID:        "test-3",
-				Title:     "(deleted)",
-				Status:    StatusTombstone,
-				Priority:  0,
-				IssueType: TypeTask,
-				DeletedAt: nil,
-			},
-			ttl:     0,
-			expired: false,
-		},
-		{
-			name: "tombstone within default TTL (30 days)",
-			issue: Issue{
-				ID:        "test-4",
-				Title:     "(deleted)",
-				Status:    StatusTombstone,
-				Priority:  0,
-				IssueType: TypeTask,
-				DeletedAt: timePtr(now.Add(-15 * 24 * time.Hour)), // 15 days ago
-			},
-			ttl:     0, // Use default TTL
-			expired: false,
-		},
-		{
-			name: "tombstone past default TTL (30 days)",
-			issue: Issue{
-				ID:        "test-5",
-				Title:     "(deleted)",
-				Status:    StatusTombstone,
-				Priority:  0,
-				IssueType: TypeTask,
-				DeletedAt: timePtr(now.Add(-35 * 24 * time.Hour)), // 35 days ago (past 30 days + 1 hour grace)
-			},
-			ttl:     0, // Use default TTL
-			expired: true,
-		},
-		{
-			name: "tombstone within custom TTL (7 days)",
-			issue: Issue{
-				ID:        "test-6",
-				Title:     "(deleted)",
-				Status:    StatusTombstone,
-				Priority:  0,
-				IssueType: TypeTask,
-				DeletedAt: timePtr(now.Add(-3 * 24 * time.Hour)), // 3 days ago
-			},
-			ttl:     7 * 24 * time.Hour,
-			expired: false,
-		},
-		{
-			name: "tombstone past custom TTL (7 days)",
-			issue: Issue{
-				ID:        "test-7",
-				Title:     "(deleted)",
-				Status:    StatusTombstone,
-				Priority:  0,
-				IssueType: TypeTask,
-				DeletedAt: timePtr(now.Add(-9 * 24 * time.Hour)), // 9 days ago (past 7 days + 1 hour grace)
-			},
-			ttl:     7 * 24 * time.Hour,
-			expired: true,
-		},
-		{
-			name: "tombstone at exact TTL boundary (within grace period)",
-			issue: Issue{
-				ID:        "test-8",
-				Title:     "(deleted)",
-				Status:    StatusTombstone,
-				Priority:  0,
-				IssueType: TypeTask,
-				DeletedAt: timePtr(now.Add(-30 * 24 * time.Hour)), // Exactly 30 days ago
-			},
-			ttl:     0, // Use default TTL (30 days + 1 hour grace)
-			expired: false,
-		},
-		{
-			name: "tombstone just past TTL boundary (beyond grace period)",
-			issue: Issue{
-				ID:        "test-9",
-				Title:     "(deleted)",
-				Status:    StatusTombstone,
-				Priority:  0,
-				IssueType: TypeTask,
-				DeletedAt: timePtr(now.Add(-(30*24*time.Hour + 2*time.Hour))), // 30 days + 2 hours ago
-			},
-			ttl:     0, // Use default TTL (30 days + 1 hour grace)
-			expired: true,
-		},
-		{
-			name: "tombstone within grace period",
-			issue: Issue{
-				ID:        "test-10",
-				Title:     "(deleted)",
-				Status:    StatusTombstone,
-				Priority:  0,
-				IssueType: TypeTask,
-				DeletedAt: timePtr(now.Add(-(30*24*time.Hour + 30*time.Minute))), // 30 days + 30 minutes ago
-			},
-			ttl:     0, // Use default TTL (30 days + 1 hour grace)
-			expired: false,
-		},
-		{
-			name: "tombstone with MinTombstoneTTL (7 days)",
-			issue: Issue{
-				ID:        "test-11",
-				Title:     "(deleted)",
-				Status:    StatusTombstone,
-				Priority:  0,
-				IssueType: TypeTask,
-				DeletedAt: timePtr(now.Add(-10 * 24 * time.Hour)), // 10 days ago
-			},
-			ttl:     MinTombstoneTTL, // 7 days
-			expired: true,
-		},
-		{
-			name: "tombstone with very short TTL (1 hour)",
-			issue: Issue{
-				ID:        "test-12",
-				Title:     "(deleted)",
-				Status:    StatusTombstone,
-				Priority:  0,
-				IssueType: TypeTask,
-				DeletedAt: timePtr(now.Add(-3 * time.Hour)), // 3 hours ago
-			},
-			ttl:     1 * time.Hour, // 1 hour + 1 hour grace = 2 hours total
-			expired: true,
-		},
-		{
-			name: "tombstone deleted in the future (clock skew)",
-			issue: Issue{
-				ID:        "test-13",
-				Title:     "(deleted)",
-				Status:    StatusTombstone,
-				Priority:  0,
-				IssueType: TypeTask,
-				DeletedAt: timePtr(now.Add(1 * time.Hour)), // 1 hour in the future
-			},
-			ttl:     7 * 24 * time.Hour,
-			expired: false,
-		},
-		{
-			name: "negative TTL means immediately expired (bd-4q8 --hard mode)",
-			issue: Issue{
-				ID:        "test-14",
-				Title:     "(deleted)",
-				Status:    StatusTombstone,
-				Priority:  0,
-				IssueType: TypeTask,
-				DeletedAt: timePtr(now), // Just deleted NOW
-			},
-			ttl:     -1, // Negative TTL = immediate expiration
-			expired: true,
-		},
-		{
-			name: "non-tombstone never expires even with negative TTL",
-			issue: Issue{
-				ID:        "test-15",
-				Title:     "Open issue",
-				Status:    StatusOpen,
-				Priority:  0,
-				IssueType: TypeTask,
-			},
-			ttl:     -1,
-			expired: false,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := tt.issue.IsExpired(tt.ttl)
-			if got != tt.expired {
-				t.Errorf("Issue.IsExpired(%v) = %v, want %v", tt.ttl, got, tt.expired)
-			}
-		})
-	}
-}
-
-func TestTombstoneTTLConstants(t *testing.T) {
-	// Test that constants have expected values
-	if DefaultTombstoneTTL != 30*24*time.Hour {
-		t.Errorf("DefaultTombstoneTTL = %v, want %v", DefaultTombstoneTTL, 30*24*time.Hour)
-	}
-	if MinTombstoneTTL != 7*24*time.Hour {
-		t.Errorf("MinTombstoneTTL = %v, want %v", MinTombstoneTTL, 7*24*time.Hour)
-	}
-	if ClockSkewGrace != 1*time.Hour {
-		t.Errorf("ClockSkewGrace = %v, want %v", ClockSkewGrace, 1*time.Hour)
-	}
-
-	// Test that MinTombstoneTTL is less than DefaultTombstoneTTL
-	if MinTombstoneTTL >= DefaultTombstoneTTL {
-		t.Errorf("MinTombstoneTTL (%v) should be less than DefaultTombstoneTTL (%v)", MinTombstoneTTL, DefaultTombstoneTTL)
-	}
-}
-
 // Helper functions
 
 func intPtr(i int) *int {
@@ -1263,310 +1318,644 @@ func TestSetDefaults(t *testing.T) {
 	}
 }
 
-// EntityRef tests (bd-nmch: HOP entity tracking foundation)
-
-func TestEntityRefIsEmpty(t *testing.T) {
+func TestParseCustomStatusConfig(t *testing.T) {
 	tests := []struct {
-		name   string
-		ref    *EntityRef
-		expect bool
+		name    string
+		input   string
+		want    []CustomStatus
+		wantErr string
 	}{
-		{"nil ref", nil, true},
-		{"empty ref", &EntityRef{}, true},
-		{"only name", &EntityRef{Name: "test"}, false},
-		{"only platform", &EntityRef{Platform: "gastown"}, false},
-		{"only org", &EntityRef{Org: "steveyegge"}, false},
-		{"only id", &EntityRef{ID: "polecat-nux"}, false},
-		{"full ref", &EntityRef{Name: "polecat/Nux", Platform: "gastown", Org: "steveyegge", ID: "polecat-nux"}, false},
+		{
+			name:  "empty string",
+			input: "",
+			want:  nil,
+		},
+		{
+			name:  "whitespace only",
+			input: "   ",
+			want:  nil,
+		},
+		{
+			name:  "single flat status (legacy format)",
+			input: "review",
+			want:  []CustomStatus{{Name: "review", Category: CategoryUnspecified}},
+		},
+		{
+			name:  "multiple flat statuses (legacy format)",
+			input: "review,qa,on-hold",
+			want: []CustomStatus{
+				{Name: "review", Category: CategoryUnspecified},
+				{Name: "qa", Category: CategoryUnspecified},
+				{Name: "on-hold", Category: CategoryUnspecified},
+			},
+		},
+		{
+			name:  "single categorized status",
+			input: "review:active",
+			want:  []CustomStatus{{Name: "review", Category: CategoryActive}},
+		},
+		{
+			name:  "all category types",
+			input: "review:active,testing:wip,done-review:done,on-ice:frozen",
+			want: []CustomStatus{
+				{Name: "review", Category: CategoryActive},
+				{Name: "testing", Category: CategoryWIP},
+				{Name: "done-review", Category: CategoryDone},
+				{Name: "on-ice", Category: CategoryFrozen},
+			},
+		},
+		{
+			name:  "mixed legacy and categorized",
+			input: "review,testing:wip,qa",
+			want: []CustomStatus{
+				{Name: "review", Category: CategoryUnspecified},
+				{Name: "testing", Category: CategoryWIP},
+				{Name: "qa", Category: CategoryUnspecified},
+			},
+		},
+		{
+			name:  "whitespace around entries",
+			input: " review:active , testing:wip , qa ",
+			want: []CustomStatus{
+				{Name: "review", Category: CategoryActive},
+				{Name: "testing", Category: CategoryWIP},
+				{Name: "qa", Category: CategoryUnspecified},
+			},
+		},
+		{
+			name:  "trailing comma ignored",
+			input: "review:active,",
+			want:  []CustomStatus{{Name: "review", Category: CategoryActive}},
+		},
+		{
+			name:    "trailing colon with empty category",
+			input:   "review:",
+			wantErr: "trailing colon with empty category",
+		},
+		{
+			name:    "invalid category",
+			input:   "review:invalid",
+			wantErr: "invalid category",
+		},
+		{
+			name:    "uppercase in name",
+			input:   "Review:active",
+			wantErr: "must match",
+		},
+		{
+			name:    "space in name",
+			input:   "my status:active",
+			wantErr: "must match",
+		},
+		{
+			name:    "digit-first name",
+			input:   "1review:active",
+			wantErr: "must match",
+		},
+		{
+			name:    "hyphen-first name",
+			input:   "-review:active",
+			wantErr: "must match",
+		},
+		{
+			name:  "empty name from leading comma",
+			input: ",review:active",
+			want:  []CustomStatus{{Name: "review", Category: CategoryActive}},
+		},
+		{
+			name:    "collision with built-in open",
+			input:   "open:active",
+			wantErr: "collides with built-in",
+		},
+		{
+			name:    "collision with built-in closed",
+			input:   "closed:done",
+			wantErr: "collides with built-in",
+		},
+		{
+			name:    "collision with built-in in_progress",
+			input:   "in_progress:wip",
+			wantErr: "collides with built-in",
+		},
+		{
+			name:    "duplicate name",
+			input:   "review:active,review:wip",
+			wantErr: "duplicate",
+		},
+		{
+			name:  "name with underscores and hyphens",
+			input: "in-review:active,needs_qa:wip",
+			want: []CustomStatus{
+				{Name: "in-review", Category: CategoryActive},
+				{Name: "needs_qa", Category: CategoryWIP},
+			},
+		},
+		{
+			name:  "name with digits after first letter",
+			input: "stage2:active,qa3-check:wip",
+			want: []CustomStatus{
+				{Name: "stage2", Category: CategoryActive},
+				{Name: "qa3-check", Category: CategoryWIP},
+			},
+		},
+		{
+			name:    "colon in category portion (first-colon split)",
+			input:   "review:active:extra",
+			wantErr: "invalid category",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := tt.ref.IsEmpty(); got != tt.expect {
-				t.Errorf("EntityRef.IsEmpty() = %v, want %v", got, tt.expect)
-			}
-		})
-	}
-}
-
-func TestEntityRefURI(t *testing.T) {
-	tests := []struct {
-		name   string
-		ref    *EntityRef
-		expect string
-	}{
-		{"nil ref", nil, ""},
-		{"empty ref", &EntityRef{}, ""},
-		{"missing platform", &EntityRef{Org: "steveyegge", ID: "polecat-nux"}, ""},
-		{"missing org", &EntityRef{Platform: "gastown", ID: "polecat-nux"}, ""},
-		{"missing id", &EntityRef{Platform: "gastown", Org: "steveyegge"}, ""},
-		{"full ref", &EntityRef{Platform: "gastown", Org: "steveyegge", ID: "polecat-nux"}, "entity://hop/gastown/steveyegge/polecat-nux"},
-		{"with name", &EntityRef{Name: "polecat/Nux", Platform: "gastown", Org: "steveyegge", ID: "polecat-nux"}, "entity://hop/gastown/steveyegge/polecat-nux"},
-		{"github platform", &EntityRef{Platform: "github", Org: "anthropics", ID: "claude-code"}, "entity://hop/github/anthropics/claude-code"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := tt.ref.URI(); got != tt.expect {
-				t.Errorf("EntityRef.URI() = %q, want %q", got, tt.expect)
-			}
-		})
-	}
-}
-
-func TestEntityRefString(t *testing.T) {
-	tests := []struct {
-		name   string
-		ref    *EntityRef
-		expect string
-	}{
-		{"nil ref", nil, ""},
-		{"empty ref", &EntityRef{}, ""},
-		{"only name", &EntityRef{Name: "polecat/Nux"}, "polecat/Nux"},
-		{"full ref with name", &EntityRef{Name: "polecat/Nux", Platform: "gastown", Org: "steveyegge", ID: "polecat-nux"}, "polecat/Nux"},
-		{"full ref without name", &EntityRef{Platform: "gastown", Org: "steveyegge", ID: "polecat-nux"}, "entity://hop/gastown/steveyegge/polecat-nux"},
-		{"only id", &EntityRef{ID: "polecat-nux"}, "polecat-nux"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if got := tt.ref.String(); got != tt.expect {
-				t.Errorf("EntityRef.String() = %q, want %q", got, tt.expect)
-			}
-		})
-	}
-}
-
-func TestParseEntityURI(t *testing.T) {
-	tests := []struct {
-		name      string
-		uri       string
-		expect    *EntityRef
-		expectErr bool
-	}{
-		{
-			name:   "valid URI",
-			uri:    "entity://hop/gastown/steveyegge/polecat-nux",
-			expect: &EntityRef{Platform: "gastown", Org: "steveyegge", ID: "polecat-nux"},
-		},
-		{
-			name:   "github URI",
-			uri:    "entity://hop/github/anthropics/claude-code",
-			expect: &EntityRef{Platform: "github", Org: "anthropics", ID: "claude-code"},
-		},
-		{
-			name:   "id with slashes",
-			uri:    "entity://hop/gastown/steveyegge/polecat/nux",
-			expect: &EntityRef{Platform: "gastown", Org: "steveyegge", ID: "polecat/nux"},
-		},
-		{
-			name:      "wrong prefix",
-			uri:       "beads://hop/gastown/steveyegge/polecat-nux",
-			expectErr: true,
-		},
-		{
-			name:      "missing hop",
-			uri:       "entity://gastown/steveyegge/polecat-nux",
-			expectErr: true,
-		},
-		{
-			name:      "too few parts",
-			uri:       "entity://hop/gastown/steveyegge",
-			expectErr: true,
-		},
-		{
-			name:      "empty platform",
-			uri:       "entity://hop//steveyegge/polecat-nux",
-			expectErr: true,
-		},
-		{
-			name:      "empty org",
-			uri:       "entity://hop/gastown//polecat-nux",
-			expectErr: true,
-		},
-		{
-			name:      "empty id",
-			uri:       "entity://hop/gastown/steveyegge/",
-			expectErr: true,
-		},
-		{
-			name:      "empty string",
-			uri:       "",
-			expectErr: true,
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := ParseEntityURI(tt.uri)
-			if tt.expectErr {
+			got, err := ParseCustomStatusConfig(tt.input)
+			if tt.wantErr != "" {
 				if err == nil {
-					t.Errorf("ParseEntityURI(%q) expected error, got nil", tt.uri)
+					t.Fatalf("expected error containing %q, got nil", tt.wantErr)
+				}
+				if !contains(err.Error(), tt.wantErr) {
+					t.Fatalf("expected error containing %q, got %q", tt.wantErr, err.Error())
 				}
 				return
 			}
 			if err != nil {
-				t.Errorf("ParseEntityURI(%q) unexpected error: %v", tt.uri, err)
-				return
+				t.Fatalf("unexpected error: %v", err)
 			}
-			if got.Platform != tt.expect.Platform || got.Org != tt.expect.Org || got.ID != tt.expect.ID {
-				t.Errorf("ParseEntityURI(%q) = %+v, want %+v", tt.uri, got, tt.expect)
+			if len(got) != len(tt.want) {
+				t.Fatalf("got %d statuses, want %d", len(got), len(tt.want))
+			}
+			for i, g := range got {
+				if g.Name != tt.want[i].Name || g.Category != tt.want[i].Category {
+					t.Errorf("status[%d] = {%q, %q}, want {%q, %q}",
+						i, g.Name, g.Category, tt.want[i].Name, tt.want[i].Category)
+				}
 			}
 		})
 	}
 }
 
-func TestEntityRefRoundTrip(t *testing.T) {
-	// Test that URI() and ParseEntityURI() are inverses
-	original := &EntityRef{Platform: "gastown", Org: "steveyegge", ID: "polecat-nux"}
-	uri := original.URI()
-	parsed, err := ParseEntityURI(uri)
-	if err != nil {
-		t.Fatalf("ParseEntityURI(%q) error: %v", uri, err)
+func TestParseCustomStatusConfigMaxLimit(t *testing.T) {
+	// Build a config string with 51 statuses
+	parts := make([]string, 51)
+	for i := range parts {
+		parts[i] = fmt.Sprintf("s%d", i)
 	}
-	if parsed.Platform != original.Platform || parsed.Org != original.Org || parsed.ID != original.ID {
-		t.Errorf("Round trip failed: got %+v, want %+v", parsed, original)
+	input := strings.Join(parts, ",")
+	_, err := ParseCustomStatusConfig(input)
+	if err == nil {
+		t.Fatal("expected error for >50 custom statuses")
 	}
-}
-
-func TestComputeContentHashWithCreator(t *testing.T) {
-	// Test that Creator field affects the content hash (bd-m7ib)
-	issue1 := Issue{
-		Title:     "Test Issue",
-		Status:    StatusOpen,
-		Priority:  2,
-		IssueType: TypeTask,
-	}
-
-	issue2 := Issue{
-		Title:     "Test Issue",
-		Status:    StatusOpen,
-		Priority:  2,
-		IssueType: TypeTask,
-		Creator:   &EntityRef{Name: "polecat/Nux", Platform: "gastown", Org: "steveyegge", ID: "polecat-nux"},
-	}
-
-	hash1 := issue1.ComputeContentHash()
-	hash2 := issue2.ComputeContentHash()
-
-	if hash1 == hash2 {
-		t.Error("Expected different hash when Creator is set")
-	}
-
-	// Same creator should produce same hash
-	issue3 := Issue{
-		Title:     "Test Issue",
-		Status:    StatusOpen,
-		Priority:  2,
-		IssueType: TypeTask,
-		Creator:   &EntityRef{Name: "polecat/Nux", Platform: "gastown", Org: "steveyegge", ID: "polecat-nux"},
-	}
-
-	hash3 := issue3.ComputeContentHash()
-	if hash2 != hash3 {
-		t.Error("Expected same hash for identical Creator")
+	if !contains(err.Error(), "too many") {
+		t.Fatalf("expected 'too many' error, got %q", err.Error())
 	}
 }
 
-// Validation tests (bd-du9h: HOP proof-of-stake)
+func TestCustomStatusNames(t *testing.T) {
+	statuses := []CustomStatus{
+		{Name: "review", Category: CategoryActive},
+		{Name: "testing", Category: CategoryWIP},
+	}
+	names := CustomStatusNames(statuses)
+	if len(names) != 2 || names[0] != "review" || names[1] != "testing" {
+		t.Errorf("got %v, want [review testing]", names)
+	}
 
-func TestValidationIsValidOutcome(t *testing.T) {
+	// nil input
+	if got := CustomStatusNames(nil); got != nil {
+		t.Errorf("expected nil for nil input, got %v", got)
+	}
+}
+
+func TestCustomStatusesByCategory(t *testing.T) {
+	statuses := []CustomStatus{
+		{Name: "review", Category: CategoryActive},
+		{Name: "testing", Category: CategoryWIP},
+		{Name: "qa", Category: CategoryActive},
+		{Name: "archived", Category: CategoryDone},
+	}
+
+	active := CustomStatusesByCategory(statuses, CategoryActive)
+	if len(active) != 2 || active[0].Name != "review" || active[1].Name != "qa" {
+		t.Errorf("active = %v, want [review, qa]", active)
+	}
+
+	done := CustomStatusesByCategory(statuses, CategoryDone)
+	if len(done) != 1 || done[0].Name != "archived" {
+		t.Errorf("done = %v, want [archived]", done)
+	}
+
+	frozen := CustomStatusesByCategory(statuses, CategoryFrozen)
+	if len(frozen) != 0 {
+		t.Errorf("frozen = %v, want []", frozen)
+	}
+}
+
+func TestBuiltInStatusCategory(t *testing.T) {
 	tests := []struct {
-		outcome string
-		valid   bool
+		status Status
+		want   StatusCategory
 	}{
-		{ValidationAccepted, true},
-		{ValidationRejected, true},
-		{ValidationRevisionRequested, true},
-		{"unknown", false},
-		{"", false},
+		{StatusOpen, CategoryActive},
+		{StatusInProgress, CategoryWIP},
+		{StatusBlocked, CategoryWIP},
+		{StatusHooked, CategoryWIP},
+		{StatusClosed, CategoryDone},
+		{StatusDeferred, CategoryFrozen},
+		{StatusPinned, CategoryFrozen},
+	}
+	for _, tt := range tests {
+		got := BuiltInStatusCategory(tt.status)
+		if got != tt.want {
+			t.Errorf("BuiltInStatusCategory(%q) = %q, want %q", tt.status, got, tt.want)
+		}
+	}
+}
+
+func TestIsValidWithCustomStatuses(t *testing.T) {
+	customs := []CustomStatus{
+		{Name: "review", Category: CategoryActive},
+		{Name: "testing", Category: CategoryWIP},
+	}
+
+	// Built-in status is always valid
+	if !Status("open").IsValidWithCustomStatuses(customs) {
+		t.Error("open should be valid")
+	}
+
+	// Custom status is valid
+	if !Status("review").IsValidWithCustomStatuses(customs) {
+		t.Error("review should be valid")
+	}
+
+	// Unknown status is not valid
+	if Status("unknown").IsValidWithCustomStatuses(customs) {
+		t.Error("unknown should not be valid")
+	}
+}
+
+func TestParseCustomStatusConfigEdgeCases(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		want    []CustomStatus
+		wantErr string
+	}{
+		{
+			name:    "trailing colon rejected",
+			input:   "review:",
+			wantErr: "trailing colon with empty category",
+		},
+		{
+			name:    "double colon invalid category",
+			input:   "review::active",
+			wantErr: "invalid category",
+		},
+		{
+			name:  "name with numbers v2-review",
+			input: "v2-review:active",
+			want:  []CustomStatus{{Name: "v2-review", Category: CategoryActive}},
+		},
+		{
+			name:    "name starting with digit",
+			input:   "2review:active",
+			wantErr: "must match",
+		},
+		{
+			name:  "very long valid name",
+			input: "abcdefghijklmnopqrstuvwxyz-abcdefghijklmnopqrstuvwxyz-abcdefghijklmnopqrstuvwxyz-abcdefghijklmnop:active",
+			want:  []CustomStatus{{Name: "abcdefghijklmnopqrstuvwxyz-abcdefghijklmnopqrstuvwxyz-abcdefghijklmnopqrstuvwxyz-abcdefghijklmnop", Category: CategoryActive}},
+		},
+		{
+			name:    "unicode in name rejected",
+			input:   "über:active",
+			wantErr: "must match",
+		},
+		{
+			name:    "emoji in name rejected",
+			input:   "review🔥:active",
+			wantErr: "must match",
+		},
+		{
+			name:  "single char name",
+			input: "r:active",
+			want:  []CustomStatus{{Name: "r", Category: CategoryActive}},
+		},
+		{
+			name:    "underscore-first name rejected",
+			input:   "_review:active",
+			wantErr: "must match",
+		},
+		{
+			name:  "multiple empty entries filtered",
+			input: ",,review:active,,testing:wip,,",
+			want: []CustomStatus{
+				{Name: "review", Category: CategoryActive},
+				{Name: "testing", Category: CategoryWIP},
+			},
+		},
+		{
+			name:    "category unspecified not user-assignable",
+			input:   "review:unspecified",
+			wantErr: "invalid category",
+		},
+		{
+			name:    "all built-in collisions",
+			input:   "blocked:wip",
+			wantErr: "collides with built-in",
+		},
+		{
+			name:    "hooked built-in collision",
+			input:   "hooked:wip",
+			wantErr: "collides with built-in",
+		},
+		{
+			name:    "deferred built-in collision",
+			input:   "deferred:frozen",
+			wantErr: "collides with built-in",
+		},
+		{
+			name:    "pinned built-in collision",
+			input:   "pinned:frozen",
+			wantErr: "collides with built-in",
+		},
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.outcome, func(t *testing.T) {
-			v := &Validation{Outcome: tt.outcome}
-			if got := v.IsValidOutcome(); got != tt.valid {
-				t.Errorf("Validation{Outcome: %q}.IsValidOutcome() = %v, want %v", tt.outcome, got, tt.valid)
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := ParseCustomStatusConfig(tt.input)
+			if tt.wantErr != "" {
+				if err == nil {
+					t.Fatalf("expected error containing %q, got nil", tt.wantErr)
+				}
+				if !contains(err.Error(), tt.wantErr) {
+					t.Fatalf("expected error containing %q, got %q", tt.wantErr, err.Error())
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if len(got) != len(tt.want) {
+				t.Fatalf("got %d statuses, want %d", len(got), len(tt.want))
+			}
+			for i, g := range got {
+				if g.Name != tt.want[i].Name || g.Category != tt.want[i].Category {
+					t.Errorf("status[%d] = {%q, %q}, want {%q, %q}",
+						i, g.Name, g.Category, tt.want[i].Name, tt.want[i].Category)
+				}
 			}
 		})
 	}
 }
 
-func TestComputeContentHashWithValidations(t *testing.T) {
-	// Test that Validations field affects the content hash (bd-du9h)
-	ts := time.Date(2025, 12, 22, 10, 30, 0, 0, time.UTC)
-
-	issue1 := Issue{
-		Title:     "Test Issue",
-		Status:    StatusClosed,
-		Priority:  2,
-		IssueType: TypeTask,
-		ClosedAt:  &ts,
-	}
-
-	issue2 := Issue{
-		Title:     "Test Issue",
-		Status:    StatusClosed,
-		Priority:  2,
-		IssueType: TypeTask,
-		ClosedAt:  &ts,
-		Validations: []Validation{
-			{
-				Validator: &EntityRef{Platform: "gastown", Org: "steveyegge", ID: "refinery"},
-				Outcome:   ValidationAccepted,
-				Timestamp: ts,
-			},
+func TestCommentUnmarshalJSON(t *testing.T) {
+	tests := []struct {
+		name       string
+		input      string
+		wantID     string
+		wantAuthor string
+		wantText   string
+		wantErr    bool
+	}{
+		{
+			name:       "string ID (v1.0+)",
+			input:      `{"id":"uuid-abc","author":"alice","text":"hello","created_at":"2025-01-01T00:00:00Z"}`,
+			wantID:     "uuid-abc",
+			wantAuthor: "alice",
+			wantText:   "hello",
+		},
+		{
+			name:       "numeric ID (pre-v1.0)",
+			input:      `{"id":42,"author":"bob","text":"old comment","created_at":"2025-01-01T00:00:00Z"}`,
+			wantID:     "42",
+			wantAuthor: "bob",
+			wantText:   "old comment",
+		},
+		{
+			name:   "zero numeric ID",
+			input:  `{"id":0,"author":"sys","text":"auto","created_at":"2025-01-01T00:00:00Z"}`,
+			wantID: "0",
+		},
+		{
+			name:   "large numeric ID",
+			input:  `{"id":9999999,"author":"alice","text":"big","created_at":"2025-01-01T00:00:00Z"}`,
+			wantID: "9999999",
+		},
+		{
+			name:   "missing ID field",
+			input:  `{"author":"alice","text":"no id","created_at":"2025-01-01T00:00:00Z"}`,
+			wantID: "",
+		},
+		{
+			name:    "invalid JSON",
+			input:   `{not valid`,
+			wantErr: true,
 		},
 	}
 
-	hash1 := issue1.ComputeContentHash()
-	hash2 := issue2.ComputeContentHash()
-
-	if hash1 == hash2 {
-		t.Error("Expected different hash when Validations is set")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var c Comment
+			err := json.Unmarshal([]byte(tt.input), &c)
+			if tt.wantErr {
+				if err == nil {
+					t.Error("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if c.ID != tt.wantID {
+				t.Errorf("ID = %q, want %q", c.ID, tt.wantID)
+			}
+			if tt.wantAuthor != "" && c.Author != tt.wantAuthor {
+				t.Errorf("Author = %q, want %q", c.Author, tt.wantAuthor)
+			}
+			if tt.wantText != "" && c.Text != tt.wantText {
+				t.Errorf("Text = %q, want %q", c.Text, tt.wantText)
+			}
+		})
 	}
+}
 
-	// Same validations should produce same hash
-	issue3 := Issue{
-		Title:     "Test Issue",
-		Status:    StatusClosed,
-		Priority:  2,
-		IssueType: TypeTask,
-		ClosedAt:  &ts,
-		Validations: []Validation{
-			{
-				Validator: &EntityRef{Platform: "gastown", Org: "steveyegge", ID: "refinery"},
-				Outcome:   ValidationAccepted,
-				Timestamp: ts,
-			},
+func TestBondRefUnmarshalJSON(t *testing.T) {
+	tests := []struct {
+		name         string
+		input        string
+		wantSourceID string
+		wantBondType string
+		wantErr      bool
+	}{
+		{
+			name:         "current format with source_id",
+			input:        `{"source_id":"bd-src1","bond_type":"sequential"}`,
+			wantSourceID: "bd-src1",
+			wantBondType: "sequential",
+		},
+		{
+			name:         "legacy format with proto_id",
+			input:        `{"proto_id":"bd-old1","bond_type":"parallel"}`,
+			wantSourceID: "bd-old1",
+			wantBondType: "parallel",
+		},
+		{
+			name:         "both fields — source_id takes precedence",
+			input:        `{"source_id":"bd-new","proto_id":"bd-old","bond_type":"conditional"}`,
+			wantSourceID: "bd-new",
+			wantBondType: "conditional",
+		},
+		{
+			name:         "neither field present",
+			input:        `{"bond_type":"sequential"}`,
+			wantSourceID: "",
+			wantBondType: "sequential",
+		},
+		{
+			name:    "invalid JSON",
+			input:   `{not valid`,
+			wantErr: true,
 		},
 	}
 
-	hash3 := issue3.ComputeContentHash()
-	if hash2 != hash3 {
-		t.Error("Expected same hash for identical Validations")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var b BondRef
+			err := json.Unmarshal([]byte(tt.input), &b)
+			if tt.wantErr {
+				if err == nil {
+					t.Error("expected error, got nil")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if b.SourceID != tt.wantSourceID {
+				t.Errorf("SourceID = %q, want %q", b.SourceID, tt.wantSourceID)
+			}
+			if b.BondType != tt.wantBondType {
+				t.Errorf("BondType = %q, want %q", b.BondType, tt.wantBondType)
+			}
+		})
 	}
+}
 
-	// Test with score
-	score := float32(0.95)
-	issue4 := Issue{
+// validIssue returns a minimal issue that passes ValidateWithCustom, so
+// field-length tests below isolate the assignee/owner bound.
+func validIssue() Issue {
+	return Issue{
 		Title:     "Test Issue",
-		Status:    StatusClosed,
-		Priority:  2,
+		Status:    StatusOpen,
+		Priority:  1,
 		IssueType: TypeTask,
-		ClosedAt:  &ts,
-		Validations: []Validation{
-			{
-				Validator: &EntityRef{Platform: "gastown", Org: "steveyegge", ID: "refinery"},
-				Outcome:   ValidationAccepted,
-				Timestamp: ts,
-				Score:     &score,
-			},
+	}
+}
+
+// TestValidateFieldLength proves ValidateWithCustom bounds assignee and owner at
+// MaxFieldLen and that the bound is measured in runes, not bytes: a 255-rune
+// multibyte value (~510 bytes) fits the VARCHAR(255) column and passes, while a
+// 256-rune value is rejected with a typed ErrFieldTooLong.
+func TestValidateFieldLength(t *testing.T) {
+	// "é" (U+00E9) encodes as 2 bytes, so 255 of them is 255 runes / 510 bytes.
+	const multibyte = "é"
+
+	tests := []struct {
+		name    string
+		mutate  func(*Issue)
+		wantErr bool
+	}{
+		{
+			name:    "255-rune assignee passes",
+			mutate:  func(i *Issue) { i.Assignee = strings.Repeat("a", MaxFieldLen) },
+			wantErr: false,
+		},
+		{
+			name:    "256-rune assignee fails",
+			mutate:  func(i *Issue) { i.Assignee = strings.Repeat("a", MaxFieldLen+1) },
+			wantErr: true,
+		},
+		{
+			name:    "255-rune owner passes",
+			mutate:  func(i *Issue) { i.Owner = strings.Repeat("o", MaxFieldLen) },
+			wantErr: false,
+		},
+		{
+			name:    "256-rune owner fails",
+			mutate:  func(i *Issue) { i.Owner = strings.Repeat("o", MaxFieldLen+1) },
+			wantErr: true,
+		},
+		{
+			name:    "255-rune multibyte assignee passes (rune-count, not byte-count)",
+			mutate:  func(i *Issue) { i.Assignee = strings.Repeat(multibyte, MaxFieldLen) },
+			wantErr: false,
+		},
+		{
+			name:    "256-rune multibyte assignee fails",
+			mutate:  func(i *Issue) { i.Assignee = strings.Repeat(multibyte, MaxFieldLen+1) },
+			wantErr: true,
+		},
+		{
+			name:    "255-rune multibyte owner passes (rune-count, not byte-count)",
+			mutate:  func(i *Issue) { i.Owner = strings.Repeat(multibyte, MaxFieldLen) },
+			wantErr: false,
 		},
 	}
 
-	hash4 := issue4.ComputeContentHash()
-	if hash2 == hash4 {
-		t.Error("Expected different hash when Score is added")
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			issue := validIssue()
+			tt.mutate(&issue)
+			err := issue.ValidateWithCustom(nil, nil)
+			if tt.wantErr {
+				if !errors.Is(err, ErrFieldTooLong) {
+					t.Errorf("ValidateWithCustom() error = %v, want errors.Is(ErrFieldTooLong)", err)
+				}
+			} else if err != nil {
+				t.Errorf("ValidateWithCustom() error = %v, want nil", err)
+			}
+		})
+	}
+}
+
+// TestValidateForImportFieldLength proves the import path bounds assignee and
+// owner too, so a federated import can't smuggle in an over-length value that
+// the backend would otherwise reject with a raw "data too long" error.
+func TestValidateForImportFieldLength(t *testing.T) {
+	t.Run("256-rune assignee fails", func(t *testing.T) {
+		issue := validIssue()
+		issue.Assignee = strings.Repeat("a", MaxFieldLen+1)
+		if err := issue.ValidateForImport(nil); !errors.Is(err, ErrFieldTooLong) {
+			t.Errorf("ValidateForImport() error = %v, want errors.Is(ErrFieldTooLong)", err)
+		}
+	})
+	t.Run("256-rune owner fails", func(t *testing.T) {
+		issue := validIssue()
+		issue.Owner = strings.Repeat("o", MaxFieldLen+1)
+		if err := issue.ValidateForImport(nil); !errors.Is(err, ErrFieldTooLong) {
+			t.Errorf("ValidateForImport() error = %v, want errors.Is(ErrFieldTooLong)", err)
+		}
+	})
+	t.Run("255-rune multibyte assignee passes", func(t *testing.T) {
+		issue := validIssue()
+		issue.Assignee = strings.Repeat("é", MaxFieldLen)
+		if err := issue.ValidateForImport(nil); err != nil {
+			t.Errorf("ValidateForImport() error = %v, want nil", err)
+		}
+	})
+}
+
+// TestCheckFieldLen unit-tests the helper directly, including the rune vs byte
+// boundary and the wrapped, typed error it returns.
+func TestCheckFieldLen(t *testing.T) {
+	if err := CheckFieldLen("assignee", strings.Repeat("a", MaxFieldLen)); err != nil {
+		t.Errorf("CheckFieldLen(255 runes) = %v, want nil", err)
+	}
+	if err := CheckFieldLen("assignee", strings.Repeat("é", MaxFieldLen)); err != nil {
+		t.Errorf("CheckFieldLen(255 multibyte runes / %d bytes) = %v, want nil",
+			len(strings.Repeat("é", MaxFieldLen)), err)
+	}
+	err := CheckFieldLen("assignee", strings.Repeat("é", MaxFieldLen+1))
+	if !errors.Is(err, ErrFieldTooLong) {
+		t.Errorf("CheckFieldLen(256 runes) = %v, want errors.Is(ErrFieldTooLong)", err)
 	}
 }

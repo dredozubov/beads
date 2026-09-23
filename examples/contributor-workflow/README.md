@@ -58,7 +58,7 @@ When you create issues as a contributor:
 bd create "Fix authentication bug" -p 1
 ```
 
-Beads automatically routes this to your planning repo (`~/.beads-planning/.beads/issues.jsonl`), not the current repo.
+Beads automatically routes this to your planning repo (`~/.beads-planning/.beads/`), not the current repo.
 
 ### Viewing Issues
 
@@ -223,6 +223,6 @@ bd config set routing.default .  # Default to current repo
 
 ## See Also
 
-- [Multi-Repo Migration Guide](../../docs/MULTI_REPO_MIGRATION.md)
+- [Multi-Repo Migration Guide](../../docs/multi-agent/multi-repo-migration.md)
 - [Team Workflow Example](../team-workflow/)
 - [Protected Branch Setup](../protected-branch/)

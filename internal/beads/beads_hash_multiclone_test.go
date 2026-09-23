@@ -16,48 +16,9 @@ import (
 	"github.com/steveyegge/beads/internal/testutil"
 )
 
-var testBDBinary string
-
-func TestMain(m *testing.M) {
-	// Build bd binary once for all tests
-	binName := "bd"
-	if runtime.GOOS == "windows" {
-		binName = "bd.exe"
-	}
-
-	tmpDir, err := os.MkdirTemp("", "bd-test-bin-*")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create temp dir for bd binary: %v\n", err)
-		os.Exit(1)
-	}
-	defer os.RemoveAll(tmpDir)
-
-	// Find module root directory (where go.mod lives)
-	modRootCmd := exec.Command("go", "list", "-m", "-f", "{{.Dir}}")
-	modRootOut, err := modRootCmd.Output()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to find module root: %v\n", err)
-		os.Exit(1)
-	}
-	modRoot := strings.TrimSpace(string(modRootOut))
-
-	testBDBinary = filepath.Join(tmpDir, binName)
-	cmd := exec.Command("go", "build", "-o", testBDBinary, "./cmd/bd")
-	cmd.Dir = modRoot // Build from module root where ./cmd/bd exists
-	if out, err := cmd.CombinedOutput(); err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to build bd binary: %v\n%s\n", err, out)
-		os.Exit(1)
-	}
-
-	// Optimize git for tests
-	os.Setenv("GIT_CONFIG_NOSYSTEM", "1")
-
-	os.Exit(m.Run())
-}
-
 // getBDPath returns the test bd binary path
 func getBDPath() string {
-	if testBDBinary != "" {
+	if testBDBinary := os.Getenv("BEADS_TEST_BD_BINARY"); testBDBinary != "" {
 		return testBDBinary
 	}
 	// Fallback for non-TestMain runs
@@ -76,20 +37,29 @@ func getBDCommand() string {
 	return "./bd"
 }
 
-// TestHashIDs_MultiCloneConverge verifies that hash-based IDs work correctly
-// across multiple clones creating different issues. With hash IDs, each unique
-// issue gets a unique ID, so no collision resolution is needed.
-func TestHashIDs_MultiCloneConverge(t *testing.T) {
-	if testing.Short() {
-		t.Skip("slow git e2e test")
-	}
-	t.Parallel()
-	tmpDir := testutil.TempDirInMemory(t)
+func hasDoltTestPort() bool {
+	return os.Getenv("BEADS_DOLT_PORT") != ""
+}
 
+func requireHashIDIntegration(t *testing.T) string {
+	t.Helper()
+	if !hasDoltTestPort() {
+		t.Skip("skipping: Dolt test container not available")
+	}
 	bdPath := getBDPath()
 	if _, err := os.Stat(bdPath); err != nil {
 		t.Fatalf("bd binary not found at %s", bdPath)
 	}
+	return bdPath
+}
+
+// TestHashIDs_MultiCloneConverge verifies that hash-based IDs work correctly
+// across multiple clones creating different issues. With hash IDs, each unique
+// issue gets a unique ID, so no collision resolution is needed.
+func TestHashIDs_MultiCloneConverge(t *testing.T) {
+	bdPath := requireHashIDIntegration(t)
+	t.Parallel()
+	tmpDir := testutil.TempDirInMemory(t)
 
 	// Setup remote and 3 clones
 	remoteDir := setupBareRepo(t, tmpDir)
@@ -104,7 +74,7 @@ func TestHashIDs_MultiCloneConverge(t *testing.T) {
 
 	// Sync all clones once (hash IDs prevent collisions, don't need multiple rounds)
 	for _, clone := range []string{cloneA, cloneB, cloneC} {
-		runCmdOutputWithEnvAllowError(t, clone, map[string]string{"BEADS_NO_DAEMON": "1"}, true, bdPath, "sync")
+		runCmdOutputWithEnvAllowError(t, clone, map[string]string{}, true, bdPath, "sync")
 	}
 
 	// Verify all clones have all 3 issues
@@ -133,16 +103,9 @@ func TestHashIDs_MultiCloneConverge(t *testing.T) {
 // TestHashIDs_IdenticalContentDedup verifies that when two clones create
 // identical issues, they get the same hash ID and deduplicate correctly.
 func TestHashIDs_IdenticalContentDedup(t *testing.T) {
-	if testing.Short() {
-		t.Skip("slow git e2e test")
-	}
+	bdPath := requireHashIDIntegration(t)
 	t.Parallel()
 	tmpDir := testutil.TempDirInMemory(t)
-
-	bdPath := getBDPath()
-	if _, err := os.Stat(bdPath); err != nil {
-		t.Fatalf("bd binary not found at %s", bdPath)
-	}
 
 	// Setup remote and 2 clones
 	remoteDir := setupBareRepo(t, tmpDir)
@@ -155,7 +118,7 @@ func TestHashIDs_IdenticalContentDedup(t *testing.T) {
 
 	// Sync both clones once (hash IDs handle dedup automatically)
 	for _, clone := range []string{cloneA, cloneB} {
-		runCmdOutputWithEnvAllowError(t, clone, map[string]string{"BEADS_NO_DAEMON": "1"}, true, bdPath, "sync")
+		runCmdOutputWithEnvAllowError(t, clone, map[string]string{}, true, bdPath, "sync")
 	}
 
 	// Verify both clones have exactly 1 issue (deduplication worked)
@@ -222,13 +185,12 @@ func setupClone(t *testing.T, tmpDir, remoteDir, name, bdPath string) string {
 
 func createIssueInClone(t *testing.T, cloneDir, title string) {
 	t.Helper()
-	runCmdWithEnv(t, cloneDir, map[string]string{"BEADS_NO_DAEMON": "1"}, getBDCommand(), "create", title, "-t", "task", "-p", "1", "--json")
+	runCmdWithEnv(t, cloneDir, map[string]string{}, getBDCommand(), "create", title, "-t", "task", "-p", "1", "--json")
 }
 
 func getTitlesFromClone(t *testing.T, cloneDir string) map[string]bool {
 	t.Helper()
 	listJSON := runCmdOutputWithEnv(t, cloneDir, map[string]string{
-		"BEADS_NO_DAEMON":   "1",
 		"BD_NO_AUTO_IMPORT": "1",
 	}, getBDCommand(), "list", "--json")
 
@@ -282,12 +244,12 @@ func installGitHooks(t *testing.T, repoDir string) {
 	bdCmd := strings.ReplaceAll(getBDCommand(), "\\", "/")
 
 	preCommit := fmt.Sprintf(`#!/bin/sh
-%s --no-daemon export -o .beads/issues.jsonl >/dev/null 2>&1 || true
+%s export -o .beads/issues.jsonl >/dev/null 2>&1 || true
 git add .beads/issues.jsonl >/dev/null 2>&1 || true
 exit 0
 `, bdCmd)
 	postMerge := fmt.Sprintf(`#!/bin/sh
-%s --no-daemon import -i .beads/issues.jsonl >/dev/null 2>&1 || true
+%s import -i .beads/issues.jsonl >/dev/null 2>&1 || true
 exit 0
 `, bdCmd)
 	os.WriteFile(filepath.Join(hooksDir, "pre-commit"), []byte(preCommit), 0755)

@@ -6,79 +6,147 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-
-	"github.com/steveyegge/beads/cmd/bd/doctor/fix"
-	"github.com/steveyegge/beads/internal/syncbranch"
 )
 
 // GitignoreTemplate is the canonical .beads/.gitignore content
-const GitignoreTemplate = `# SQLite databases
-*.db
-*.db?*
-*.db-journal
-*.db-wal
-*.db-shm
+const GitignoreTemplate = `# Dolt database (managed by Dolt, not git)
+dolt/
+embeddeddolt/
+proxieddb/
 
-# Daemon runtime files
-daemon.lock
-daemon.log
-daemon.pid
+# Runtime files
 bd.sock
+bd.sock.startlock
 sync-state.json
 last-touched
+.exclusive-lock
+
+# Daemon runtime (lock, log, pid)
+daemon.*
+
+# Push state (runtime, per-machine)
+push-state.json
+
+# Lock files (various runtime locks)
+*.lock
+
+# Credential key (encryption key for federation peer auth — never commit)
+.beads-credential-key
 
 # Local version tracking (prevents upgrade notification spam after git ops)
 .local_version
 
-# Legacy database files
-db.sqlite
-bd.db
+proxied_server_client_info.json
 
 # Worktree redirect file (contains relative path to main repo's .beads/)
 # Must not be committed as paths would be wrong in other clones
 redirect
 
-# Merge artifacts (temporary files from 3-way merge)
-beads.base.jsonl
-beads.base.meta.json
-beads.left.jsonl
-beads.left.meta.json
-beads.right.jsonl
-beads.right.meta.json
-
 # Sync state (local-only, per-machine)
 # These files are machine-specific and should not be shared across clones
 .sync.lock
-sync_base.jsonl
 
-# NOTE: Do NOT add negation patterns (e.g., !issues.jsonl) here.
-# They would override fork protection in .git/info/exclude, allowing
-# contributors to accidentally commit upstream issue databases.
-# The JSONL files (issues.jsonl, interactions.jsonl) and config files
-# are tracked by git by default since no pattern above ignores them.
+# Workspace operation gate (internal/workspacegate): physical-root gate
+# files live beside the guarded root inside .beads (e.g. dolt.gate.lock)
+*.gate.lock*
+export-state/
+export-state.json
+last_pull
+
+# Ephemeral store (SQLite - wisps/molecules, intentionally not versioned)
+ephemeral.sqlite3
+ephemeral.sqlite3-journal
+ephemeral.sqlite3-wal
+ephemeral.sqlite3-shm
+
+# Dolt server management (auto-started by bd)
+dolt-server.pid
+dolt-server.log
+dolt-server.lock
+dolt-server.port
+dolt-server.activity
+dolt-server-config.yaml
+
+# Debug-mode pprof artifacts (written when dolt.debug: true in config.yaml)
+dolt-pprof/
+
+# Corrupt backup directories (created by bd doctor --fix recovery)
+*.corrupt.backup/
+
+# Backup data (auto-exported JSONL, local-only)
+backup/
+
+# Per-project environment file (Dolt connection config, GH#2520)
+.env
+
+# Legacy files (from pre-Dolt versions)
+*.db
+*.db?*
+*.db-journal
+*.db-wal
+*.db-shm
+db.sqlite
+bd.db
+# NOTE: Do NOT add negation patterns here.
+# They would override fork protection in .git/info/exclude.
+# Config files (metadata.json, config.yaml) are tracked by git by default
+# since no pattern above ignores them.
 `
+
+// ProjectGitignorePatterns are patterns that should be in the project-root .gitignore
+// to prevent accidentally committing Dolt database files and credential keys.
+var ProjectGitignorePatterns = []string{
+	".dolt/",
+	"*.db",
+	".beads-credential-key",
+	".beads/proxieddb/",
+	// Workspace-gate artifacts (internal/workspacegate): the workspace
+	// gate file sits BESIDE .beads in the project root, so .beads/
+	// patterns cannot cover it.
+	"*.gate.lock*",
+}
+
+// ProjectGitignoreHeader is the section header added to the project .gitignore
+const ProjectGitignoreHeader = "# Beads / Dolt files (added by bd init)"
 
 // requiredPatterns are patterns that MUST be in .beads/.gitignore
 var requiredPatterns = []string{
-	"beads.base.jsonl",
-	"beads.left.jsonl",
-	"beads.right.jsonl",
-	"beads.base.meta.json",
-	"beads.left.meta.json",
-	"beads.right.meta.json",
 	"*.db?*",
+	".env",
 	"redirect",
 	"last-touched",
+	"bd.sock.startlock",
 	".sync.lock",
-	"sync_base.jsonl",
+	"*.gate.lock*",
+	"export-state/",
+	"export-state.json",
+	"last_pull",
+	"dolt/",
+	"embeddeddolt/",
+	"proxieddb/",
+	"ephemeral.sqlite3",
+	"dolt-server.pid",
+	"dolt-server.log",
+	"dolt-server.lock",
+	"dolt-server.port",
+	"dolt-server.activity",
+	"dolt-server-config.yaml",
+	"daemon.*",
+	"*.lock",
+	"*.corrupt.backup/",
+	".beads-credential-key",
+	"proxied_server_client_info.json",
+	".local_version",
+	"backup/",
 }
 
-// CheckGitignore checks if .beads/.gitignore is up to date
-func CheckGitignore() DoctorCheck {
-	gitignorePath := filepath.Join(".beads", ".gitignore")
-	
+// CheckGitignore checks if .beads/.gitignore is up to date.
+// repoPath is the project root directory.
+func CheckGitignore(repoPath string) DoctorCheck {
+	gitignorePath := filepath.Join(ResolveBeadsDirForRepo(repoPath), ".gitignore")
+
 	// Check if file exists
-	content, err := os.ReadFile(gitignorePath) // #nosec G304 -- path is hardcoded
+	content, err := os.ReadFile(gitignorePath) // #nosec G304 -- path is constructed from known parts
 	if err != nil {
 		return DoctorCheck{
 			Name:    "Gitignore",
@@ -90,18 +158,12 @@ func CheckGitignore() DoctorCheck {
 
 	// Check for required patterns
 	contentStr := string(content)
-	var missing []string
-	for _, pattern := range requiredPatterns {
-		if !strings.Contains(contentStr, pattern) {
-			missing = append(missing, pattern)
-		}
-	}
-
+	missing := missingGitignorePatterns(contentStr)
 	if len(missing) > 0 {
 		return DoctorCheck{
 			Name:    "Gitignore",
 			Status:  "warning",
-			Message: "Outdated .beads/.gitignore (missing merge artifact patterns)",
+			Message: "Outdated .beads/.gitignore (missing required patterns)",
 			Detail:  "Missing: " + strings.Join(missing, ", "),
 			Fix:     "Run: bd doctor --fix or bd init (safe to re-run)",
 		}
@@ -114,10 +176,80 @@ func CheckGitignore() DoctorCheck {
 	}
 }
 
-// FixGitignore updates .beads/.gitignore to the current template
-func FixGitignore() error {
-	gitignorePath := filepath.Join(".beads", ".gitignore")
+// EnsureGitignoreForBeadsDir writes the canonical .beads/.gitignore when it is
+// missing or outdated. If the file does not exist, it writes the full template.
+// If it exists but is outdated, it safely appends missing required patterns so
+// local additions are preserved.
+func EnsureGitignoreForBeadsDir(beadsDir string) error {
+	gitignorePath := filepath.Join(beadsDir, ".gitignore")
 
+	content, err := os.ReadFile(gitignorePath) // #nosec G304 -- caller supplies the active .beads dir
+	if os.IsNotExist(err) {
+		return writeGitignoreTemplate(gitignorePath)
+	}
+	if err != nil {
+		return fmt.Errorf("read .beads/.gitignore: %w", err)
+	}
+
+	missing := missingGitignorePatterns(string(content))
+	if len(missing) == 0 {
+		return nil
+	}
+
+	if info, err := os.Stat(gitignorePath); err == nil {
+		if info.Mode().Perm()&0200 == 0 {
+			if err := os.Chmod(gitignorePath, 0600); err != nil {
+				return fmt.Errorf("chmod .beads/.gitignore: %w", err)
+			}
+		}
+	}
+
+	existingContent := string(content)
+	newContent := existingContent
+	if len(newContent) > 0 && !strings.HasSuffix(newContent, "\n") {
+		newContent += "\n"
+	}
+
+	newContent += "\n# Added by bd (missing required patterns)\n"
+	for _, pattern := range missing {
+		newContent += pattern + "\n"
+	}
+
+	if err := os.WriteFile(gitignorePath, []byte(newContent), 0600); err != nil {
+		return fmt.Errorf("ensure .beads/.gitignore: %w", err)
+	}
+
+	// Tighten permissions on pre-existing files: os.WriteFile's mode argument
+	// only applies at creation, and the file may predate the 0600 policy.
+	if err := os.Chmod(gitignorePath, 0600); err != nil {
+		return fmt.Errorf("chmod .beads/.gitignore: %w", err)
+	}
+
+	return nil
+}
+
+// FixGitignore brings .beads/.gitignore up to date: the full template when
+// the file is missing, append-only for missing required patterns otherwise.
+// It must never rewrite an existing file wholesale — local rules (e.g.
+// keep-exports-off-master negations) live in this file too, and the old
+// full-template rewrite destroyed them (bd-kaaz3).
+// If a redirect exists, it writes to the redirect target's .gitignore instead.
+// repoPath is the project root directory.
+func FixGitignore(repoPath string) error {
+	return EnsureGitignoreForBeadsDir(ResolveBeadsDirForRepo(repoPath))
+}
+
+func missingGitignorePatterns(content string) []string {
+	var missing []string
+	for _, pattern := range requiredPatterns {
+		if !containsGitignorePattern(content, pattern) {
+			missing = append(missing, pattern)
+		}
+	}
+	return missing
+}
+
+func writeGitignoreTemplate(gitignorePath string) error {
 	// If file exists and is read-only, fix permissions first
 	if info, err := os.Stat(gitignorePath); err == nil {
 		if info.Mode().Perm()&0200 == 0 { // No write permission for owner
@@ -140,68 +272,12 @@ func FixGitignore() error {
 	return nil
 }
 
-// CheckIssuesTracking verifies that issues.jsonl is tracked by git.
-// This catches cases where global gitignore patterns (e.g., *.jsonl) would
-// cause issues.jsonl to be ignored, breaking bd sync.
-// In sync-branch mode, the file may be intentionally ignored in working branches (GH#858).
-func CheckIssuesTracking() DoctorCheck {
-	issuesPath := filepath.Join(".beads", "issues.jsonl")
-
-	// First check if the file exists
-	if _, err := os.Stat(issuesPath); os.IsNotExist(err) {
-		// File doesn't exist yet - not an error, bd init may not have been run
-		return DoctorCheck{
-			Name:   "Issues Tracking",
-			Status: "ok",
-			Message: "No issues.jsonl yet (will be created on first issue)",
-		}
-	}
-
-	// In sync-branch mode, JSONL files may be intentionally ignored in working branches.
-	// They are tracked only in the dedicated sync branch.
-	if branch := syncbranch.GetFromYAML(); branch != "" {
-		return DoctorCheck{
-			Name:    "Issues Tracking",
-			Status:  StatusOK,
-			Message: "N/A (sync-branch mode)",
-			Detail:  fmt.Sprintf("JSONL files tracked in '%s' branch only", branch),
-		}
-	}
-
-	// Check if git considers this file ignored
-	// git check-ignore exits 0 if ignored, 1 if not ignored, 128 if error
-	cmd := exec.Command("git", "check-ignore", "-q", issuesPath) // #nosec G204 - args are hardcoded paths
-	err := cmd.Run()
-
-	if err == nil {
-		// Exit code 0 means the file IS ignored - this is bad
-		// Get details about what's ignoring it
-		detailCmd := exec.Command("git", "check-ignore", "-v", issuesPath) // #nosec G204 - args are hardcoded paths
-		output, _ := detailCmd.Output()
-		detail := strings.TrimSpace(string(output))
-
-		return DoctorCheck{
-			Name:    "Issues Tracking",
-			Status:  "warning",
-			Message: "issues.jsonl is ignored by git (bd sync will fail)",
-			Detail:  detail,
-			Fix:     "Check global gitignore: git config --global core.excludesfile",
-		}
-	}
-
-	// Exit code 1 means not ignored (good), any other error we ignore
-	return DoctorCheck{
-		Name:    "Issues Tracking",
-		Status:  "ok",
-		Message: "issues.jsonl is tracked by git",
-	}
-}
-
 // CheckRedirectNotTracked verifies that .beads/redirect is NOT tracked by git.
 // Redirect files contain relative paths that only work in the original worktree.
 // If committed, they cause warnings in other clones where the path is invalid.
-func CheckRedirectNotTracked() DoctorCheck {
-	redirectPath := filepath.Join(".beads", "redirect")
+// repoPath is the project root directory.
+func CheckRedirectNotTracked(repoPath string) DoctorCheck {
+	redirectPath := filepath.Join(repoPath, ".beads", "redirect")
 
 	// First check if the file exists
 	if _, err := os.Stat(redirectPath); os.IsNotExist(err) {
@@ -246,9 +322,10 @@ func CheckRedirectNotTracked() DoctorCheck {
 	}
 }
 
-// FixRedirectTracking untracks the .beads/redirect file from git
-func FixRedirectTracking() error {
-	redirectPath := filepath.Join(".beads", "redirect")
+// FixRedirectTracking untracks the .beads/redirect file from git.
+// repoPath is the project root directory.
+func FixRedirectTracking(repoPath string) error {
+	redirectPath := filepath.Join(repoPath, ".beads", "redirect")
 
 	// Check if file is actually tracked first
 	cmd := exec.Command("git", "ls-files", redirectPath) // #nosec G204 - args are hardcoded paths
@@ -271,10 +348,52 @@ func FixRedirectTracking() error {
 	return nil
 }
 
+// parseRedirectTarget extracts the first non-comment, non-empty redirect target.
+// It also strips a UTF-8 BOM if present.
+func parseRedirectTarget(data []byte) string {
+	content := strings.TrimSpace(string(data))
+	if content == "" {
+		return ""
+	}
+
+	lines := strings.Split(content, "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		line = strings.TrimPrefix(line, "\ufeff")
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		return line
+	}
+
+	return ""
+}
+
+// resolveRedirectTarget resolves a redirect target relative to the .beads parent.
+// Absolute targets are cleaned and returned as-is.
+func resolveRedirectTarget(beadsDir string, target string) string {
+	if target == "" {
+		return ""
+	}
+
+	resolvedTarget := target
+	if !filepath.IsAbs(target) {
+		projectRoot := filepath.Dir(beadsDir)
+		resolvedTarget = filepath.Join(projectRoot, target)
+	}
+	resolvedTarget = filepath.Clean(resolvedTarget)
+	if absPath, err := filepath.Abs(resolvedTarget); err == nil {
+		resolvedTarget = absPath
+	}
+
+	return resolvedTarget
+}
+
 // CheckRedirectTargetValid verifies that the redirect target exists and has a valid beads database.
 // This catches cases where the redirect points to a non-existent directory or one without a database.
-func CheckRedirectTargetValid() DoctorCheck {
-	redirectPath := filepath.Join(".beads", "redirect")
+// repoPath is the project root directory.
+func CheckRedirectTargetValid(repoPath string) DoctorCheck {
+	redirectPath := filepath.Join(repoPath, ".beads", "redirect")
 
 	// Check if redirect file exists
 	data, err := os.ReadFile(redirectPath) // #nosec G304 - path is hardcoded
@@ -295,7 +414,7 @@ func CheckRedirectTargetValid() DoctorCheck {
 	}
 
 	// Parse redirect target
-	target := strings.TrimSpace(string(data))
+	target := parseRedirectTarget(data)
 	if target == "" {
 		return DoctorCheck{
 			Name:    "Redirect Target Valid",
@@ -305,17 +424,8 @@ func CheckRedirectTargetValid() DoctorCheck {
 		}
 	}
 
-	// Resolve the redirect path relative to the parent of .beads
-	cwd, err := os.Getwd()
-	if err != nil {
-		return DoctorCheck{
-			Name:    "Redirect Target Valid",
-			Status:  StatusWarning,
-			Message: "Cannot determine current directory",
-		}
-	}
-
-	resolvedTarget := filepath.Clean(filepath.Join(cwd, target))
+	beadsDir := filepath.Dir(redirectPath)
+	resolvedTarget := resolveRedirectTarget(beadsDir, target)
 
 	// Check if target directory exists
 	info, err := os.Stat(resolvedTarget)
@@ -346,16 +456,38 @@ func CheckRedirectTargetValid() DoctorCheck {
 	}
 
 	// Check for valid beads database in target
+	// First check for Dolt backend via metadata.json — Dolt server mode has no local .db file
+	metadataPath := filepath.Join(resolvedTarget, "metadata.json")
+	metadataData, metaErr := os.ReadFile(metadataPath) // #nosec G304 -- constructed from known path
+	if metaErr == nil && strings.Contains(string(metadataData), `"backend"`) &&
+		strings.Contains(string(metadataData), `"dolt"`) {
+		return DoctorCheck{
+			Name:    "Redirect Target Valid",
+			Status:  StatusOK,
+			Message: fmt.Sprintf("Redirect target valid (dolt backend): %s", resolvedTarget),
+		}
+	}
+
+	// Legacy: check for Dolt database directory or SQLite .db file
+	doltDir := filepath.Join(resolvedTarget, "dolt")
+	if info, statErr := os.Stat(doltDir); statErr == nil && info.IsDir() {
+		return DoctorCheck{
+			Name:    "Redirect Target Valid",
+			Status:  StatusOK,
+			Message: fmt.Sprintf("Redirect target valid (dolt directory): %s", resolvedTarget),
+		}
+	}
+
 	dbPath := filepath.Join(resolvedTarget, "beads.db")
 	if _, err := os.Stat(dbPath); os.IsNotExist(err) {
-		// Also check for any .db file
+		// Also check for any .db file (legacy SQLite)
 		matches, _ := filepath.Glob(filepath.Join(resolvedTarget, "*.db"))
 		if len(matches) == 0 {
 			return DoctorCheck{
 				Name:    "Redirect Target Valid",
 				Status:  StatusWarning,
 				Message: "Redirect target has no beads database",
-				Detail:  fmt.Sprintf("Target: %s", resolvedTarget),
+				Detail:  fmt.Sprintf("Target: %s (no dolt directory or .db file found)", resolvedTarget),
 				Fix:     "Run 'bd init' in the target directory or check redirect path",
 			}
 		}
@@ -364,14 +496,15 @@ func CheckRedirectTargetValid() DoctorCheck {
 	return DoctorCheck{
 		Name:    "Redirect Target Valid",
 		Status:  StatusOK,
-		Message: fmt.Sprintf("Redirect target valid: %s", resolvedTarget),
+		Message: fmt.Sprintf("Redirect target valid (legacy): %s", resolvedTarget),
 	}
 }
 
 // CheckRedirectTargetSyncWorktree verifies that the redirect target has a working beads-sync worktree.
 // This is important for repos using sync-branch mode with redirects.
-func CheckRedirectTargetSyncWorktree() DoctorCheck {
-	redirectPath := filepath.Join(".beads", "redirect")
+// repoPath is the project root directory.
+func CheckRedirectTargetSyncWorktree(repoPath string) DoctorCheck {
+	redirectPath := filepath.Join(repoPath, ".beads", "redirect")
 
 	// Check if redirect file exists
 	data, err := os.ReadFile(redirectPath) // #nosec G304 - path is hardcoded
@@ -390,7 +523,7 @@ func CheckRedirectTargetSyncWorktree() DoctorCheck {
 		}
 	}
 
-	target := strings.TrimSpace(string(data))
+	target := parseRedirectTarget(data)
 	if target == "" {
 		return DoctorCheck{
 			Name:    "Redirect Target Sync",
@@ -400,16 +533,8 @@ func CheckRedirectTargetSyncWorktree() DoctorCheck {
 	}
 
 	// Resolve the target path
-	cwd, err := os.Getwd()
-	if err != nil {
-		return DoctorCheck{
-			Name:    "Redirect Target Sync",
-			Status:  StatusOK,
-			Message: "N/A (cannot determine cwd)",
-		}
-	}
-
-	resolvedTarget := filepath.Clean(filepath.Join(cwd, target))
+	beadsDir := filepath.Dir(redirectPath)
+	resolvedTarget := resolveRedirectTarget(beadsDir, target)
 
 	// Check if the target has a sync-branch configured in config.yaml
 	configPath := filepath.Join(resolvedTarget, "config.yaml")
@@ -444,7 +569,7 @@ func CheckRedirectTargetSyncWorktree() DoctorCheck {
 			Status:  StatusWarning,
 			Message: "Redirect target missing beads-sync worktree",
 			Detail:  fmt.Sprintf("Expected worktree at: %s", worktreePath),
-			Fix:     fmt.Sprintf("Run 'bd sync' in %s to create the worktree", targetRepoRoot),
+			Fix:     fmt.Sprintf("Run 'bd init' in %s to set up beads", targetRepoRoot),
 		}
 	}
 
@@ -458,8 +583,9 @@ func CheckRedirectTargetSyncWorktree() DoctorCheck {
 // CheckNoVestigialSyncWorktrees detects beads-sync worktrees in redirected repos that are unused.
 // When a repo uses .beads/redirect, it doesn't need its own beads-sync worktree since
 // sync operations happen in the redirect target. These vestigial worktrees waste space.
-func CheckNoVestigialSyncWorktrees() DoctorCheck {
-	redirectPath := filepath.Join(".beads", "redirect")
+// repoPath is the project root directory.
+func CheckNoVestigialSyncWorktrees(repoPath string) DoctorCheck {
+	redirectPath := filepath.Join(repoPath, ".beads", "redirect")
 
 	// Check if redirect file exists
 	if _, err := os.Stat(redirectPath); os.IsNotExist(err) {
@@ -471,18 +597,8 @@ func CheckNoVestigialSyncWorktrees() DoctorCheck {
 		}
 	}
 
-	// Check for local .beads-sync worktree
-	cwd, err := os.Getwd()
-	if err != nil {
-		return DoctorCheck{
-			Name:    "Vestigial Sync Worktrees",
-			Status:  StatusOK,
-			Message: "N/A (cannot determine cwd)",
-		}
-	}
-
-	// Walk up to find git root
-	gitRoot := cwd
+	// Use repoPath to find git root instead of walking up from cwd
+	gitRoot := repoPath
 	for {
 		if _, err := os.Stat(filepath.Join(gitRoot, ".git")); err == nil {
 			break
@@ -523,8 +639,9 @@ func CheckNoVestigialSyncWorktrees() DoctorCheck {
 // CheckLastTouchedNotTracked verifies that .beads/last-touched is NOT tracked by git.
 // The last-touched file is local runtime state that should never be committed.
 // If committed, it causes spurious diffs in other clones.
-func CheckLastTouchedNotTracked() DoctorCheck {
-	lastTouchedPath := filepath.Join(".beads", "last-touched")
+// repoPath is the project root directory.
+func CheckLastTouchedNotTracked(repoPath string) DoctorCheck {
+	lastTouchedPath := filepath.Join(repoPath, ".beads", "last-touched")
 
 	// First check if the file exists
 	if _, err := os.Stat(lastTouchedPath); os.IsNotExist(err) {
@@ -569,9 +686,10 @@ func CheckLastTouchedNotTracked() DoctorCheck {
 	}
 }
 
-// FixLastTouchedTracking untracks the .beads/last-touched file from git
-func FixLastTouchedTracking() error {
-	lastTouchedPath := filepath.Join(".beads", "last-touched")
+// FixLastTouchedTracking untracks the .beads/last-touched file from git.
+// repoPath is the project root directory.
+func FixLastTouchedTracking(repoPath string) error {
+	lastTouchedPath := filepath.Join(repoPath, ".beads", "last-touched")
 
 	// Check if file is actually tracked first
 	cmd := exec.Command("git", "ls-files", lastTouchedPath) // #nosec G204 - args are hardcoded paths
@@ -594,92 +712,113 @@ func FixLastTouchedTracking() error {
 	return nil
 }
 
-// CheckSyncBranchGitignore checks if git index flags are set on issues.jsonl when sync.branch is configured.
-// Without these flags, the file appears modified in git status even though changes go to the sync branch.
-// GH#797, GH#801, GH#870.
-func CheckSyncBranchGitignore() DoctorCheck {
-	// Only relevant when sync.branch is configured
-	branch := syncbranch.GetFromYAML()
-	if branch == "" {
-		return DoctorCheck{
-			Name:    "Sync Branch Gitignore",
-			Status:  StatusOK,
-			Message: "N/A (sync.branch not configured)",
-		}
-	}
+// CheckProjectGitignore checks if the project-root .gitignore contains patterns
+// to prevent accidentally committing Dolt database files and credential keys.
+// repoPath is the project root directory.
+func CheckProjectGitignore(repoPath string) DoctorCheck {
+	gitignorePath := filepath.Join(repoPath, ".gitignore")
 
-	issuesPath := filepath.Join(".beads", "issues.jsonl")
-
-	// Check if file exists
-	if _, err := os.Stat(issuesPath); os.IsNotExist(err) {
-		return DoctorCheck{
-			Name:    "Sync Branch Gitignore",
-			Status:  StatusOK,
-			Message: "No issues.jsonl yet",
-		}
-	}
-
-	// Check if file is tracked by git
-	cmd := exec.Command("git", "ls-files", "--error-unmatch", issuesPath) // #nosec G204 - args are hardcoded paths
-	if err := cmd.Run(); err != nil {
-		// File is not tracked - check if it's excluded
-		return DoctorCheck{
-			Name:    "Sync Branch Gitignore",
-			Status:  StatusOK,
-			Message: "issues.jsonl is not tracked (via .gitignore or exclude)",
-		}
-	}
-
-	// File is tracked - check for git index flags
-	cwd, err := os.Getwd()
+	content, err := os.ReadFile(gitignorePath) // #nosec G304 -- path is hardcoded
 	if err != nil {
+		if os.IsNotExist(err) {
+			return DoctorCheck{
+				Name:    "Project Gitignore",
+				Status:  StatusWarning,
+				Message: "No project .gitignore found — Dolt/credential files may be committed accidentally",
+				Fix:     "Run: bd init (safe to re-run) or bd doctor --fix",
+			}
+		}
 		return DoctorCheck{
-			Name:    "Sync Branch Gitignore",
+			Name:    "Project Gitignore",
 			Status:  StatusWarning,
-			Message: "Cannot determine current directory",
+			Message: fmt.Sprintf("Cannot read project .gitignore: %v", err),
 		}
 	}
 
-	hasAnyFlag, _, err := fix.HasSyncBranchGitignoreFlags(cwd)
-	if err != nil {
+	contentStr := string(content)
+	var missing []string
+	for _, pattern := range ProjectGitignorePatterns {
+		if !containsGitignorePattern(contentStr, pattern) {
+			missing = append(missing, pattern)
+		}
+	}
+
+	if len(missing) > 0 {
 		return DoctorCheck{
-			Name:    "Sync Branch Gitignore",
+			Name:    "Project Gitignore",
 			Status:  StatusWarning,
-			Message: "Cannot check git index flags",
-			Detail:  err.Error(),
+			Message: "Project .gitignore missing required exclusion patterns",
+			Detail:  "Missing: " + strings.Join(missing, ", "),
+			Fix:     "Run: bd doctor --fix or bd init (safe to re-run)",
 		}
 	}
 
-	if hasAnyFlag {
-		return DoctorCheck{
-			Name:    "Sync Branch Gitignore",
-			Status:  StatusOK,
-			Message: "Git index flags set (issues.jsonl hidden from git status)",
-		}
-	}
-
-	// No flags set - this is the problem case
 	return DoctorCheck{
-		Name:    "Sync Branch Gitignore",
-		Status:  StatusWarning,
-		Message: "issues.jsonl shows as modified (missing git index flags)",
-		Detail:  fmt.Sprintf("sync.branch='%s' configured but issues.jsonl appears in git status", branch),
-		Fix:     "Run 'bd doctor --fix' or 'bd sync' to set git index flags",
+		Name:    "Project Gitignore",
+		Status:  StatusOK,
+		Message: "Dolt and credential files excluded",
 	}
 }
 
-// FixSyncBranchGitignore sets git index flags on issues.jsonl when sync.branch is configured.
-func FixSyncBranchGitignore() error {
-	// Only relevant when sync.branch is configured
-	branch := syncbranch.GetFromYAML()
-	if branch == "" {
-		return nil // Not in sync-branch mode, nothing to do
+// EnsureProjectGitignore adds .dolt/, *.db, and .beads-credential-key patterns
+// to the project-root .gitignore if they are not already present. Creates the
+// file if it doesn't exist. This prevents users from accidentally committing
+// Dolt database files or the credential encryption key.
+// repoPath is the project root directory.
+func EnsureProjectGitignore(repoPath string) error {
+	gitignorePath := filepath.Join(repoPath, ".gitignore")
+
+	var existingContent string
+	// #nosec G304 -- path is hardcoded
+	if content, err := os.ReadFile(gitignorePath); err == nil {
+		existingContent = string(content)
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("failed to read .gitignore: %w", err)
 	}
 
-	cwd, err := os.Getwd()
-	if err != nil {
-		return fmt.Errorf("cannot determine current directory: %w", err)
+	var toAdd []string
+	for _, pattern := range ProjectGitignorePatterns {
+		if !containsGitignorePattern(existingContent, pattern) {
+			toAdd = append(toAdd, pattern)
+		}
 	}
 
-	return fix.SyncBranchGitignore(cwd)
+	if len(toAdd) == 0 {
+		return nil // All patterns already present
+	}
+
+	newContent := existingContent
+	if len(newContent) > 0 && !strings.HasSuffix(newContent, "\n") {
+		newContent += "\n"
+	}
+
+	newContent += "\n" + ProjectGitignoreHeader + "\n"
+	for _, pattern := range toAdd {
+		newContent += pattern + "\n"
+	}
+
+	// #nosec G306 -- gitignore needs to be readable by git and collaborators
+	if err := os.WriteFile(gitignorePath, []byte(newContent), 0644); err != nil {
+		return fmt.Errorf("failed to write .gitignore: %w", err)
+	}
+
+	return nil
+}
+
+// FixProjectGitignore is an alias for EnsureProjectGitignore, used by bd doctor --fix.
+// repoPath is the project root directory.
+func FixProjectGitignore(repoPath string) error {
+	return EnsureProjectGitignore(repoPath)
+}
+
+// containsGitignorePattern checks if a gitignore file content contains the given pattern.
+// It checks for the pattern as a standalone line (ignoring leading/trailing whitespace).
+func containsGitignorePattern(content, pattern string) bool {
+	for _, line := range strings.Split(content, "\n") {
+		line = strings.TrimSpace(line)
+		if line == pattern {
+			return true
+		}
+	}
+	return false
 }

@@ -1,3 +1,5 @@
+//go:build cgo
+
 package main
 
 import (
@@ -6,12 +8,12 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/storage/dolt"
 	"github.com/steveyegge/beads/internal/types"
 )
 
 type reopenTestHelper struct {
-	s   *sqlite.SQLiteStorage
+	s   *dolt.DoltStore
 	ctx context.Context
 	t   *testing.T
 }
@@ -36,10 +38,9 @@ func (h *reopenTestHelper) closeIssue(issueID, reason string) {
 }
 
 func (h *reopenTestHelper) reopenIssue(issueID string) {
-	updates := map[string]interface{}{
-		"status": string(types.StatusOpen),
-	}
-	if err := h.s.UpdateIssue(h.ctx, issueID, updates, "test-user"); err != nil {
+	// Reopen through the lifecycle operation so the fixture carries the full
+	// closure teardown, mirroring closeIssue above.
+	if err := h.s.ReopenIssue(h.ctx, issueID, "", "test-user"); err != nil {
 		h.t.Fatalf("Failed to reopen issue: %v", err)
 	}
 }
@@ -84,7 +85,7 @@ func (h *reopenTestHelper) assertCommentEvent(issueID, comment string) {
 	if err != nil {
 		h.t.Fatalf("Failed to get events: %v", err)
 	}
-	
+
 	for _, e := range events {
 		if e.EventType == types.EventCommented && e.Comment != nil && *e.Comment == comment {
 			return

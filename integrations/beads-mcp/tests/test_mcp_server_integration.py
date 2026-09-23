@@ -54,7 +54,7 @@ async def temp_db(bd_executable):
 
     # Return the .beads directory path (not the db file)
     beads_dir = os.path.join(temp_dir, ".beads")
-    
+
     yield beads_dir
 
     # Cleanup
@@ -79,9 +79,6 @@ async def mcp_client(bd_executable, temp_db, monkeypatch):
     # The workspace root is the parent directory
     workspace_root = os.path.dirname(temp_db)
 
-    # Disable daemon mode for tests (prevents daemon accumulation and timeouts)
-    os.environ["BEADS_NO_DAEMON"] = "1"
-
     # Create test client
     async with Client(mcp) as client:
         # Automatically set context for the tests
@@ -94,7 +91,6 @@ async def mcp_client(bd_executable, temp_db, monkeypatch):
     os.environ.pop("BEADS_WORKING_DIR", None)
     os.environ.pop("BEADS_DB", None)
     os.environ.pop("BEADS_DIR", None)
-    os.environ.pop("BEADS_NO_DAEMON", None)
 
 
 @pytest.mark.asyncio
@@ -161,9 +157,7 @@ async def test_show_issue_tool(mcp_client):
 async def test_list_issues_tool(mcp_client):
     """Test list_issues tool."""
     # Create some issues first
-    await mcp_client.call_tool(
-        "create", {"title": "Issue 1", "priority": 0, "issue_type": "bug", "brief": False}
-    )
+    await mcp_client.call_tool("create", {"title": "Issue 1", "priority": 0, "issue_type": "bug", "brief": False})
     await mcp_client.call_tool(
         "create", {"title": "Issue 2", "priority": 1, "issue_type": "feature", "brief": False}
     )
@@ -199,7 +193,7 @@ async def test_update_issue_tool(mcp_client):
         "update",
         {
             "issue_id": issue_id,
-            "status": "in_progress",
+            "status": "blocked",
             "priority": 0,
             "title": "Updated title",
             "brief": False,  # Get full Issue object
@@ -208,9 +202,28 @@ async def test_update_issue_tool(mcp_client):
 
     updated = json.loads(update_result.content[0].text)
     assert updated["id"] == issue_id
-    assert updated["status"] == "in_progress"
+    assert updated["status"] == "blocked"
     assert updated["priority"] == 0
     assert updated["title"] == "Updated title"
+
+
+@pytest.mark.asyncio
+async def test_claim_issue_tool(mcp_client):
+    """Test claim_issue tool."""
+    import json
+
+    create_result = await mcp_client.call_tool(
+        "create", {"title": "Issue to claim", "priority": 2, "issue_type": "task", "brief": False}
+    )
+    created = json.loads(create_result.content[0].text)
+    issue_id = created["id"]
+
+    claim_result = await mcp_client.call_tool("claim", {"issue_id": issue_id, "brief": False})
+    claimed = json.loads(claim_result.content[0].text)
+
+    assert claimed["id"] == issue_id
+    assert claimed["status"] == "in_progress"
+    assert claimed["assignee"] is not None
 
 
 @pytest.mark.asyncio
@@ -250,14 +263,10 @@ async def test_reopen_issue_tool(mcp_client):
     created = json.loads(create_result.content[0].text)
     issue_id = created["id"]
 
-    await mcp_client.call_tool(
-        "close", {"issue_id": issue_id, "reason": "Done"}
-    )
+    await mcp_client.call_tool("close", {"issue_id": issue_id, "reason": "Done"})
 
     # Reopen issue with brief=False to get full Issue object
-    reopen_result = await mcp_client.call_tool(
-        "reopen", {"issue_ids": [issue_id], "brief": False}
-    )
+    reopen_result = await mcp_client.call_tool("reopen", {"issue_ids": [issue_id], "brief": False})
 
     reopened_issues = json.loads(reopen_result.content[0].text)
     assert len(reopened_issues) >= 1
@@ -316,8 +325,7 @@ async def test_reopen_with_reason_tool(mcp_client):
 
     # Reopen with reason and brief=False
     reopen_result = await mcp_client.call_tool(
-        "reopen",
-        {"issue_ids": [issue_id], "reason": "Found regression", "brief": False}
+        "reopen", {"issue_ids": [issue_id], "reason": "Found regression", "brief": False}
     )
 
     reopened_issues = json.loads(reopen_result.content[0].text)
@@ -398,6 +406,37 @@ async def test_add_dependency_tool(mcp_client):
 
 
 @pytest.mark.asyncio
+async def test_comment_comments_and_note_tools(mcp_client):
+    """Test comment, comments, and note tools end to end."""
+    import json
+
+    issue_result = await mcp_client.call_tool(
+        "create", {"title": "Comment tool target", "priority": 1, "issue_type": "task", "brief": False}
+    )
+    issue = json.loads(issue_result.content[0].text)
+
+    # Add a comment
+    comment_result = await mcp_client.call_tool("comment", {"issue_id": issue["id"], "text": "Comment via MCP"})
+    assert issue["id"] in comment_result.content[0].text
+
+    # Read comments back
+    comments_result = await mcp_client.call_tool("comments", {"issue_id": issue["id"]})
+    comments = json.loads(comments_result.content[0].text)
+    if isinstance(comments, dict):
+        comments = [comments]
+    assert any(c["text"] == "Comment via MCP" for c in comments)
+    assert all(c["issue_id"] == issue["id"] for c in comments)
+
+    # Append a note and verify via show
+    note_result = await mcp_client.call_tool("note", {"issue_id": issue["id"], "text": "Note via MCP"})
+    assert issue["id"] in note_result.content[0].text
+
+    show_result = await mcp_client.call_tool("show", {"issue_id": issue["id"]})
+    shown = json.loads(show_result.content[0].text)
+    assert "Note via MCP" in (shown.get("notes") or "")
+
+
+@pytest.mark.asyncio
 async def test_create_with_all_fields(mcp_client):
     """Test create_issue with all optional fields."""
     import json
@@ -472,9 +511,7 @@ async def test_ready_work_with_priority_filter(mcp_client):
     import json
 
     # Create issues with different priorities
-    await mcp_client.call_tool(
-        "create", {"title": "P0 issue", "priority": 0, "issue_type": "bug", "brief": False}
-    )
+    await mcp_client.call_tool("create", {"title": "P0 issue", "priority": 0, "issue_type": "bug", "brief": False})
     await mcp_client.call_tool(
         "create", {"title": "P1 issue", "priority": 1, "issue_type": "task", "brief": False}
     )
@@ -506,10 +543,10 @@ async def test_update_partial_fields(mcp_client):
 
     # Update only status with brief=False to get full Issue
     update_result = await mcp_client.call_tool(
-        "update", {"issue_id": issue_id, "status": "in_progress", "brief": False}
+        "update", {"issue_id": issue_id, "status": "blocked", "brief": False}
     )
     updated = json.loads(update_result.content[0].text)
-    assert updated["status"] == "in_progress"
+    assert updated["status"] == "blocked"
     assert updated["title"] == "Original title"  # Unchanged
     assert updated["priority"] == 2  # Unchanged
 
@@ -558,9 +595,10 @@ async def test_stats_tool(mcp_client):
     result = await mcp_client.call_tool("stats", {})
     stats = json.loads(result.content[0].text)
 
-    assert "total_issues" in stats
-    assert "open_issues" in stats
-    assert stats["total_issues"] >= 2
+    assert "summary" in stats
+    assert "total_issues" in stats["summary"]
+    assert "open_issues" in stats["summary"]
+    assert stats["summary"]["total_issues"] >= 2
 
 
 @pytest.mark.asyncio
@@ -611,8 +649,9 @@ async def test_context_init_action(bd_executable):
     Uses a fresh temp directory without an existing database.
     """
     import os
-    import tempfile
     import shutil
+    import tempfile
+
     from beads_mcp import tools
     from beads_mcp.server import mcp
 
@@ -622,7 +661,6 @@ async def test_context_init_action(bd_executable):
     os.environ.pop("BEADS_WORKING_DIR", None)
     os.environ.pop("BEADS_DB", None)
     os.environ.pop("BEADS_DIR", None)
-    os.environ["BEADS_NO_DAEMON"] = "1"
 
     # Create a fresh temp directory without any beads database
     temp_dir = tempfile.mkdtemp(prefix="beads_init_test_")
@@ -727,16 +765,12 @@ async def test_update_brief_default(mcp_client):
     import json
 
     # Create issue first
-    create_result = await mcp_client.call_tool(
-        "create", {"title": "Update brief test", "brief": False}
-    )
+    create_result = await mcp_client.call_tool("create", {"title": "Update brief test", "brief": False})
     created = json.loads(create_result.content[0].text)
     issue_id = created["id"]
 
     # Update with default brief=True
-    update_result = await mcp_client.call_tool(
-        "update", {"issue_id": issue_id, "status": "in_progress"}
-    )
+    update_result = await mcp_client.call_tool("update", {"issue_id": issue_id, "status": "blocked"})
 
     data = json.loads(update_result.content[0].text)
     assert data["id"] == issue_id
@@ -750,21 +784,50 @@ async def test_update_brief_false(mcp_client):
     import json
 
     # Create issue first
-    create_result = await mcp_client.call_tool(
-        "create", {"title": "Update full test", "brief": False}
-    )
+    create_result = await mcp_client.call_tool("create", {"title": "Update full test", "brief": False})
     created = json.loads(create_result.content[0].text)
     issue_id = created["id"]
 
     # Update with brief=False
     update_result = await mcp_client.call_tool(
-        "update", {"issue_id": issue_id, "status": "in_progress", "brief": False}
+        "update", {"issue_id": issue_id, "status": "blocked", "brief": False}
     )
 
     data = json.loads(update_result.content[0].text)
     assert data["id"] == issue_id
-    assert data["status"] == "in_progress"
+    assert data["status"] == "blocked"
     assert data["title"] == "Update full test"
+
+
+@pytest.mark.asyncio
+async def test_claim_brief_default(mcp_client):
+    """Test claim returns OperationResult by default (brief=True)."""
+    import json
+
+    create_result = await mcp_client.call_tool("create", {"title": "Claim brief test", "brief": False})
+    created = json.loads(create_result.content[0].text)
+    issue_id = created["id"]
+
+    claim_result = await mcp_client.call_tool("claim", {"issue_id": issue_id})
+    data = json.loads(claim_result.content[0].text)
+    assert data["id"] == issue_id
+    assert data["action"] == "claimed"
+
+
+@pytest.mark.asyncio
+async def test_claim_brief_false(mcp_client):
+    """Test claim returns full Issue when brief=False."""
+    import json
+
+    create_result = await mcp_client.call_tool("create", {"title": "Claim full test", "brief": False})
+    created = json.loads(create_result.content[0].text)
+    issue_id = created["id"]
+
+    claim_result = await mcp_client.call_tool("claim", {"issue_id": issue_id, "brief": False})
+    data = json.loads(claim_result.content[0].text)
+    assert data["id"] == issue_id
+    assert data["status"] == "in_progress"
+    assert data["assignee"] is not None
 
 
 @pytest.mark.asyncio
@@ -773,16 +836,12 @@ async def test_close_brief_default(mcp_client):
     import json
 
     # Create issue first
-    create_result = await mcp_client.call_tool(
-        "create", {"title": "Close brief test", "brief": False}
-    )
+    create_result = await mcp_client.call_tool("create", {"title": "Close brief test", "brief": False})
     created = json.loads(create_result.content[0].text)
     issue_id = created["id"]
 
     # Close with default brief=True
-    close_result = await mcp_client.call_tool(
-        "close", {"issue_id": issue_id, "reason": "Done"}
-    )
+    close_result = await mcp_client.call_tool("close", {"issue_id": issue_id, "reason": "Done"})
 
     data = json.loads(close_result.content[0].text)
     assert isinstance(data, list)
@@ -797,16 +856,12 @@ async def test_close_brief_false(mcp_client):
     import json
 
     # Create issue first
-    create_result = await mcp_client.call_tool(
-        "create", {"title": "Close full test", "brief": False}
-    )
+    create_result = await mcp_client.call_tool("create", {"title": "Close full test", "brief": False})
     created = json.loads(create_result.content[0].text)
     issue_id = created["id"]
 
     # Close with brief=False
-    close_result = await mcp_client.call_tool(
-        "close", {"issue_id": issue_id, "reason": "Done", "brief": False}
-    )
+    close_result = await mcp_client.call_tool("close", {"issue_id": issue_id, "reason": "Done", "brief": False})
 
     data = json.loads(close_result.content[0].text)
     assert isinstance(data, list)
@@ -822,18 +877,14 @@ async def test_reopen_brief_default(mcp_client):
     import json
 
     # Create and close issue first
-    create_result = await mcp_client.call_tool(
-        "create", {"title": "Reopen brief test", "brief": False}
-    )
+    create_result = await mcp_client.call_tool("create", {"title": "Reopen brief test", "brief": False})
     created = json.loads(create_result.content[0].text)
     issue_id = created["id"]
 
     await mcp_client.call_tool("close", {"issue_id": issue_id})
 
     # Reopen with default brief=True
-    reopen_result = await mcp_client.call_tool(
-        "reopen", {"issue_ids": [issue_id]}
-    )
+    reopen_result = await mcp_client.call_tool("reopen", {"issue_ids": [issue_id]})
 
     data = json.loads(reopen_result.content[0].text)
     assert isinstance(data, list)
@@ -856,9 +907,7 @@ async def test_show_brief(mcp_client):
     issue_id = created["id"]
 
     # Show with brief=True
-    show_result = await mcp_client.call_tool(
-        "show", {"issue_id": issue_id, "brief": True}
-    )
+    show_result = await mcp_client.call_tool("show", {"issue_id": issue_id, "brief": True})
 
     data = json.loads(show_result.content[0].text)
     # BriefIssue has only: id, title, status, priority
@@ -890,9 +939,7 @@ async def test_show_fields_projection(mcp_client):
     issue_id = created["id"]
 
     # Show with specific fields
-    show_result = await mcp_client.call_tool(
-        "show", {"issue_id": issue_id, "fields": ["id", "title", "priority"]}
-    )
+    show_result = await mcp_client.call_tool("show", {"issue_id": issue_id, "fields": ["id", "title", "priority"]})
 
     data = json.loads(show_result.content[0].text)
     # Should have only requested fields
@@ -908,20 +955,17 @@ async def test_show_fields_projection(mcp_client):
 async def test_show_fields_invalid(mcp_client):
     """Test show with invalid fields raises error."""
     import json
+
     from fastmcp.exceptions import ToolError
 
     # Create issue first
-    create_result = await mcp_client.call_tool(
-        "create", {"title": "Invalid fields test", "brief": False}
-    )
+    create_result = await mcp_client.call_tool("create", {"title": "Invalid fields test", "brief": False})
     created = json.loads(create_result.content[0].text)
     issue_id = created["id"]
 
     # Show with invalid field should raise ToolError
     with pytest.raises(ToolError) as exc_info:
-        await mcp_client.call_tool(
-            "show", {"issue_id": issue_id, "fields": ["id", "nonexistent_field"]}
-        )
+        await mcp_client.call_tool("show", {"issue_id": issue_id, "fields": ["id", "nonexistent_field"]})
 
     # Verify error message mentions invalid field
     assert "Invalid field" in str(exc_info.value)
@@ -942,9 +986,7 @@ async def test_show_max_description_length(mcp_client):
     issue_id = created["id"]
 
     # Show with truncation
-    show_result = await mcp_client.call_tool(
-        "show", {"issue_id": issue_id, "max_description_length": 50}
-    )
+    show_result = await mcp_client.call_tool("show", {"issue_id": issue_id, "max_description_length": 50})
 
     data = json.loads(show_result.content[0].text)
     # Description should be truncated
@@ -958,12 +1000,8 @@ async def test_list_brief(mcp_client):
     import json
 
     # Create some issues
-    await mcp_client.call_tool(
-        "create", {"title": "List brief 1", "priority": 1, "brief": False}
-    )
-    await mcp_client.call_tool(
-        "create", {"title": "List brief 2", "priority": 2, "brief": False}
-    )
+    await mcp_client.call_tool("create", {"title": "List brief 1", "priority": 1, "brief": False})
+    await mcp_client.call_tool("create", {"title": "List brief 2", "priority": 2, "brief": False})
 
     # List with brief=True
     result = await mcp_client.call_tool("list", {"brief": True})
@@ -987,9 +1025,7 @@ async def test_ready_brief(mcp_client):
     import json
 
     # Create a ready issue
-    await mcp_client.call_tool(
-        "create", {"title": "Ready brief test", "priority": 1, "brief": False}
-    )
+    await mcp_client.call_tool("create", {"title": "Ready brief test", "priority": 1, "brief": False})
 
     # Ready with brief=True
     result = await mcp_client.call_tool("ready", {"brief": True, "limit": 100})
@@ -1012,14 +1048,10 @@ async def test_blocked_brief(mcp_client):
     import json
 
     # Create blocking dependency
-    blocking_result = await mcp_client.call_tool(
-        "create", {"title": "Blocker for brief test", "brief": False}
-    )
+    blocking_result = await mcp_client.call_tool("create", {"title": "Blocker for brief test", "brief": False})
     blocking = json.loads(blocking_result.content[0].text)
 
-    blocked_result = await mcp_client.call_tool(
-        "create", {"title": "Blocked for brief test", "brief": False}
-    )
+    blocked_result = await mcp_client.call_tool("create", {"title": "Blocked for brief test", "brief": False})
     blocked = json.loads(blocked_result.content[0].text)
 
     await mcp_client.call_tool(
@@ -1047,14 +1079,10 @@ async def test_show_brief_deps(mcp_client):
     import json
 
     # Create two issues with dependency
-    dep_result = await mcp_client.call_tool(
-        "create", {"title": "Dependency issue", "brief": False}
-    )
+    dep_result = await mcp_client.call_tool("create", {"title": "Dependency issue", "brief": False})
     dep_issue = json.loads(dep_result.content[0].text)
 
-    main_result = await mcp_client.call_tool(
-        "create", {"title": "Main issue", "brief": False}
-    )
+    main_result = await mcp_client.call_tool("create", {"title": "Main issue", "brief": False})
     main_issue = json.loads(main_result.content[0].text)
 
     await mcp_client.call_tool(
@@ -1063,9 +1091,7 @@ async def test_show_brief_deps(mcp_client):
     )
 
     # Show with brief_deps=True
-    show_result = await mcp_client.call_tool(
-        "show", {"issue_id": main_issue["id"], "brief_deps": True}
-    )
+    show_result = await mcp_client.call_tool("show", {"issue_id": main_issue["id"], "brief_deps": True})
 
     data = json.loads(show_result.content[0].text)
     # Full issue data

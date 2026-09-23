@@ -3,10 +3,9 @@ package main
 import (
 	"context"
 	"fmt"
-	"os"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/storage"
+	"github.com/steveyegge/beads/internal/metrics"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
@@ -30,54 +29,53 @@ Output includes:
 
 Example:
   bd mol progress bd-hanoi-xyz`,
-	Args: cobra.MaximumNArgs(1),
-	Run: func(cmd *cobra.Command, args []string) {
+	Args:          cobra.MaximumNArgs(1),
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		evt := metrics.NewCommandEvent("mol-progress")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
+
+		if usesProxiedServer() {
+			return runMolProgressProxiedServer(rootCtx, args)
+		}
+
 		ctx := rootCtx
 
-		// mol progress requires direct store access
 		if store == nil {
-			if daemonClient != nil {
-				fmt.Fprintf(os.Stderr, "Error: mol progress requires direct database access\n")
-				fmt.Fprintf(os.Stderr, "Hint: use --no-daemon flag: bd --no-daemon mol progress\n")
-			} else {
-				fmt.Fprintf(os.Stderr, "Error: no database connection\n")
-			}
-			os.Exit(1)
+			return HandleErrorRespectJSON("no database connection")
 		}
 
 		var moleculeID string
 		if len(args) == 1 {
-			// Explicit molecule ID given
 			resolved, err := utils.ResolvePartialID(ctx, store, args[0])
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: molecule '%s' not found\n", args[0])
-				os.Exit(1)
+				return HandleErrorRespectJSON("molecule '%s' not found", args[0])
 			}
 			moleculeID = resolved
 		} else {
-			// Infer from in_progress work - use lightweight discovery
 			moleculeIDs := findInProgressMoleculeIDs(ctx, store, actor)
 			if len(moleculeIDs) == 0 {
 				if jsonOutput {
-					outputJSON([]interface{}{})
-					return
+					return outputJSON([]interface{}{})
 				}
 				fmt.Println("No molecules in progress.")
 				fmt.Println("\nUse: bd mol progress <molecule-id>")
-				return
+				return nil
 			}
-			// Show progress for first molecule
 			moleculeID = moleculeIDs[0]
 		}
 
 		stats, err := store.GetMoleculeProgress(ctx, moleculeID)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			return HandleErrorRespectJSON("%v", err)
 		}
 
 		if jsonOutput {
-			// Add computed fields for JSON output
 			output := map[string]interface{}{
 				"molecule_id":     stats.MoleculeID,
 				"molecule_title":  stats.MoleculeTitle,
@@ -101,18 +99,17 @@ Example:
 					}
 				}
 			}
-			outputJSON(output)
-			return
+			return outputJSON(output)
 		}
 
-		// Human-readable output
 		printMoleculeProgressStats(stats)
+		return nil
 	},
 }
 
 // findInProgressMoleculeIDs finds molecule IDs with in_progress steps for an agent.
 // This is a lightweight version that only returns IDs without loading subgraphs.
-func findInProgressMoleculeIDs(ctx context.Context, s storage.Storage, agent string) []string {
+func findInProgressMoleculeIDs(ctx context.Context, s molReader, agent string) []string {
 	// Query for in_progress issues
 	status := types.StatusInProgress
 	filter := types.IssueFilter{Status: &status}
@@ -124,11 +121,17 @@ func findInProgressMoleculeIDs(ctx context.Context, s storage.Storage, agent str
 		return nil
 	}
 
-	// For each in_progress issue, find its parent molecule
+	// Batch-find parent molecules for all in_progress issues (bd-hn4q)
+	issueIDs := make([]string, len(inProgressIssues))
+	for i, issue := range inProgressIssues {
+		issueIDs[i] = issue.ID
+	}
+	moleculeRoots := findParentMolecules(ctx, s, issueIDs)
+
 	seen := make(map[string]bool)
 	var moleculeIDs []string
 	for _, issue := range inProgressIssues {
-		moleculeID := findParentMolecule(ctx, s, issue.ID)
+		moleculeID := moleculeRoots[issue.ID]
 		if moleculeID != "" && !seen[moleculeID] {
 			seen[moleculeID] = true
 			moleculeIDs = append(moleculeIDs, moleculeID)

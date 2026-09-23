@@ -1,8 +1,13 @@
 package main
 
 import (
+	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/steveyegge/beads/internal/config"
 )
 
 func TestCheckResult_Passed(t *testing.T) {
@@ -154,9 +159,9 @@ func TestPreflightResult_WithWarning(t *testing.T) {
 
 func TestTruncateOutput(t *testing.T) {
 	tests := []struct {
-		name     string
-		input    string
-		maxLen   int
+		name      string
+		input     string
+		maxLen    int
 		wantTrunc bool
 	}{
 		{"short string", "hello world", 500, false},
@@ -182,4 +187,317 @@ func TestTruncateOutput(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRunLintCheck_MissingCommandFailsByDefault(t *testing.T) {
+	t.Setenv("PATH", "")
+
+	result := runLintCheck(false)
+	if result.Passed {
+		t.Fatalf("expected lint check to fail when golangci-lint is missing")
+	}
+	if result.Skipped {
+		t.Fatalf("expected missing lint to be a hard failure, not skipped")
+	}
+	if !strings.Contains(result.Output, "not found in PATH") {
+		t.Fatalf("expected missing command message, got: %q", result.Output)
+	}
+	if !strings.Contains(result.Output, "--skip-lint") {
+		t.Fatalf("expected explicit skip guidance in message, got: %q", result.Output)
+	}
+}
+
+func TestRunLintCheck_SkipLintFlag(t *testing.T) {
+	result := runLintCheck(true)
+	if result.Passed {
+		t.Fatalf("expected skipped lint check to remain non-passing")
+	}
+	if !result.Skipped {
+		t.Fatalf("expected skipped lint check to be marked skipped")
+	}
+	if !result.Warning {
+		t.Fatalf("expected skipped lint check to be warning")
+	}
+	if !strings.Contains(result.Output, "--skip-lint") {
+		t.Fatalf("expected output to mention --skip-lint, got: %q", result.Output)
+	}
+}
+
+func TestRunFmtCheck_Formatted(t *testing.T) {
+	dir := t.TempDir()
+	// Write a properly formatted Go file
+	err := os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Run gofmt -l in the temp dir
+	cmd := exec.Command("gofmt", "-l", ".")
+	cmd.Dir = dir
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("gofmt failed: %v: %s", err, output)
+	}
+	if strings.TrimSpace(string(output)) != "" {
+		t.Fatalf("expected no unformatted files, got: %s", output)
+	}
+}
+
+func TestRunFmtCheck_Unformatted(t *testing.T) {
+	dir := t.TempDir()
+	// Write a poorly formatted Go file (extra spaces, no newline)
+	err := os.WriteFile(filepath.Join(dir, "bad.go"), []byte("package main\nfunc  main( )  {  }\n"), 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command("gofmt", "-l", ".")
+	cmd.Dir = dir
+	output, _ := cmd.CombinedOutput()
+	unformatted := strings.TrimSpace(string(output))
+	if unformatted == "" {
+		t.Fatal("expected unformatted files to be listed")
+	}
+	if !strings.Contains(unformatted, "bad.go") {
+		t.Fatalf("expected bad.go in output, got: %s", unformatted)
+	}
+}
+
+func TestRunBeadsPollutionCheck_Clean(t *testing.T) {
+	// In a clean repo state (no uncommitted .beads changes), the check should pass.
+	result := runBeadsPollutionCheck()
+	if !result.Passed {
+		// If this fails, it means the test environment itself has .beads changes,
+		// which is valid — skip rather than fail.
+		if strings.Contains(result.Output, "modified") {
+			t.Skip("test environment has .beads changes, skipping")
+		}
+		if result.Skipped {
+			t.Skip("cannot determine branch in test environment")
+		}
+		t.Fatalf("expected beads pollution check to pass in clean state, got: %q", result.Output)
+	}
+}
+
+func TestRunVersionSyncCheck_ScriptFallback(t *testing.T) {
+	// Run from a temp dir where scripts/check-versions.sh does not exist.
+	// The fallback inline logic should be used, resulting in a skipped result
+	// because version.go won't be found either.
+	origDir, err := os.Getwd()
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if err := os.Chdir(dir); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chdir(origDir)
+
+	result := runVersionSyncCheck()
+	// Without version.go present, fallback should skip
+	if !result.Skipped {
+		// Could also pass if default.nix is also missing — both are acceptable fallback outcomes
+		if result.Passed && strings.Contains(result.Output, "not found") {
+			return // acceptable: nix not found skip
+		}
+	}
+	if result.Command == "scripts/check-versions.sh" {
+		t.Fatal("expected fallback logic, not script invocation")
+	}
+}
+
+// writeMarkerDir creates a temp dir containing the given marker files (each
+// with trivial content) and returns its path. Used to exercise project-type
+// detection in the preflight checklist (GH#4364).
+func writeMarkerDir(t *testing.T, files map[string]string) string {
+	t.Helper()
+	dir := t.TempDir()
+	for name, content := range files {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(content), 0o644); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+	}
+	return dir
+}
+
+func TestBuildPreflightChecklist(t *testing.T) {
+	beadsGoMod := "module github.com/steveyegge/beads\n\ngo 1.22\n"
+	otherGoMod := "module example.com/foo\n\ngo 1.22\n"
+
+	cases := []struct {
+		name        string
+		files       map[string]string
+		wantContain []string // substring present in at least one item
+		wantAbsent  []string // substring present in no item
+	}{
+		{
+			name:        "beads repo keeps rich Go+Nix checklist",
+			files:       map[string]string{"go.mod": beadsGoMod, "default.nix": "{}", ".beads": ""},
+			wantContain: []string{"gms_pure_go", "Version sync", "Nix hash", "No beads pollution"},
+		},
+		{
+			name:        "generic Go project gets plain go commands",
+			files:       map[string]string{"go.mod": otherGoMod},
+			wantContain: []string{"go test ./...", "golangci-lint run ./...", "gofmt -l ."},
+			wantAbsent:  []string{"gms_pure_go", "Version sync", "Nix hash"},
+		},
+		{
+			name:        "node project",
+			files:       map[string]string{"package.json": "{}"},
+			wantContain: []string{"npm test", "tsc --noEmit"},
+			wantAbsent:  []string{"go test", "gofmt"},
+		},
+		{
+			name:        "rust project",
+			files:       map[string]string{"Cargo.toml": "[package]\n"},
+			wantContain: []string{"cargo test", "cargo clippy"},
+			wantAbsent:  []string{"go test ./...", "npm test"},
+		},
+		{
+			name:        "python pyproject",
+			files:       map[string]string{"pyproject.toml": "[project]\n"},
+			wantContain: []string{"pytest", "ruff check"},
+		},
+		{
+			name:        "python setup.py",
+			files:       map[string]string{"setup.py": "", ".beads": ""},
+			wantContain: []string{"pytest", "No beads pollution"},
+		},
+		{
+			name:        "unknown stack gets generic reminder",
+			files:       map[string]string{"README.md": "hi"},
+			wantContain: []string{"run your project's test suite"},
+			wantAbsent:  []string{"go test", "npm test", "cargo test", "pytest"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := writeMarkerDir(t, tc.files)
+			joined := strings.Join(buildPreflightChecklist(dir), "\n")
+			for _, want := range tc.wantContain {
+				if !strings.Contains(joined, want) {
+					t.Errorf("checklist missing %q\ngot:\n%s", want, joined)
+				}
+			}
+			for _, absent := range tc.wantAbsent {
+				if strings.Contains(joined, absent) {
+					t.Errorf("checklist unexpectedly contains %q\ngot:\n%s", absent, joined)
+				}
+			}
+		})
+	}
+}
+
+func TestIsBeadsRepo(t *testing.T) {
+	beads := writeMarkerDir(t, map[string]string{"go.mod": "module github.com/steveyegge/beads\n"})
+	if !isBeadsRepo(beads) {
+		t.Error("expected beads module to be detected as the beads repo")
+	}
+	other := writeMarkerDir(t, map[string]string{"go.mod": "module example.com/foo\n"})
+	if isBeadsRepo(other) {
+		t.Error("non-beads module should not be detected as the beads repo")
+	}
+	empty := t.TempDir()
+	if isBeadsRepo(empty) {
+		t.Error("dir without go.mod should not be detected as the beads repo")
+	}
+}
+
+// TestPreflightJSONFlagBindsGlobal pins both halves of preflight's --json
+// binding, which is one flag serving two masters. Setting it must write the
+// package global, or every jsonOutput reader (including the front-door refusal
+// renderers) stays in text mode while the user asked for JSON. Leaving it
+// unset must report unchanged to commandJSONFlagChanged, which is what lets a
+// config-file `json: true` reach preflight the way it reaches its siblings —
+// a deliberate behavior change from the unbound shadow this replaced, and the
+// reason the CHANGELOG calls it out.
+//
+// The last two subtests drive that config half rather than only asserting the
+// negative direction. flag.Value.Set never sets Changed (only FlagSet.Set
+// does), so the Changed==true branch of commandJSONFlagChanged needs its own
+// case, and the behavior the CHANGELOG announces — configured `json: true`
+// with no flag flipping jsonOutput — only happens inside
+// refreshBoundCommandConfig, so it has to be driven through that function.
+func TestPreflightJSONFlagBindsGlobal(t *testing.T) {
+	flag := preflightCmd.Flags().Lookup("json")
+	if flag == nil {
+		t.Fatal("preflight has no --json flag")
+	}
+	rootJSON := preflightCmd.Root().PersistentFlags().Lookup("json")
+	if rootJSON == nil {
+		t.Fatal("root has no persistent --json flag")
+	}
+	// refreshBoundCommandConfig consults config only when neither --json nor
+	// its hidden --format alias was given, so this test owns that flag's
+	// Changed bit too.
+	rootFormat := preflightCmd.Root().PersistentFlags().Lookup("format")
+	if rootFormat == nil {
+		t.Fatal("root has no persistent --format flag")
+	}
+
+	oldGlobal := jsonOutput
+	oldValue, oldChanged := flag.Value.String(), flag.Changed
+	oldRootChanged := rootJSON.Changed
+	oldFormatChanged := rootFormat.Changed
+	// refreshBoundCommandConfig reapplies every config-backed default, not
+	// just json; restore the rest so this test cannot leak into siblings.
+	oldReadonly, oldActor, oldAutoCommit := readonlyMode, actor, doltAutoCommit
+	t.Cleanup(func() {
+		_ = flag.Value.Set(oldValue)
+		flag.Changed = oldChanged
+		rootJSON.Changed = oldRootChanged
+		rootFormat.Changed = oldFormatChanged
+		jsonOutput = oldGlobal
+		readonlyMode, actor, doltAutoCommit = oldReadonly, oldActor, oldAutoCommit
+		config.ResetForTesting()
+	})
+
+	t.Run("flag writes the package global", func(t *testing.T) {
+		jsonOutput = false
+		if err := flag.Value.Set("true"); err != nil {
+			t.Fatal(err)
+		}
+		if !jsonOutput {
+			t.Fatal("preflight --json did not write jsonOutput; an unbound shadow leaves every reader of the global in text mode")
+		}
+	})
+
+	t.Run("neither flag set reports unchanged", func(t *testing.T) {
+		flag.Changed = false
+		rootJSON.Changed = false
+		if commandJSONFlagChanged(preflightCmd) {
+			t.Fatal("preflight reported an explicit --json with neither flag set; the config-file json default would never apply")
+		}
+	})
+
+	t.Run("explicit --json reports changed", func(t *testing.T) {
+		flag.Changed = false
+		rootJSON.Changed = false
+		if err := preflightCmd.Flags().Set("json", "true"); err != nil {
+			t.Fatal(err)
+		}
+		if !commandJSONFlagChanged(preflightCmd) {
+			t.Fatal("an explicitly set --json reported unchanged; the config default would override the flag the user typed")
+		}
+	})
+
+	t.Run("configured json default applies with no flag", func(t *testing.T) {
+		config.ResetForTesting()
+		if err := config.Initialize(); err != nil {
+			t.Fatalf("config.Initialize: %v", err)
+		}
+		config.Set("json", true)
+
+		flag.Changed = false
+		rootJSON.Changed = false
+		rootFormat.Changed = false
+		jsonOutput = false
+
+		refreshBoundCommandConfig(preflightCmd)
+
+		if !jsonOutput {
+			t.Fatal("config json:true with no --json flag left jsonOutput false; preflight would render text while the repo config asks for JSON")
+		}
+	})
 }

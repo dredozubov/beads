@@ -2,16 +2,15 @@ package main
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"os"
+	"io"
 	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/rpc"
+	"github.com/steveyegge/beads/internal/metrics"
 	"github.com/steveyegge/beads/internal/storage"
-	"github.com/steveyegge/beads/internal/storage/sqlite"
+	"github.com/steveyegge/beads/internal/storage/issueops"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 	"github.com/steveyegge/beads/internal/utils"
@@ -19,24 +18,27 @@ import (
 
 // GraphNode represents a node in the rendered graph
 type GraphNode struct {
-	Issue    *types.Issue
-	Layer    int      // Horizontal layer (topological order)
-	Position int      // Vertical position within layer
+	Issue     *types.Issue
+	Layer     int      // Horizontal layer (topological order)
+	Position  int      // Vertical position within layer
 	DependsOn []string // IDs this node depends on (blocks dependencies only)
 }
 
 // GraphLayout holds the computed graph layout
 type GraphLayout struct {
-	Nodes      map[string]*GraphNode
-	Layers     [][]string // Layer index -> node IDs in that layer
-	MaxLayer   int
-	RootID     string
+	Nodes    map[string]*GraphNode
+	Layers   [][]string // Layer index -> node IDs in that layer
+	MaxLayer int
+	RootID   string
 }
 
 var (
 	graphCompact bool
 	graphBox     bool
 	graphAll     bool
+	graphDOT     bool
+	graphHTML    bool
+	graphOpen    bool
 )
 
 var graphCmd = &cobra.Command{
@@ -49,141 +51,325 @@ For epics, shows all children and their dependencies.
 For regular issues, shows the issue and its direct dependencies.
 
 With --all, shows all open issues grouped by connected component.
+With --open, filters to only open/actionable issues (compact layer format).
 
 Display formats:
-  --box (default)  ASCII boxes showing layers, more detailed
+  (default)        DAG with columns and box-drawing edges (terminal-native)
+  --box            ASCII boxes showing layers, more detailed
   --compact        Tree format, one line per issue, more scannable
+  --dot            Graphviz DOT format (pipe to dot -Tsvg > graph.svg)
+  --html           Self-contained interactive HTML with D3.js visualization
+  --open           Open issues only, compact layers (LLM-friendly)
 
 The graph shows execution order:
 - Layer 0 / leftmost = no dependencies (can start immediately)
 - Higher layers depend on lower layers
 - Nodes in the same layer can run in parallel
 
-Status icons: ○ open  ◐ in_progress  ● blocked  ✓ closed  ❄ deferred`,
-	Args: cobra.RangeArgs(0, 1),
-	Run: func(cmd *cobra.Command, args []string) {
-		ctx := rootCtx
+Status icons: ○ open  ◐ in_progress  ● blocked  ✓ closed  ❄ deferred
 
-		// Validate args
+Examples:
+  bd graph issue-id              # Terminal DAG visualization (default)
+  bd graph --box issue-id        # ASCII boxes with layer grouping
+  bd graph --dot issue-id | dot -Tsvg > graph.svg  # SVG via Graphviz
+  bd graph --dot issue-id | dot -Tpng > graph.png  # PNG via Graphviz
+  bd graph --html issue-id > graph.html  # Interactive browser view
+  bd graph --all --html > all.html       # All issues, interactive
+  bd graph --open issue-id       # Open issues only, layered by blocking order
+  bd graph --all --open          # All open issues, compact layers
+
+--max-rows / BEADS_MAX_ROWS caveat: the cap is checked differently per mode.
+Single-issue graphs (no --all) check the connected-component node count
+after the BFS traversal completes — the whole subgraph is always walked
+first, then rejected if it's over cap. --all checks each status
+(open/in_progress/blocked) independently, so up to 3x the cap can be loaded
+in total before any individual status trips it.`,
+	Args:          cobra.RangeArgs(0, 1),
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		evt := metrics.NewCommandEvent("graph")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
+
 		if graphAll && len(args) > 0 {
-			fmt.Fprintf(os.Stderr, "Error: cannot specify issue ID with --all flag\n")
-			os.Exit(1)
+			return HandleErrorRespectJSON("cannot specify issue ID with --all flag")
 		}
 		if !graphAll && len(args) == 0 {
-			fmt.Fprintf(os.Stderr, "Error: issue ID required (or use --all for all open issues)\n")
-			os.Exit(1)
+			return HandleErrorWithHintRespectJSON("issue ID required", "Use --all for all open issues")
 		}
 
-		// If daemon is running but doesn't support this command, use direct storage
-		if daemonClient != nil && store == nil {
-			var err error
-			store, err = sqlite.New(ctx, dbPath)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: failed to open database: %v\n", err)
-				os.Exit(1)
+		out := cmd.OutOrStdout()
+		if usesProxiedServer() {
+			if err := rejectMaxRowsUnderProxiedServer(cmd); err != nil {
+				return err
 			}
-			defer func() { _ = store.Close() }()
+			return runGraphProxiedServer(rootCtx, out, args)
 		}
 
+		ctx := rootCtx
 		if store == nil {
-			fmt.Fprintf(os.Stderr, "Error: no database connection\n")
-			os.Exit(1)
+			return HandleErrorRespectJSON("no database connection")
 		}
 
-		// Handle --all flag: show graph for all open issues
 		if graphAll {
-			subgraphs, err := loadAllGraphSubgraphs(ctx, store)
+			maxRows, maxRowsSource, err := resolveMaxRows(cmd)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error loading all issues: %v\n", err)
-				os.Exit(1)
+				return err
 			}
-
-			if len(subgraphs) == 0 {
-				fmt.Println("No open issues found")
-				return
-			}
-
-			if jsonOutput {
-				outputJSON(subgraphs)
-				return
-			}
-
-			// Render all subgraphs
-			for i, subgraph := range subgraphs {
-				layout := computeLayout(subgraph)
-				if graphCompact {
-					renderGraphCompact(layout, subgraph)
-				} else {
-					renderGraph(layout, subgraph)
+			subgraphs, err := loadAllGraphSubgraphs(ctx, store, maxRows, maxRowsSource)
+			if err != nil {
+				if capErr := handleMaxRowsError(err); capErr != nil {
+					return capErr
 				}
-				if i < len(subgraphs)-1 {
-					fmt.Println(strings.Repeat("─", 60))
-				}
+				return HandleErrorRespectJSON("loading all issues: %v", err)
 			}
-			return
+			return renderGraphAllSubgraphs(out, subgraphs)
 		}
 
-		// Single issue mode
-		var issueID string
-		if daemonClient != nil {
-			resolveArgs := &rpc.ResolveIDArgs{ID: args[0]}
-			resp, err := daemonClient.ResolveID(resolveArgs)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: issue '%s' not found\n", args[0])
-				os.Exit(1)
-			}
-			if err := json.Unmarshal(resp.Data, &issueID); err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
-		} else {
-			var err error
-			issueID, err = utils.ResolvePartialID(ctx, store, args[0])
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: issue '%s' not found\n", args[0])
-				os.Exit(1)
-			}
+		issueID, err := utils.ResolvePartialID(ctx, store, args[0])
+		if err != nil {
+			return HandleErrorRespectJSON("issue '%s' not found", args[0])
 		}
 
-		// Load the subgraph
 		subgraph, err := loadGraphSubgraph(ctx, store, issueID)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error loading graph: %v\n", err)
-			os.Exit(1)
+			return HandleErrorRespectJSON("loading graph: %v", err)
 		}
 
-		// Compute layout
-		layout := computeLayout(subgraph)
-
-		if jsonOutput {
-			outputJSON(map[string]interface{}{
-				"root":    subgraph.Root,
-				"issues":  subgraph.Issues,
-				"layout":  layout,
-			})
-			return
+		// Apply the defensive row cap (be-x42v) on the connected-component
+		// node count. loadGraphSubgraph is a BFS over GetDependents/
+		// GetDependencies (per-ID lookups, no IssueFilter to thread MaxRows
+		// through), so — like `bd dep tree` — the cap is checked post-hoc
+		// against the final node set rather than during traversal.
+		graphMaxRows, graphMaxRowsSource, err := resolveMaxRows(cmd)
+		if err != nil {
+			return err
+		}
+		if graphMaxRows > 0 && len(subgraph.Issues) > graphMaxRows {
+			if capErr := handleMaxRowsError(&issueops.ErrTooManyRows{
+				Found:  len(subgraph.Issues),
+				Cap:    graphMaxRows,
+				Source: graphMaxRowsSource,
+			}); capErr != nil {
+				return capErr
+			}
 		}
 
-		// Render graph - compact tree format or box format (default)
-		if graphCompact {
-			renderGraphCompact(layout, subgraph)
-		} else {
-			renderGraph(layout, subgraph)
-		}
+		return renderGraphSingleSubgraph(out, subgraph)
 	},
+}
+
+func writeGraphLine(out io.Writer, value string) error {
+	w := &graphExportWriter{out: out}
+	w.println(value)
+	return w.wrapError("graph")
+}
+
+func renderGraphAllSubgraphs(out io.Writer, subgraphs []*TemplateSubgraph) error {
+	if graphOpen {
+		var filtered []*TemplateSubgraph
+		for _, sg := range subgraphs {
+			f := filterSubgraphOpen(sg)
+			if f != nil && len(f.Issues) > 0 {
+				filtered = append(filtered, f)
+			}
+		}
+		subgraphs = filtered
+	}
+
+	if len(subgraphs) == 0 {
+		return writeGraphLine(out, "No open issues found")
+	}
+
+	if jsonOutput {
+		return outputJSON(subgraphs)
+	}
+
+	if graphHTML && !graphOpen {
+		merged := mergeSubgraphsForHTML(subgraphs)
+		layout := computeLayout(merged)
+		return renderGraphHTML(out, layout, merged)
+	}
+
+	if graphOpen {
+		for i, subgraph := range subgraphs {
+			layout := computeLayout(subgraph)
+			renderGraphCompact(layout, subgraph)
+			if i < len(subgraphs)-1 {
+				if err := writeGraphLine(out, strings.Repeat("─", 60)); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
+
+	for i, subgraph := range subgraphs {
+		layout := computeLayout(subgraph)
+		if graphDOT {
+			if err := renderGraphDOT(out, layout, subgraph); err != nil {
+				return err
+			}
+		} else if graphCompact {
+			renderGraphCompact(layout, subgraph)
+		} else if graphBox {
+			renderGraph(layout, subgraph)
+		} else {
+			renderGraphVisual(layout, subgraph)
+		}
+		if !graphDOT && i < len(subgraphs)-1 {
+			if err := writeGraphLine(out, strings.Repeat("─", 60)); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func renderGraphSingleSubgraph(out io.Writer, subgraph *TemplateSubgraph) error {
+	if graphOpen {
+		subgraph = filterSubgraphOpen(subgraph)
+		if subgraph == nil || len(subgraph.Issues) == 0 {
+			return writeGraphLine(out, "No open issues in subgraph")
+		}
+	}
+
+	layout := computeLayout(subgraph)
+
+	if jsonOutput {
+		return outputJSON(map[string]interface{}{
+			"root":   subgraph.Root,
+			"issues": subgraph.Issues,
+			"layout": layout,
+		})
+	}
+
+	if graphOpen {
+		renderGraphCompact(layout, subgraph)
+		return nil
+	}
+
+	if graphDOT {
+		return renderGraphDOT(out, layout, subgraph)
+	} else if graphHTML {
+		return renderGraphHTML(out, layout, subgraph)
+	} else if graphCompact {
+		renderGraphCompact(layout, subgraph)
+	} else if graphBox {
+		renderGraph(layout, subgraph)
+	} else {
+		renderGraphVisual(layout, subgraph)
+	}
+	return nil
+}
+
+var graphCheckCmd = &cobra.Command{
+	Use:   "check",
+	Short: "Check dependency graph integrity",
+	Long: `Check the dependency graph for cycles, orphans, and other integrity issues.
+
+Returns exit code 0 if the graph is clean, 1 if issues are found.`,
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		evt := metrics.NewCommandEvent("graph-check")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
+
+		if usesProxiedServer() {
+			return runGraphCheckProxiedServer(rootCtx)
+		}
+
+		cycles, err := store.DetectCycles(rootCtx)
+		if err != nil {
+			return HandleErrorRespectJSON("cycle detection failed: %v", err)
+		}
+		return renderGraphCheck(cycles)
+	},
+}
+
+func renderGraphCheck(cycles [][]*types.Issue) error {
+	type GraphCheckResult struct {
+		Clean   bool       `json:"clean"`
+		Cycles  [][]string `json:"cycles"`
+		Summary struct {
+			CycleCount int `json:"cycle_count"`
+		} `json:"summary"`
+	}
+
+	result := GraphCheckResult{Clean: true}
+
+	for _, cycle := range cycles {
+		ids := make([]string, len(cycle))
+		for i, issue := range cycle {
+			ids[i] = issue.ID
+		}
+		result.Cycles = append(result.Cycles, ids)
+	}
+	result.Summary.CycleCount = len(cycles)
+
+	if len(cycles) > 0 {
+		result.Clean = false
+	}
+
+	if jsonOutput {
+		if err := outputJSON(result); err != nil {
+			return err
+		}
+		if !result.Clean {
+			return SilentExit()
+		}
+		return nil
+	}
+
+	if result.Clean {
+		fmt.Printf("\n%s Graph integrity check passed\n\n", ui.RenderPass("✓"))
+	} else {
+		fmt.Printf("\n%s Graph integrity issues found\n\n", ui.RenderFail("✗"))
+	}
+
+	if len(result.Cycles) > 0 {
+		fmt.Printf("%s Cycles (%d):\n\n", ui.RenderFail("⚠"), len(result.Cycles))
+		for _, cycle := range result.Cycles {
+			fmt.Printf("  %s → %s\n", strings.Join(cycle, " → "), cycle[0])
+		}
+		fmt.Println()
+	} else {
+		fmt.Printf("  %s No dependency cycles\n", ui.RenderPass("✓"))
+	}
+
+	fmt.Println()
+
+	if !result.Clean {
+		return SilentExit()
+	}
+	return nil
 }
 
 func init() {
 	graphCmd.Flags().BoolVar(&graphAll, "all", false, "Show graph for all open issues")
 	graphCmd.Flags().BoolVar(&graphCompact, "compact", false, "Tree format, one line per issue, more scannable")
-	graphCmd.Flags().BoolVar(&graphBox, "box", true, "ASCII boxes showing layers (default)")
+	graphCmd.Flags().BoolVar(&graphBox, "box", false, "ASCII boxes showing layers")
+	graphCmd.Flags().BoolVar(&graphDOT, "dot", false, "Output Graphviz DOT format (pipe to: dot -Tsvg > graph.svg)")
+	graphCmd.Flags().BoolVar(&graphHTML, "html", false, "Output self-contained interactive HTML (redirect to file)")
+	graphCmd.Flags().BoolVar(&graphOpen, "open", false, "Show only open issues (filters out closed/deferred), forces compact layer format")
+	// Defensive row cap (be-x42v): exits 2 on overage, default disabled.
+	addMaxRowsFlag(graphCmd)
 	graphCmd.ValidArgsFunction = issueIDCompletion
 	rootCmd.AddCommand(graphCmd)
+	graphCmd.AddCommand(graphCheckCmd)
 }
 
 // loadGraphSubgraph loads an issue and its subgraph for visualization
 // Unlike template loading, this includes ALL dependency types (not just parent-child)
-func loadGraphSubgraph(ctx context.Context, s storage.Storage, issueID string) (*TemplateSubgraph, error) {
+func loadGraphSubgraph(ctx context.Context, s storage.DoltStorage, issueID string) (*TemplateSubgraph, error) {
 	if s == nil {
 		return nil, fmt.Errorf("no database connection")
 	}
@@ -203,8 +389,8 @@ func loadGraphSubgraph(ctx context.Context, s storage.Storage, issueID string) (
 		IssueMap: map[string]*types.Issue{root.ID: root},
 	}
 
-	// BFS to find all connected issues (via any dependency type)
-	// We traverse both directions: dependents and dependencies
+	// BFS to find all connected issues (via any dependency type).
+	// Traverse both directions: dependents AND dependencies (GH#2145).
 	queue := []string{root.ID}
 	visited := map[string]bool{root.ID: true}
 
@@ -226,11 +412,18 @@ func loadGraphSubgraph(ctx context.Context, s storage.Storage, issueID string) (
 			}
 		}
 
-		// Get issues this one depends on (dependencies) - but only for non-root
-		// to avoid pulling in unrelated upstream issues
-		if currentID == root.ID {
-			// For root, we might want to include direct dependencies too
-			// Skip for now to keep graph focused on "what this issue encompasses"
+		// Get issues this one depends on (dependencies)
+		dependencies, err := s.GetDependencies(ctx, currentID)
+		if err != nil {
+			continue
+		}
+		for _, dep := range dependencies {
+			if !visited[dep.ID] {
+				visited[dep.ID] = true
+				subgraph.Issues = append(subgraph.Issues, dep)
+				subgraph.IssueMap[dep.ID] = dep
+				queue = append(queue, dep.ID)
+			}
 		}
 	}
 
@@ -241,6 +434,30 @@ func loadGraphSubgraph(ctx context.Context, s storage.Storage, issueID string) (
 			continue
 		}
 		for _, dep := range deps {
+			// Resolve external deps via routing (bd-k0pfm)
+			if strings.HasPrefix(dep.DependsOnID, "external:") {
+				parts := strings.SplitN(dep.DependsOnID, ":", 3)
+				if len(parts) == 3 && parts[2] != "" {
+					targetID := parts[2]
+					if _, exists := subgraph.IssueMap[targetID]; !exists {
+						result, routeErr := resolveAndGetIssueWithRouting(ctx, store, targetID)
+						if routeErr == nil && result != nil && result.Issue != nil {
+							subgraph.Issues = append(subgraph.Issues, result.Issue)
+							subgraph.IssueMap[result.Issue.ID] = result.Issue
+							// Rewrite dep to use the resolved issue ID
+							dep.DependsOnID = result.Issue.ID
+							result.Close()
+						} else {
+							if result != nil {
+								result.Close()
+							}
+							continue
+						}
+					} else {
+						dep.DependsOnID = targetID
+					}
+				}
+			}
 			// Only include dependencies where both ends are in the subgraph
 			if _, ok := subgraph.IssueMap[dep.DependsOnID]; ok {
 				subgraph.Dependencies = append(subgraph.Dependencies, dep)
@@ -252,8 +469,10 @@ func loadGraphSubgraph(ctx context.Context, s storage.Storage, issueID string) (
 }
 
 // loadAllGraphSubgraphs loads all open issues and groups them by connected component
-// Each component is a subgraph of issues that share dependencies
-func loadAllGraphSubgraphs(ctx context.Context, s storage.Storage) ([]*TemplateSubgraph, error) {
+// Each component is a subgraph of issues that share dependencies. The defensive
+// row cap (be-x42v) is propagated to each per-status SearchIssues call so any
+// single status that exceeds the cap returns the typed error directly.
+func loadAllGraphSubgraphs(ctx context.Context, s storage.DoltStorage, maxRows int, maxRowsSource string) ([]*TemplateSubgraph, error) {
 	if s == nil {
 		return nil, fmt.Errorf("no database connection")
 	}
@@ -264,7 +483,9 @@ func loadAllGraphSubgraphs(ctx context.Context, s storage.Storage) ([]*TemplateS
 	for _, status := range []types.Status{types.StatusOpen, types.StatusInProgress, types.StatusBlocked} {
 		statusCopy := status
 		issues, err := s.SearchIssues(ctx, "", types.IssueFilter{
-			Status: &statusCopy,
+			Status:        &statusCopy,
+			MaxRows:       maxRows,
+			MaxRowsSource: maxRowsSource,
 		})
 		if err != nil {
 			return nil, fmt.Errorf("failed to search issues: %w", err)
@@ -290,6 +511,29 @@ func loadAllGraphSubgraphs(ctx context.Context, s storage.Storage) ([]*TemplateS
 			continue
 		}
 		for _, dep := range deps {
+			// Resolve external deps via routing (bd-k0pfm)
+			if strings.HasPrefix(dep.DependsOnID, "external:") {
+				parts := strings.SplitN(dep.DependsOnID, ":", 3)
+				if len(parts) == 3 && parts[2] != "" {
+					targetID := parts[2]
+					if _, exists := issueMap[targetID]; !exists {
+						result, routeErr := resolveAndGetIssueWithRouting(ctx, store, targetID)
+						if routeErr == nil && result != nil && result.Issue != nil {
+							allIssues = append(allIssues, result.Issue)
+							issueMap[result.Issue.ID] = result.Issue
+							dep.DependsOnID = result.Issue.ID
+							result.Close()
+						} else {
+							if result != nil {
+								result.Close()
+							}
+							continue
+						}
+					} else {
+						dep.DependsOnID = targetID
+					}
+				}
+			}
 			// Only include deps where both ends are in our issue set
 			if _, ok := issueMap[dep.DependsOnID]; ok {
 				allDeps = append(allDeps, dep)
@@ -297,6 +541,10 @@ func loadAllGraphSubgraphs(ctx context.Context, s storage.Storage) ([]*TemplateS
 		}
 	}
 
+	return assembleAllSubgraphs(allIssues, issueMap, allDeps), nil
+}
+
+func assembleAllSubgraphs(allIssues []*types.Issue, issueMap map[string]*types.Issue, allDeps []*types.Dependency) []*TemplateSubgraph {
 	// Build adjacency list for union-find
 	adj := make(map[string][]string)
 	for _, dep := range allDeps {
@@ -399,14 +647,168 @@ func loadAllGraphSubgraphs(ctx context.Context, s storage.Storage) ([]*TemplateS
 		subgraphs = append(subgraphs, subgraph)
 	}
 
-	return subgraphs, nil
+	return subgraphs
+}
+
+// isOpenStatus returns true for statuses considered "open" / actionable.
+// Closed and deferred (frozen) issues are excluded by --open.
+func isOpenStatus(s types.Status) bool {
+	switch s {
+	case types.StatusOpen, types.StatusInProgress, types.StatusBlocked:
+		return true
+	default:
+		return false
+	}
+}
+
+// filterSubgraphOpen removes closed/deferred issues from a subgraph and
+// computes a transitive closure of blocking edges through removed nodes so
+// that indirect blocking relationships are preserved.
+//
+// Example: if A(open) blocks B(closed) blocks C(open), the filtered graph
+// contains A and C with a synthetic edge A→C.
+func filterSubgraphOpen(subgraph *TemplateSubgraph) *TemplateSubgraph {
+	if subgraph == nil {
+		return nil
+	}
+
+	openSet := make(map[string]bool)
+	for _, issue := range subgraph.Issues {
+		if isOpenStatus(issue.Status) {
+			openSet[issue.ID] = true
+		}
+	}
+
+	if len(openSet) == 0 {
+		return nil
+	}
+
+	// Build full blocking graph (all nodes, including closed) for transitive
+	// closure. blocksAdj: A→B means "A blocks B" (B depends on A).
+	blocksAdj := make(map[string][]string)
+	for _, dep := range subgraph.Dependencies {
+		if dep.Type == types.DepBlocks {
+			blocksAdj[dep.DependsOnID] = append(blocksAdj[dep.DependsOnID], dep.IssueID)
+		}
+	}
+
+	// For each open node, BFS forward through the blocking graph to find all
+	// reachable open nodes. Each such reachable open node has a transitive
+	// blocking relationship.
+	type edge struct{ from, to string }
+	syntheticEdges := make(map[edge]bool)
+
+	for src := range openSet {
+		visited := map[string]bool{src: true}
+		queue := []string{src}
+		for len(queue) > 0 {
+			cur := queue[0]
+			queue = queue[1:]
+			for _, next := range blocksAdj[cur] {
+				if visited[next] {
+					continue
+				}
+				visited[next] = true
+				if openSet[next] {
+					syntheticEdges[edge{src, next}] = true
+				}
+				if !openSet[next] {
+					queue = append(queue, next)
+				}
+			}
+		}
+	}
+
+	// Build filtered subgraph
+	filtered := &TemplateSubgraph{
+		IssueMap: make(map[string]*types.Issue, len(openSet)),
+	}
+	for _, issue := range subgraph.Issues {
+		if openSet[issue.ID] {
+			filtered.Issues = append(filtered.Issues, issue)
+			filtered.IssueMap[issue.ID] = issue
+		}
+	}
+
+	// Keep non-blocks deps where both ends are open, and rebuild blocks
+	// deps from the transitive closure.
+	seen := make(map[edge]bool)
+	for _, dep := range subgraph.Dependencies {
+		if !openSet[dep.IssueID] || !openSet[dep.DependsOnID] {
+			continue
+		}
+		if dep.Type == types.DepBlocks {
+			e := edge{dep.DependsOnID, dep.IssueID}
+			if !seen[e] {
+				seen[e] = true
+				filtered.Dependencies = append(filtered.Dependencies, dep)
+			}
+		} else {
+			filtered.Dependencies = append(filtered.Dependencies, dep)
+		}
+	}
+	// Add synthetic transitive edges
+	for e := range syntheticEdges {
+		if seen[e] {
+			continue
+		}
+		seen[e] = true
+		filtered.Dependencies = append(filtered.Dependencies, &types.Dependency{
+			IssueID:     e.to,
+			DependsOnID: e.from,
+			Type:        types.DepBlocks,
+		})
+	}
+
+	// Pick root: prefer original root if still open, else highest-priority open issue
+	if subgraph.Root != nil && openSet[subgraph.Root.ID] {
+		filtered.Root = subgraph.Root
+	} else {
+		for _, issue := range filtered.Issues {
+			if filtered.Root == nil || issue.Priority < filtered.Root.Priority {
+				filtered.Root = issue
+			}
+		}
+	}
+
+	return filtered
 }
 
 // computeLayout assigns layers to nodes using topological sort
+// mergeSubgraphsForHTML joins disconnected components into one subgraph so
+// `bd graph --all --html` emits a single valid HTML document.
+func mergeSubgraphsForHTML(subgraphs []*TemplateSubgraph) *TemplateSubgraph {
+	switch len(subgraphs) {
+	case 0:
+		return &TemplateSubgraph{IssueMap: make(map[string]*types.Issue)}
+	case 1:
+		return subgraphs[0]
+	}
+	merged := &TemplateSubgraph{
+		IssueMap: make(map[string]*types.Issue),
+	}
+	for _, sg := range subgraphs {
+		for _, issue := range sg.Issues {
+			merged.IssueMap[issue.ID] = issue
+		}
+		merged.Dependencies = append(merged.Dependencies, sg.Dependencies...)
+	}
+	merged.Issues = make([]*types.Issue, 0, len(merged.IssueMap))
+	for _, issue := range merged.IssueMap {
+		merged.Issues = append(merged.Issues, issue)
+	}
+	sort.Slice(merged.Issues, func(i, j int) bool {
+		return merged.Issues[i].ID < merged.Issues[j].ID
+	})
+	return merged
+}
+
 func computeLayout(subgraph *TemplateSubgraph) *GraphLayout {
 	layout := &GraphLayout{
-		Nodes:  make(map[string]*GraphNode),
-		RootID: subgraph.Root.ID,
+		Nodes: make(map[string]*GraphNode),
+	}
+	if subgraph.Root != nil {
+		layout.RootID = subgraph.Root.ID
 	}
 
 	// Build dependency map (only "blocks" dependencies, not parent-child)
@@ -471,6 +873,32 @@ func computeLayout(subgraph *TemplateSubgraph) *GraphLayout {
 	for _, node := range layout.Nodes {
 		if node.Layer < 0 {
 			node.Layer = 0
+		}
+	}
+
+	// Lift children to at least their parent's layer (GH#1748).
+	// Parent-child deps are not blocking deps, but children logically belong
+	// to their parent's scope. If a parent epic is blocked (higher layer),
+	// its children should appear in the same layer, not float in Layer 0.
+	parentOf := make(map[string]string) // childID -> parentID
+	for _, dep := range subgraph.Dependencies {
+		if dep.Type == types.DepParentChild {
+			parentOf[dep.IssueID] = dep.DependsOnID
+		}
+	}
+	if len(parentOf) > 0 {
+		// Iterate until stable — handles nested parent-child hierarchies
+		changed = true
+		for changed {
+			changed = false
+			for childID, parentID := range parentOf {
+				childNode := layout.Nodes[childID]
+				parentNode := layout.Nodes[parentID]
+				if childNode != nil && parentNode != nil && childNode.Layer < parentNode.Layer {
+					childNode.Layer = parentNode.Layer
+					changed = true
+				}
+			}
 		}
 	}
 
@@ -624,7 +1052,7 @@ func renderGraphCompact(layout *GraphLayout, subgraph *TemplateSubgraph) {
 			if nodeI.Issue.Priority != nodeJ.Issue.Priority {
 				return nodeI.Issue.Priority < nodeJ.Issue.Priority
 			}
-			return nodeI.Issue.ID < nodeJ.Issue.ID
+			return utils.NaturalCompareIDs(nodeI.Issue.ID, nodeJ.Issue.ID) < 0
 		})
 	}
 
@@ -703,7 +1131,7 @@ func formatCompactNode(node *GraphNode) string {
 	// Use shared status icon with semantic color
 	statusIcon := ui.RenderStatusIcon(status)
 
-	// Priority with icon
+	// Priority with semantic color (P-label only)
 	priorityTag := ui.RenderPriority(node.Issue.Priority)
 
 	// Title - truncate if too long
@@ -715,7 +1143,7 @@ func formatCompactNode(node *GraphNode) string {
 		return fmt.Sprintf("%s %s %s %s",
 			statusIcon,
 			style.Render(node.Issue.ID),
-			style.Render(fmt.Sprintf("● P%d", node.Issue.Priority)),
+			style.Render(fmt.Sprintf("P%d", node.Issue.Priority)),
 			style.Render(title))
 	}
 

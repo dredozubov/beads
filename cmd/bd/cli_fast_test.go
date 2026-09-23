@@ -1,11 +1,11 @@
-//go:build integration
-// +build integration
+//go:build cgo && integration
 
 package main
 
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,11 +29,86 @@ var (
 	inProcessMutex sync.Mutex // Protects concurrent access to rootCmd and global state
 )
 
-// setupCLITestDB creates a fresh initialized bd database for CLI tests
+// templateDB holds a pre-initialized bd database directory.
+// Created once via sync.Once, then copied for each test to avoid
+// running bd init (which creates SQLite DB, config files, etc.) per test.
+// This optimization eliminates ~2s per test from repeated initialization.
+var (
+	templateDBDir  string
+	templateDBOnce sync.Once
+	templateDBErr  error
+)
+
+// initTemplateDB creates a single template database that can be copied for each test.
+// Uses exec.Command (subprocess) to avoid polluting Cobra global state.
+// The testBD binary is already built once in init().
+func initTemplateDB() {
+	templateDBOnce.Do(func() {
+		tmpDir, err := os.MkdirTemp("", "bd-cli-template-*")
+		if err != nil {
+			templateDBErr = fmt.Errorf("failed to create template dir: %w", err)
+			return
+		}
+		templateDBDir = tmpDir
+
+		// Use exec.Command to run bd init in a subprocess.
+		// This avoids any Cobra global state pollution that would affect subsequent
+		// in-process test runs.
+		cmd := exec.Command(testBD, "init", "--prefix", "test", "--quiet")
+		cmd.Dir = tmpDir
+		cmd.Env = os.Environ()
+		if out, err := cmd.CombinedOutput(); err != nil {
+			templateDBErr = fmt.Errorf("template bd init failed: %v\n%s", err, out)
+			return
+		}
+	})
+}
+
+// copyDir recursively copies a directory tree.
+func copyDir(src, dst string) error {
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(dst, 0750); err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		srcPath := filepath.Join(src, entry.Name())
+		dstPath := filepath.Join(dst, entry.Name())
+		if entry.IsDir() {
+			if err := copyDir(srcPath, dstPath); err != nil {
+				return err
+			}
+		} else {
+			data, err := os.ReadFile(srcPath)
+			if err != nil {
+				return err
+			}
+			if err := os.WriteFile(dstPath, data, 0600); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// setupCLITestDB creates a fresh initialized bd database for CLI tests.
+// Uses a cached template directory to avoid running bd init for every test.
+// The template is created once via sync.Once and copied for each test.
 func setupCLITestDB(t *testing.T) string {
 	t.Helper()
+	if testDoltServerPort == 0 {
+		t.Skip("skipping: Dolt test container not available")
+	}
+	initTemplateDB()
+	if templateDBErr != nil {
+		t.Fatalf("Template DB initialization failed: %v", templateDBErr)
+	}
 	tmpDir := createTempDirWithCleanup(t)
-	runBDInProcess(t, tmpDir, "init", "--prefix", "test", "--quiet")
+	if err := copyDir(templateDBDir, tmpDir); err != nil {
+		t.Fatalf("Failed to copy template DB: %v", err)
+	}
 	return tmpDir
 }
 
@@ -41,12 +116,12 @@ func setupCLITestDB(t *testing.T) string {
 // This prevents test failures from SQLite file lock cleanup issues
 func createTempDirWithCleanup(t *testing.T) string {
 	t.Helper()
-	
+
 	tmpDir, err := os.MkdirTemp("", "bd-cli-test-*")
 	if err != nil {
 		t.Fatalf("Failed to create temp dir: %v", err)
 	}
-	
+
 	t.Cleanup(func() {
 		// Retry cleanup with delays to handle SQLite file locks
 		// Don't fail the test if cleanup fails - just log it
@@ -62,7 +137,7 @@ func createTempDirWithCleanup(t *testing.T) string {
 		// Final attempt failed - log but don't fail test
 		t.Logf("Warning: Failed to clean up temp dir %s (SQLite file locks)", tmpDir)
 	})
-	
+
 	return tmpDir
 }
 
@@ -70,109 +145,81 @@ func createTempDirWithCleanup(t *testing.T) string {
 // This is ~10-20x faster than exec.Command because it avoids process spawn overhead
 func runBDInProcess(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	
+
 	// Serialize all in-process test execution to avoid race conditions
 	// rootCmd, cobra state, and viper are not thread-safe
 	inProcessMutex.Lock()
 	defer inProcessMutex.Unlock()
-	
-	// Add --no-daemon to all commands except init
-	if len(args) > 0 && args[0] != "init" {
-		args = append([]string{"--no-daemon"}, args...)
-	}
-	
+
 	// Save original state
 	oldStdout := os.Stdout
 	oldStderr := os.Stderr
 	oldDir, _ := os.Getwd()
 	oldArgs := os.Args
-	
+
 	// Change to test directory
 	if err := os.Chdir(dir); err != nil {
 		t.Fatalf("Failed to chdir to %s: %v", dir, err)
 	}
-	
+
 	// Capture stdout/stderr
 	rOut, wOut, _ := os.Pipe()
 	rErr, wErr, _ := os.Pipe()
 	os.Stdout = wOut
 	os.Stderr = wErr
-	
+	defer func() {
+		os.Stdout = oldStdout
+		os.Stderr = oldStderr
+	}()
+
 	// Set args for rootCmd
 	rootCmd.SetArgs(args)
 	os.Args = append([]string{"bd"}, args...)
-	
-	// Set environment
-	os.Setenv("BEADS_NO_DAEMON", "1")
-	defer os.Unsetenv("BEADS_NO_DAEMON")
-	
+
 	// Execute command
 	err := rootCmd.Execute()
-	
+
 	// Close and clean up all global state to prevent contamination between tests
 	if store != nil {
 		store.Close()
 		store = nil
 	}
-	if daemonClient != nil {
-		daemonClient.Close()
-		daemonClient = nil
-	}
-	
 	// Reset all global flags and state
 	dbPath = ""
 	actor = ""
 	jsonOutput = false
-	noDaemon = false
-	noAutoFlush = false
-	noAutoImport = false
 	sandboxMode = false
-	noDb = false
-	autoFlushEnabled = true
-	storeActive = false
-	flushFailureCount = 0
-	lastFlushError = nil
-	// Shutdown any existing FlushManager
-	if flushManager != nil {
-		_ = flushManager.Shutdown()
-		flushManager = nil
-	}
 	// Reset context state
 	rootCtx = nil
 	rootCancel = nil
-	
+
 	// Give SQLite time to release file locks before cleanup
 	time.Sleep(10 * time.Millisecond)
-	
+
 	// Close writers and restore
 	wOut.Close()
 	wErr.Close()
-	os.Stdout = oldStdout
-	os.Stderr = oldStderr
 	os.Chdir(oldDir)
 	os.Args = oldArgs
 	rootCmd.SetArgs(nil)
-	
+
 	// Read output (keep stdout and stderr separate)
 	var outBuf, errBuf bytes.Buffer
 	outBuf.ReadFrom(rOut)
 	errBuf.ReadFrom(rErr)
-	
+
 	stdout := outBuf.String()
 	stderr := errBuf.String()
-	
+
 	if err != nil {
 		t.Fatalf("bd %v failed: %v\nStdout: %s\nStderr: %s", args, err, stdout, stderr)
 	}
-	
+
 	// Return only stdout (stderr contains warnings that break JSON parsing)
 	return stdout
 }
 
 func TestCLI_Ready(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping slow CLI test in short mode")
-	}
 	// Note: Not using t.Parallel() because inProcessMutex serializes execution anyway
 	tmpDir := setupCLITestDB(t)
 	runBDInProcess(t, tmpDir, "create", "Ready issue", "-p", "1")
@@ -183,20 +230,17 @@ func TestCLI_Ready(t *testing.T) {
 }
 
 func TestCLI_Create(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping slow CLI test in short mode")
-	}
 	// Note: Not using t.Parallel() because inProcessMutex serializes execution anyway
 	tmpDir := setupCLITestDB(t)
 	out := runBDInProcess(t, tmpDir, "create", "Test issue", "-p", "1", "--json")
-	
+
 	// Extract JSON from output (may contain warnings before JSON)
 	jsonStart := strings.Index(out, "{")
 	if jsonStart == -1 {
 		t.Fatalf("No JSON found in output: %s", out)
 	}
 	jsonOut := out[jsonStart:]
-	
+
 	var result map[string]interface{}
 	if err := json.Unmarshal([]byte(jsonOut), &result); err != nil {
 		t.Fatalf("Failed to parse JSON: %v\nOutput: %s", err, jsonOut)
@@ -206,15 +250,43 @@ func TestCLI_Create(t *testing.T) {
 	}
 }
 
-func TestCLI_List(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping slow CLI test in short mode")
+// TestCLI_CreateActorPrecedence is a CLI-level regression test for GH#4645:
+// with both BEADS_ACTOR and the deprecated BD_ACTOR set, `bd create` must
+// stamp created_by with BEADS_ACTOR's value. Unlike TestResolveConfiguredActor
+// (which calls resolveConfiguredActor() directly), this drives the real
+// command through rootCmd.Execute() so it also covers the root
+// PersistentPreRunE / refreshBoundCommandConfig wiring that pre-populates the
+// global actor before create.go ever runs — reverting either call site would
+// leave TestResolveConfiguredActor green but this test red.
+func TestCLI_CreateActorPrecedence(t *testing.T) {
+	// Note: Not using t.Parallel() because inProcessMutex serializes execution anyway
+	tmpDir := setupCLITestDB(t)
+	t.Setenv("BD_ACTOR", "from-bd-actor")
+	t.Setenv("BEADS_ACTOR", "from-beads-actor")
+
+	out := runBDInProcess(t, tmpDir, "create", "Actor precedence test", "-p", "1", "--json")
+
+	jsonStart := strings.Index(out, "{")
+	if jsonStart == -1 {
+		t.Fatalf("No JSON found in output: %s", out)
 	}
+	jsonOut := out[jsonStart:]
+
+	var result map[string]interface{}
+	if err := json.Unmarshal([]byte(jsonOut), &result); err != nil {
+		t.Fatalf("Failed to parse JSON: %v\nOutput: %s", err, jsonOut)
+	}
+	if result["created_by"] != "from-beads-actor" {
+		t.Errorf("created_by = %v, want %q (BEADS_ACTOR must outrank deprecated BD_ACTOR)", result["created_by"], "from-beads-actor")
+	}
+}
+
+func TestCLI_List(t *testing.T) {
 	// Note: Not using t.Parallel() because inProcessMutex serializes execution anyway
 	tmpDir := setupCLITestDB(t)
 	runBDInProcess(t, tmpDir, "create", "First", "-p", "1")
 	runBDInProcess(t, tmpDir, "create", "Second", "-p", "2")
-	
+
 	out := runBDInProcess(t, tmpDir, "list", "--json")
 	var issues []map[string]interface{}
 	if err := json.Unmarshal([]byte(out), &issues); err != nil {
@@ -226,19 +298,16 @@ func TestCLI_List(t *testing.T) {
 }
 
 func TestCLI_Update(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping slow CLI test in short mode")
-	}
 	// Note: Not using t.Parallel() because inProcessMutex serializes execution anyway
 	tmpDir := setupCLITestDB(t)
 	out := runBDInProcess(t, tmpDir, "create", "Issue to update", "-p", "1", "--json")
-	
+
 	var issue map[string]interface{}
 	json.Unmarshal([]byte(out), &issue)
 	id := issue["id"].(string)
-	
+
 	runBDInProcess(t, tmpDir, "update", id, "--status", "in_progress")
-	
+
 	out = runBDInProcess(t, tmpDir, "show", id, "--json")
 	var updated []map[string]interface{}
 	json.Unmarshal([]byte(out), &updated)
@@ -248,9 +317,6 @@ func TestCLI_Update(t *testing.T) {
 }
 
 func TestCLI_UpdateLabels(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping slow CLI test in short mode")
-	}
 	// Note: Not using t.Parallel() because inProcessMutex serializes execution anyway
 	tmpDir := setupCLITestDB(t)
 	out := runBDInProcess(t, tmpDir, "create", "Issue for label testing", "-p", "2", "--json")
@@ -312,20 +378,396 @@ func TestCLI_UpdateLabels(t *testing.T) {
 	}
 }
 
-func TestCLI_Close(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping slow CLI test in short mode")
-	}
+func TestCLI_UpdateEphemeral(t *testing.T) {
 	// Note: Not using t.Parallel() because inProcessMutex serializes execution anyway
 	tmpDir := setupCLITestDB(t)
-	out := runBDInProcess(t, tmpDir, "create", "Issue to close", "-p", "1", "--json")
-	
+	out := runBDInProcess(t, tmpDir, "create", "Issue for ephemeral testing", "-p", "2", "--json")
+
+	var issue map[string]interface{}
+	if err := json.Unmarshal([]byte(out), &issue); err != nil {
+		t.Fatalf("Failed to parse create output: %v", err)
+	}
+	id := issue["id"].(string)
+
+	// Mark as ephemeral
+	runBDInProcess(t, tmpDir, "update", id, "--ephemeral")
+
+	out = runBDInProcess(t, tmpDir, "show", id, "--json")
+	var updated []map[string]interface{}
+	if err := json.Unmarshal([]byte(out), &updated); err != nil {
+		t.Fatalf("Failed to parse show output: %v", err)
+	}
+	if updated[0]["ephemeral"] != true {
+		t.Errorf("Expected ephemeral to be true after --ephemeral, got: %v", updated[0]["ephemeral"])
+	}
+}
+
+func TestCLI_UpdatePersistent(t *testing.T) {
+	// Note: Not using t.Parallel() because inProcessMutex serializes execution anyway
+	tmpDir := setupCLITestDB(t)
+
+	// Create ephemeral issue directly
+	out := runBDInProcess(t, tmpDir, "create", "Ephemeral issue", "-p", "2", "--ephemeral", "--json")
+
+	var issue map[string]interface{}
+	if err := json.Unmarshal([]byte(out), &issue); err != nil {
+		t.Fatalf("Failed to parse create output: %v", err)
+	}
+	id := issue["id"].(string)
+
+	// Verify it's ephemeral
+	out = runBDInProcess(t, tmpDir, "show", id, "--json")
+	var initial []map[string]interface{}
+	if err := json.Unmarshal([]byte(out), &initial); err != nil {
+		t.Fatalf("Failed to parse show output: %v", err)
+	}
+	if initial[0]["ephemeral"] != true {
+		t.Fatalf("Expected issue to be ephemeral initially, got: %v", initial[0]["ephemeral"])
+	}
+
+	// Promote to persistent
+	runBDInProcess(t, tmpDir, "update", id, "--persistent")
+
+	out = runBDInProcess(t, tmpDir, "show", id, "--json")
+	var updated []map[string]interface{}
+	if err := json.Unmarshal([]byte(out), &updated); err != nil {
+		t.Fatalf("Failed to parse show output after persistent: %v", err)
+	}
+	if updated[0]["ephemeral"] == true {
+		t.Errorf("Expected ephemeral to be false after --persistent, got: %v", updated[0]["ephemeral"])
+	}
+}
+
+func TestCLI_UpdateEphemeralMutualExclusion(t *testing.T) {
+	// Note: Not using t.Parallel() because inProcessMutex serializes execution anyway
+	tmpDir := setupCLITestDB(t)
+	out := runBDInProcess(t, tmpDir, "create", "Issue for mutual exclusion test", "-p", "2", "--json")
+
 	var issue map[string]interface{}
 	json.Unmarshal([]byte(out), &issue)
 	id := issue["id"].(string)
-	
+
+	// Both flags should error
+	_, stderr, err := runBDInProcessAllowError(t, tmpDir, "update", id, "--ephemeral", "--persistent")
+	if err == nil {
+		t.Errorf("Expected error when both flags specified, got none")
+	}
+	if !strings.Contains(stderr, "cannot specify both") {
+		t.Errorf("Expected mutual exclusion error message, got: %v", stderr)
+	}
+}
+
+func TestCLI_UpdateAppendNotes(t *testing.T) {
+	tmpDir := setupCLITestDB(t)
+	out := runBDInProcess(t, tmpDir, "create", "Issue for append-notes test", "-p", "2", "--notes", "Original notes", "--json")
+
+	var issue map[string]interface{}
+	json.Unmarshal([]byte(out), &issue)
+	id := issue["id"].(string)
+
+	// Test appending notes
+	runBDInProcess(t, tmpDir, "update", id, "--append-notes", "Appended content")
+
+	out = runBDInProcess(t, tmpDir, "show", id, "--json")
+	var updated []map[string]interface{}
+	json.Unmarshal([]byte(out), &updated)
+	notes := updated[0]["notes"].(string)
+	if notes != "Original notes\nAppended content" {
+		t.Errorf("Expected 'Original notes\\nAppended content', got: %q", notes)
+	}
+
+	// Test appending to empty notes
+	out = runBDInProcess(t, tmpDir, "create", "Issue with empty notes", "-p", "2", "--json")
+	json.Unmarshal([]byte(out), &issue)
+	id2 := issue["id"].(string)
+
+	runBDInProcess(t, tmpDir, "update", id2, "--append-notes", "First note")
+
+	out = runBDInProcess(t, tmpDir, "show", id2, "--json")
+	json.Unmarshal([]byte(out), &updated)
+	notes = updated[0]["notes"].(string)
+	if notes != "First note" {
+		t.Errorf("Expected 'First note', got: %q", notes)
+	}
+}
+
+func TestCLI_UpdateAppendNotesMutualExclusion(t *testing.T) {
+	tmpDir := setupCLITestDB(t)
+	out := runBDInProcess(t, tmpDir, "create", "Issue for notes mutual exclusion", "-p", "2", "--json")
+
+	var issue map[string]interface{}
+	json.Unmarshal([]byte(out), &issue)
+	id := issue["id"].(string)
+
+	// Both --notes and --append-notes should error
+	_, stderr, err := runBDInProcessAllowError(t, tmpDir, "update", id, "--notes", "New notes", "--append-notes", "Appended")
+	if err == nil {
+		t.Errorf("Expected error when both --notes and --append-notes specified, got none")
+	}
+	if !strings.Contains(stderr, "cannot specify both --notes and --append-notes") {
+		t.Errorf("Expected mutual exclusion error message, got: %v", stderr)
+	}
+}
+
+func TestCLI_NoteCommand(t *testing.T) {
+	tmpDir := setupCLITestDB(t)
+
+	// Create an issue with initial notes
+	out := runBDInProcess(t, tmpDir, "create", "Issue for note test", "-p", "2", "--notes", "Original notes", "--json")
+	var issue map[string]interface{}
+	json.Unmarshal([]byte(out), &issue)
+	id := issue["id"].(string)
+
+	// Test: bd note <id> <text> appends to existing notes
+	runBDInProcess(t, tmpDir, "note", id, "Added via note command")
+	out = runBDInProcess(t, tmpDir, "show", id, "--json")
+	var updated []map[string]interface{}
+	json.Unmarshal([]byte(out), &updated)
+	notes := updated[0]["notes"].(string)
+	if notes != "Original notes\nAdded via note command" {
+		t.Errorf("Expected 'Original notes\\nAdded via note command', got: %q", notes)
+	}
+
+	// Test: bd note <id> with multiple words joins them
+	runBDInProcess(t, tmpDir, "note", id, "second", "note", "here")
+	out = runBDInProcess(t, tmpDir, "show", id, "--json")
+	json.Unmarshal([]byte(out), &updated)
+	notes = updated[0]["notes"].(string)
+	if notes != "Original notes\nAdded via note command\nsecond note here" {
+		t.Errorf("Expected three lines, got: %q", notes)
+	}
+
+	// Test: bd note on issue with no existing notes
+	out = runBDInProcess(t, tmpDir, "create", "Issue with no notes", "-p", "2", "--json")
+	json.Unmarshal([]byte(out), &issue)
+	id2 := issue["id"].(string)
+
+	runBDInProcess(t, tmpDir, "note", id2, "First note ever")
+	out = runBDInProcess(t, tmpDir, "show", id2, "--json")
+	json.Unmarshal([]byte(out), &updated)
+	notes = updated[0]["notes"].(string)
+	if notes != "First note ever" {
+		t.Errorf("Expected 'First note ever', got: %q", notes)
+	}
+
+	// Test: bd note with no text should fail
+	_, stderr, err := runBDInProcessAllowError(t, tmpDir, "note", id)
+	if err == nil {
+		t.Errorf("Expected error when no note text provided, got none")
+	}
+	if !strings.Contains(stderr, "no note text provided") {
+		t.Errorf("Expected 'no note text provided' error, got: %v", stderr)
+	}
+}
+
+// TestCLI_NoteListMisplacedSyntax is a regression test for "note" silently
+// mis-resolving a subcommand-like typo as an issue id (GH#5370). Mirrors
+// TestCLI_CommentListMisplacedSyntax (#5369): "bd note list <text>" used to
+// parse as id="list", text=[<text>...] with no validation on the id — since
+// no issue is literally named "list", ResolvePartialID's substring/prefix
+// fallback would silently match it against whatever existing bead or wisp id
+// happened to contain "list" and append the note there instead of erroring.
+// This asserts both halves of the fix: the command is rejected with a
+// helpful hint, AND no note silently landed on an unrelated real issue.
+func TestCLI_NoteListMisplacedSyntax(t *testing.T) {
+	tmpDir := setupCLITestDB(t)
+
+	out := runBDInProcess(t, tmpDir, "create", "Bystander issue", "-p", "1", "--json")
+	jsonStart := strings.Index(out, "{")
+	if jsonStart < 0 {
+		t.Fatalf("No JSON found in create output: %s", out)
+	}
+	var issue map[string]interface{}
+	if err := json.Unmarshal([]byte(out[jsonStart:]), &issue); err != nil {
+		t.Fatalf("Failed to parse create JSON: %v\nOutput: %s", err, out)
+	}
+	fullID := issue["id"].(string)
+
+	// Snapshot notes BEFORE the rejected command. runBDInProcess reuses the
+	// package-level rootCmd without resetting cobra flag state, so an earlier
+	// test's --notes value can leak into this create. Asserting before==after
+	// is immune to that leak and is a stronger regression check: the rejected
+	// command wrote nothing (GH#5370 review fix-round).
+	beforeShow := runBDInProcess(t, tmpDir, "show", fullID, "--json")
+	var beforeShown []map[string]interface{}
+	if err := json.Unmarshal([]byte(beforeShow), &beforeShown); err != nil {
+		t.Fatalf("Failed to parse pre-reject show JSON: %v\nOutput: %s", err, beforeShow)
+	}
+	if len(beforeShown) == 0 {
+		t.Fatalf("expected show to return the bystander issue before reject, got: %s", beforeShow)
+	}
+	notesBefore, _ := beforeShown[0]["notes"].(string)
+
+	stdout, stderr, err := runBDInProcessAllowError(t, tmpDir, "note", "list", "accidental stray text")
+	if err == nil {
+		t.Fatalf("expected non-zero exit, got stdout=%q stderr=%q", stdout, stderr)
+	}
+	combined := stdout + stderr
+	if !strings.Contains(combined, "bd note") || !strings.Contains(combined, "<issue-id>") {
+		t.Fatalf("expected hint pointing at bd note <issue-id>, got stdout=%q stderr=%q", stdout, stderr)
+	}
+
+	// The regression check: the bystander issue's notes must be UNCHANGED.
+	// Pre-fix, this could silently succeed and land a note on whatever
+	// bead's id happened to contain "list" as a substring.
+	showOut := runBDInProcess(t, tmpDir, "show", fullID, "--json")
+	var shown []map[string]interface{}
+	if err := json.Unmarshal([]byte(showOut), &shown); err != nil {
+		t.Fatalf("Failed to parse show JSON: %v\nOutput: %s", err, showOut)
+	}
+	if len(shown) == 0 {
+		t.Fatalf("expected show to return the bystander issue, got: %s", showOut)
+	}
+	notesAfter, _ := shown[0]["notes"].(string)
+	if notesAfter != notesBefore {
+		t.Fatalf("expected bystander issue %s notes unchanged after rejected 'note list' (before=%q after=%q)", fullID, notesBefore, notesAfter)
+	}
+}
+
+// TestCLI_NoteAddMisplacedSyntax mirrors TestCLI_NoteListMisplacedSyntax
+// for the symmetric "add" typo — a caller who types "bd note add <id> <text>"
+// (confusing note with comments-style "add") would parse as id="add",
+// text=[<id>, <text>...].
+func TestCLI_NoteAddMisplacedSyntax(t *testing.T) {
+	tmpDir := setupCLITestDB(t)
+
+	out := runBDInProcess(t, tmpDir, "create", "Bystander issue for add-typo", "-p", "1", "--json")
+	jsonStart := strings.Index(out, "{")
+	if jsonStart < 0 {
+		t.Fatalf("No JSON found in create output: %s", out)
+	}
+	var issue map[string]interface{}
+	if err := json.Unmarshal([]byte(out[jsonStart:]), &issue); err != nil {
+		t.Fatalf("Failed to parse create JSON: %v\nOutput: %s", err, out)
+	}
+	fullID := issue["id"].(string)
+
+	// Snapshot notes BEFORE the rejected command (same order-independence
+	// rationale as TestCLI_NoteListMisplacedSyntax).
+	beforeShow := runBDInProcess(t, tmpDir, "show", fullID, "--json")
+	var beforeShown []map[string]interface{}
+	if err := json.Unmarshal([]byte(beforeShow), &beforeShown); err != nil {
+		t.Fatalf("Failed to parse pre-reject show JSON: %v\nOutput: %s", err, beforeShow)
+	}
+	if len(beforeShown) == 0 {
+		t.Fatalf("expected show to return the bystander issue before reject, got: %s", beforeShow)
+	}
+	notesBefore, _ := beforeShown[0]["notes"].(string)
+
+	stdout, stderr, err := runBDInProcessAllowError(t, tmpDir, "note", "add", fullID, "accidental stray text")
+	if err == nil {
+		t.Fatalf("expected non-zero exit, got stdout=%q stderr=%q", stdout, stderr)
+	}
+	combined := stdout + stderr
+	if !strings.Contains(combined, "bd note") || !strings.Contains(combined, "<issue-id>") {
+		t.Fatalf("expected hint pointing at bd note <issue-id>, got stdout=%q stderr=%q", stdout, stderr)
+	}
+
+	showOut := runBDInProcess(t, tmpDir, "show", fullID, "--json")
+	var shown []map[string]interface{}
+	if err := json.Unmarshal([]byte(showOut), &shown); err != nil {
+		t.Fatalf("Failed to parse show JSON: %v\nOutput: %s", err, showOut)
+	}
+	if len(shown) == 0 {
+		t.Fatalf("expected show to return the bystander issue, got: %s", showOut)
+	}
+	notesAfter, _ := shown[0]["notes"].(string)
+	if notesAfter != notesBefore {
+		t.Fatalf("expected bystander issue %s notes unchanged after rejected 'note add' (before=%q after=%q)", fullID, notesBefore, notesAfter)
+	}
+}
+
+// TestCLI_NoteMisplacedSyntaxRejectedBeforeStoreOpen proves the guard
+// fires from noteCmd's Args validator, before PersistentPreRunE ever
+// opens a store, mirroring
+// TestCLI_CommentMisplacedSyntaxRejectedBeforeStoreOpen for the comment
+// sibling. Using a directory with no .beads/ at all proves the store was
+// never touched: a RunE-only check would have failed first with "no beads
+// database found".
+func TestCLI_NoteMisplacedSyntaxRejectedBeforeStoreOpen(t *testing.T) {
+	noBeadsCwd := t.TempDir()
+	if _, err := os.Stat(filepath.Join(noBeadsCwd, ".beads")); err == nil {
+		t.Fatalf("test setup: %s unexpectedly has a .beads dir", noBeadsCwd)
+	}
+
+	stdout, stderr, err := runBDInProcessAllowError(t, noBeadsCwd, "note", "list", "should not be stored")
+	if err == nil {
+		t.Fatalf("expected non-zero exit for misplaced 'note list', got success:\nstdout: %s", stdout)
+	}
+	combined := stdout + stderr
+	if strings.Contains(combined, "no beads database found") {
+		t.Fatalf("Args validation did not run before store open: got the pre-fix error.\nOutput:\n%s", combined)
+	}
+	if !strings.Contains(combined, "bd note") {
+		t.Errorf("expected hint pointing to `bd note`, got:\n%s", combined)
+	}
+}
+
+// TestCLI_NoteMisplacedSyntaxRejectedInProxiedServerMode is the
+// proxied-server counterpart, mirroring
+// TestCLI_CommentMisplacedSyntaxRejectedInProxiedServerMode: because
+// validateNoteArgs runs in Args — before RunE ever branches on
+// usesProxiedServer() — the rejection fires identically regardless of
+// backend, without needing a real proxied server.
+func TestCLI_NoteMisplacedSyntaxRejectedInProxiedServerMode(t *testing.T) {
+	origProxied := proxiedServerMode
+	t.Cleanup(func() { proxiedServerMode = origProxied })
+	proxiedServerMode = true
+
+	tmpDir := setupCLITestDB(t)
+	stdout, stderr, err := runBDInProcessAllowError(t, tmpDir, "note", "list", "should not be stored")
+	if err == nil {
+		t.Fatalf("expected non-zero exit for misplaced 'note list' in proxied-server mode, got success:\nstdout: %s", stdout)
+	}
+	combined := stdout + stderr
+	if !strings.Contains(combined, "bd note") {
+		t.Errorf("expected hint pointing to `bd note`, got:\n%s", combined)
+	}
+}
+
+// TestCLI_NoteTextStartingWithReservedWordStillWorks confirms the fix is
+// scoped to the id positional argument only: a real id followed by note
+// TEXT that happens to start with "list" or "add" must still work exactly
+// as before, since args[0] (the id slot) is what's checked, never the text.
+func TestCLI_NoteTextStartingWithReservedWordStillWorks(t *testing.T) {
+	tmpDir := setupCLITestDB(t)
+
+	out := runBDInProcess(t, tmpDir, "create", "Issue for reserved-word-text test", "-p", "1", "--json")
+	jsonStart := strings.Index(out, "{")
+	if jsonStart < 0 {
+		t.Fatalf("No JSON found in create output: %s", out)
+	}
+	var issue map[string]interface{}
+	if err := json.Unmarshal([]byte(out[jsonStart:]), &issue); err != nil {
+		t.Fatalf("Failed to parse create JSON: %v\nOutput: %s", err, out)
+	}
+	fullID := issue["id"].(string)
+
+	stdout, stderr, err := runBDInProcessAllowError(t, tmpDir, "note", fullID, "list", "of", "things", "to", "do")
+	if err != nil {
+		t.Fatalf("note with text starting in 'list' unexpectedly failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "Note added") {
+		t.Errorf("Expected 'Note added' in output, got: %s", stdout)
+	}
+
+	showOut := runBDInProcess(t, tmpDir, "show", fullID, "--json")
+	if !strings.Contains(showOut, "list of things to do") {
+		t.Fatalf("expected note text to be stored verbatim, got: %s", showOut)
+	}
+}
+
+func TestCLI_Close(t *testing.T) {
+	// Note: Not using t.Parallel() because inProcessMutex serializes execution anyway
+	tmpDir := setupCLITestDB(t)
+	out := runBDInProcess(t, tmpDir, "create", "Issue to close", "-p", "1", "--json")
+
+	var issue map[string]interface{}
+	json.Unmarshal([]byte(out), &issue)
+	id := issue["id"].(string)
+
 	runBDInProcess(t, tmpDir, "close", id, "--reason", "Done")
-	
+
 	out = runBDInProcess(t, tmpDir, "show", id, "--json")
 	var closed []map[string]interface{}
 	json.Unmarshal([]byte(out), &closed)
@@ -338,45 +780,117 @@ func TestCLI_Close(t *testing.T) {
 }
 
 func TestCLI_DepAdd(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping slow CLI test in short mode")
-	}
 	// Note: Not using t.Parallel() because inProcessMutex serializes execution anyway
 	tmpDir := setupCLITestDB(t)
-	
+
 	out1 := runBDInProcess(t, tmpDir, "create", "First", "-p", "1", "--json")
 	out2 := runBDInProcess(t, tmpDir, "create", "Second", "-p", "1", "--json")
-	
+
 	var issue1, issue2 map[string]interface{}
 	json.Unmarshal([]byte(out1), &issue1)
 	json.Unmarshal([]byte(out2), &issue2)
-	
+
 	id1 := issue1["id"].(string)
 	id2 := issue2["id"].(string)
-	
+
 	out := runBDInProcess(t, tmpDir, "dep", "add", id2, id1)
 	if !strings.Contains(out, "Added dependency") {
 		t.Errorf("Expected 'Added dependency', got: %s", out)
 	}
 }
 
-func TestCLI_DepRemove(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping slow CLI test in short mode")
-	}
+// TestCLI_DepAdd_TypeBlockedByAliasGates is the regression test for GH#5069:
+// `bd dep add A B --type blocked-by` used to store the literal custom type
+// "blocked-by" instead of normalizing it to the canonical "blocks" type, so
+// the dependency was displayed everywhere but silently never gated `bd
+// ready`/`bd blocked`. Assert the alias now gates exactly like the default
+// (canonical) type does.
+func TestCLI_DepAdd_TypeBlockedByAliasGates(t *testing.T) {
 	// Note: Not using t.Parallel() because inProcessMutex serializes execution anyway
 	tmpDir := setupCLITestDB(t)
-	
-	out1 := runBDInProcess(t, tmpDir, "create", "First", "-p", "1", "--json")
-	out2 := runBDInProcess(t, tmpDir, "create", "Second", "-p", "1", "--json")
-	
+
+	out1 := runBDInProcess(t, tmpDir, "create", "Blocker", "-p", "1", "--json")
+	out2 := runBDInProcess(t, tmpDir, "create", "Blocked", "-p", "1", "--json")
+
 	var issue1, issue2 map[string]interface{}
 	json.Unmarshal([]byte(out1), &issue1)
 	json.Unmarshal([]byte(out2), &issue2)
-	
+
+	blockerID := issue1["id"].(string)
+	blockedID := issue2["id"].(string)
+
+	// blockedID depends on (is blocked by) blockerID, using the --type
+	// blocked-by alias rather than the default "blocks" type.
+	out := runBDInProcess(t, tmpDir, "dep", "add", blockedID, blockerID, "--type", "blocked-by")
+	if !strings.Contains(out, "Added dependency") {
+		t.Fatalf("Expected 'Added dependency', got: %s", out)
+	}
+
+	blockedOut := runBDInProcess(t, tmpDir, "blocked")
+	if !strings.Contains(blockedOut, "Blocked") {
+		t.Errorf("Expected 'Blocked' issue in `bd blocked` output after --type blocked-by dep, got: %s", blockedOut)
+	}
+
+	readyOut := runBDInProcess(t, tmpDir, "ready")
+	if strings.Contains(readyOut, "Blocked") {
+		t.Errorf("Expected blocked issue to be excluded from `bd ready` after --type blocked-by dep, got: %s", readyOut)
+	}
+}
+
+// TestCLI_Show_SupersedesIsNotABlocker is the regression test for bd show
+// grouping every dependency type it did not name explicitly into the blocks
+// bucket. A supersedes edge printed under "DEPENDS ON" on the replaced issue
+// and "BLOCKS" on the replacement — a blocking claim that is false, since
+// supersedes takes no part in the ready-work calculation.
+func TestCLI_Show_SupersedesIsNotABlocker(t *testing.T) {
+	// Note: Not using t.Parallel() because inProcessMutex serializes execution anyway
+	tmpDir := setupCLITestDB(t)
+
+	outOld := runBDInProcess(t, tmpDir, "create", "V1 spec", "-p", "1", "--json")
+	outNew := runBDInProcess(t, tmpDir, "create", "V2 spec", "-p", "1", "--json")
+
+	var oldIssue, newIssue map[string]interface{}
+	json.Unmarshal([]byte(outOld), &oldIssue)
+	json.Unmarshal([]byte(outNew), &newIssue)
+
+	oldID := oldIssue["id"].(string)
+	newID := newIssue["id"].(string)
+
+	runBDInProcess(t, tmpDir, "supersede", oldID, "--with", newID)
+
+	// `bd supersede old --with new` stores (old, new), so the replaced issue is
+	// the edge's source and names its replacement.
+	replaced := runBDInProcess(t, tmpDir, "show", oldID)
+	if !strings.Contains(replaced, "SUPERSEDED BY") {
+		t.Errorf("expected SUPERSEDED BY section on the replaced issue, got: %s", replaced)
+	}
+	if strings.Contains(replaced, "DEPENDS ON") {
+		t.Errorf("replaced issue must not claim it depends on its replacement, got: %s", replaced)
+	}
+
+	replacement := runBDInProcess(t, tmpDir, "show", newID)
+	if !strings.Contains(replacement, "SUPERSEDES") {
+		t.Errorf("expected SUPERSEDES section on the replacement, got: %s", replacement)
+	}
+	if strings.Contains(replacement, "BLOCKS") {
+		t.Errorf("replacement must not claim it blocks the issue it replaced, got: %s", replacement)
+	}
+}
+
+func TestCLI_DepRemove(t *testing.T) {
+	// Note: Not using t.Parallel() because inProcessMutex serializes execution anyway
+	tmpDir := setupCLITestDB(t)
+
+	out1 := runBDInProcess(t, tmpDir, "create", "First", "-p", "1", "--json")
+	out2 := runBDInProcess(t, tmpDir, "create", "Second", "-p", "1", "--json")
+
+	var issue1, issue2 map[string]interface{}
+	json.Unmarshal([]byte(out1), &issue1)
+	json.Unmarshal([]byte(out2), &issue2)
+
 	id1 := issue1["id"].(string)
 	id2 := issue2["id"].(string)
-	
+
 	runBDInProcess(t, tmpDir, "dep", "add", id2, id1)
 	out := runBDInProcess(t, tmpDir, "dep", "remove", id2, id1)
 	if !strings.Contains(out, "Removed dependency") {
@@ -385,22 +899,19 @@ func TestCLI_DepRemove(t *testing.T) {
 }
 
 func TestCLI_DepTree(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping slow CLI test in short mode")
-	}
 	// Note: Not using t.Parallel() because inProcessMutex serializes execution anyway
 	tmpDir := setupCLITestDB(t)
-	
+
 	out1 := runBDInProcess(t, tmpDir, "create", "Parent", "-p", "1", "--json")
 	out2 := runBDInProcess(t, tmpDir, "create", "Child", "-p", "1", "--json")
-	
+
 	var issue1, issue2 map[string]interface{}
 	json.Unmarshal([]byte(out1), &issue1)
 	json.Unmarshal([]byte(out2), &issue2)
-	
+
 	id1 := issue1["id"].(string)
 	id2 := issue2["id"].(string)
-	
+
 	runBDInProcess(t, tmpDir, "dep", "add", id2, id1)
 	out := runBDInProcess(t, tmpDir, "dep", "tree", id1)
 	if !strings.Contains(out, "Parent") {
@@ -409,22 +920,19 @@ func TestCLI_DepTree(t *testing.T) {
 }
 
 func TestCLI_Blocked(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping slow CLI test in short mode")
-	}
 	// Note: Not using t.Parallel() because inProcessMutex serializes execution anyway
 	tmpDir := setupCLITestDB(t)
-	
+
 	out1 := runBDInProcess(t, tmpDir, "create", "Blocker", "-p", "1", "--json")
 	out2 := runBDInProcess(t, tmpDir, "create", "Blocked", "-p", "1", "--json")
-	
+
 	var issue1, issue2 map[string]interface{}
 	json.Unmarshal([]byte(out1), &issue1)
 	json.Unmarshal([]byte(out2), &issue2)
-	
+
 	id1 := issue1["id"].(string)
 	id2 := issue2["id"].(string)
-	
+
 	runBDInProcess(t, tmpDir, "dep", "add", id2, id1)
 	out := runBDInProcess(t, tmpDir, "blocked")
 	if !strings.Contains(out, "Blocked") {
@@ -433,14 +941,11 @@ func TestCLI_Blocked(t *testing.T) {
 }
 
 func TestCLI_Stats(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping slow CLI test in short mode")
-	}
 	// Note: Not using t.Parallel() because inProcessMutex serializes execution anyway
 	tmpDir := setupCLITestDB(t)
 	runBDInProcess(t, tmpDir, "create", "Issue 1", "-p", "1")
 	runBDInProcess(t, tmpDir, "create", "Issue 2", "-p", "1")
-	
+
 	out := runBDInProcess(t, tmpDir, "stats")
 	if !strings.Contains(out, "Total") || !strings.Contains(out, "2") {
 		t.Errorf("Expected stats to show 2 issues, got: %s", out)
@@ -448,17 +953,14 @@ func TestCLI_Stats(t *testing.T) {
 }
 
 func TestCLI_Show(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping slow CLI test in short mode")
-	}
 	// Note: Not using t.Parallel() because inProcessMutex serializes execution anyway
 	tmpDir := setupCLITestDB(t)
 	out := runBDInProcess(t, tmpDir, "create", "Show test", "-p", "1", "--json")
-	
+
 	var issue map[string]interface{}
 	json.Unmarshal([]byte(out), &issue)
 	id := issue["id"].(string)
-	
+
 	out = runBDInProcess(t, tmpDir, "show", id)
 	if !strings.Contains(out, "Show test") {
 		t.Errorf("Expected 'Show test' in output, got: %s", out)
@@ -466,37 +968,31 @@ func TestCLI_Show(t *testing.T) {
 }
 
 func TestCLI_Export(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping slow CLI test in short mode")
-	}
 	// Note: Not using t.Parallel() because inProcessMutex serializes execution anyway
 	tmpDir := setupCLITestDB(t)
 	runBDInProcess(t, tmpDir, "create", "Export test", "-p", "1")
-	
+
 	exportFile := filepath.Join(tmpDir, "export.jsonl")
 	runBDInProcess(t, tmpDir, "export", "-o", exportFile)
-	
+
 	if _, err := os.Stat(exportFile); os.IsNotExist(err) {
 		t.Errorf("Export file not created: %s", exportFile)
 	}
 }
 
 func TestCLI_Import(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping slow CLI test in short mode")
-	}
 	// Note: Not using t.Parallel() because inProcessMutex serializes execution anyway
 	tmpDir := setupCLITestDB(t)
 	runBDInProcess(t, tmpDir, "create", "Import test", "-p", "1")
-	
+
 	exportFile := filepath.Join(tmpDir, "export.jsonl")
 	runBDInProcess(t, tmpDir, "export", "-o", exportFile)
-	
+
 	// Create new db and import
 	tmpDir2 := createTempDirWithCleanup(t)
 	runBDInProcess(t, tmpDir2, "init", "--prefix", "test", "--quiet")
 	runBDInProcess(t, tmpDir2, "import", "-i", exportFile)
-	
+
 	out := runBDInProcess(t, tmpDir2, "list", "--json")
 	var issues []map[string]interface{}
 	json.Unmarshal([]byte(out), &issues)
@@ -508,28 +1004,38 @@ func TestCLI_Import(t *testing.T) {
 var testBD string
 
 func init() {
-	// Use existing bd binary from repo root if available, otherwise build once
+	// Helper-process re-execs (worktree_remove_test.go's
+	// runWorktreeRemoveProcess) run this init in a child whose cwd is a temp
+	// git repo: the repo-root probe below misses and the `go build .`
+	// fallback panics with "cannot find main module" — which is what six
+	// Main integration shards reported at cd25e0919. The helper never uses
+	// testBD, so skip the work entirely in that child.
+	if os.Getenv(worktreeRemoveHelperEnv) != "" {
+		return
+	}
+	// Prebuilt fast path (scripts/test.sh and CI export this), else build
+	// once. No repo-root ./bd reuse: a stale checkout-root binary silently
+	// substitutes itself for the source under test (wy-4mtr0).
+	if prebuilt := os.Getenv("BEADS_TEST_BD_BINARY"); prebuilt != "" {
+		if abs, err := filepath.Abs(prebuilt); err == nil {
+			if _, statErr := os.Stat(abs); statErr == nil {
+				testBD = abs
+				return
+			}
+		}
+	}
 	bdBinary := "bd"
 	if runtime.GOOS == "windows" {
 		bdBinary = "bd.exe"
 	}
-	
-	// Check if bd binary exists in repo root (../../bd from cmd/bd/)
-	repoRoot := filepath.Join("..", "..")
-	existingBD := filepath.Join(repoRoot, bdBinary)
-	if _, err := os.Stat(existingBD); err == nil {
-		// Use existing binary
-		testBD, _ = filepath.Abs(existingBD)
-		return
-	}
-	
+
 	// Fall back to building once (for CI or fresh checkouts)
 	tmpDir, err := os.MkdirTemp("", "bd-cli-test-*")
 	if err != nil {
 		panic(err)
 	}
 	testBD = filepath.Join(tmpDir, bdBinary)
-	cmd := exec.Command("go", "build", "-o", testBD, ".")
+	cmd := exec.Command("go", "build", "-tags", "gms_pure_go", "-o", testBD, ".")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		panic(string(out))
 	}
@@ -539,16 +1045,11 @@ func init() {
 // This is kept for a few tests to ensure the actual binary works correctly
 func runBDExec(t *testing.T, dir string, args ...string) string {
 	t.Helper()
-	
-	// Add --no-daemon to all commands except init
-	if len(args) > 0 && args[0] != "init" {
-		args = append([]string{"--no-daemon"}, args...)
-	}
-	
+
 	cmd := exec.Command(testBD, args...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), "BEADS_NO_DAEMON=1")
-	
+	cmd.Env = os.Environ()
+
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("bd %v failed: %v\nOutput: %s", args, err, out)
@@ -556,69 +1057,79 @@ func runBDExec(t *testing.T, dir string, args ...string) string {
 	return string(out)
 }
 
+// runBDExecAllowErrorWithEnv runs bd via exec.Command with custom env vars,
+// returning combined output and any error (does not fail the test on error).
+func runBDExecAllowErrorWithEnv(t *testing.T, dir string, env []string, args ...string) (string, error) {
+	t.Helper()
+
+	cmd := exec.Command(testBD, args...)
+	cmd.Dir = dir
+	cmd.Env = env
+
+	out, err := cmd.CombinedOutput()
+	return string(out), err
+}
+
 // TestCLI_EndToEnd performs end-to-end testing using the actual binary
 // This ensures the compiled binary works correctly when executed normally
 func TestCLI_EndToEnd(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping slow CLI test in short mode")
+	if testDoltServerPort == 0 {
+		t.Skip("skipping: Dolt test container not available")
 	}
 	// Note: Not using t.Parallel() because inProcessMutex serializes execution anyway
-	
+
 	tmpDir := createTempDirWithCleanup(t)
-	
+
 	// Test full workflow with exec.Command to validate binary
 	runBDExec(t, tmpDir, "init", "--prefix", "test", "--quiet")
-	
+
 	out := runBDExec(t, tmpDir, "create", "E2E test", "-p", "1", "--json")
 	var issue map[string]interface{}
 	jsonStart := strings.Index(out, "{")
 	json.Unmarshal([]byte(out[jsonStart:]), &issue)
 	id := issue["id"].(string)
-	
+
 	runBDExec(t, tmpDir, "update", id, "--status", "in_progress")
 	runBDExec(t, tmpDir, "close", id, "--reason", "Done")
-	
+
 	out = runBDExec(t, tmpDir, "show", id, "--json")
 	var closed []map[string]interface{}
 	json.Unmarshal([]byte(out), &closed)
-	
+
 	if closed[0]["status"] != "closed" {
 		t.Errorf("Expected status 'closed', got: %v", closed[0]["status"])
 	}
-	
+
 	// Test export
 	exportFile := filepath.Join(tmpDir, "export.jsonl")
 	runBDExec(t, tmpDir, "export", "-o", exportFile)
-	
+
 	if _, err := os.Stat(exportFile); os.IsNotExist(err) {
 		t.Errorf("Export file not created: %s", exportFile)
 	}
 }
 
 func TestCLI_Labels(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping slow CLI test in short mode")
-	}
 	// Note: Not using t.Parallel() because inProcessMutex serializes execution anyway
 	tmpDir := setupCLITestDB(t)
 	out := runBDInProcess(t, tmpDir, "create", "Label test", "-p", "1", "--json")
-	
+
 	jsonStart := strings.Index(out, "{")
 	jsonOut := out[jsonStart:]
-	
+
 	var issue map[string]interface{}
 	json.Unmarshal([]byte(jsonOut), &issue)
 	id := issue["id"].(string)
-	
+
 	// Add label
 	runBDInProcess(t, tmpDir, "label", "add", id, "urgent")
-	
+
 	// List labels
 	out = runBDInProcess(t, tmpDir, "label", "list", id)
 	if !strings.Contains(out, "urgent") {
 		t.Errorf("Expected 'urgent' label, got: %s", out)
 	}
-	
+
 	// Remove label
 	runBDInProcess(t, tmpDir, "label", "remove", id, "urgent")
 	out = runBDInProcess(t, tmpDir, "label", "list", id)
@@ -628,12 +1139,9 @@ func TestCLI_Labels(t *testing.T) {
 }
 
 func TestCLI_PriorityFormats(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping slow CLI test in short mode")
-	}
 	// Note: Not using t.Parallel() because inProcessMutex serializes execution anyway
 	tmpDir := setupCLITestDB(t)
-	
+
 	// Test numeric priority
 	out := runBDInProcess(t, tmpDir, "create", "Test P0", "-p", "0", "--json")
 	jsonStart := strings.Index(out, "{")
@@ -643,7 +1151,7 @@ func TestCLI_PriorityFormats(t *testing.T) {
 	if issue["priority"].(float64) != 0 {
 		t.Errorf("Expected priority 0, got: %v", issue["priority"])
 	}
-	
+
 	// Test P-format priority
 	out = runBDInProcess(t, tmpDir, "create", "Test P3", "-p", "P3", "--json")
 	jsonStart = strings.Index(out, "{")
@@ -656,7 +1164,7 @@ func TestCLI_PriorityFormats(t *testing.T) {
 	// Test update with P-format
 	id := issue["id"].(string)
 	runBDInProcess(t, tmpDir, "update", id, "-p", "P1")
-	
+
 	out = runBDInProcess(t, tmpDir, "show", id, "--json")
 	var updated []map[string]interface{}
 	json.Unmarshal([]byte(out), &updated)
@@ -666,9 +1174,6 @@ func TestCLI_PriorityFormats(t *testing.T) {
 }
 
 func TestCLI_Reopen(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping slow CLI test in short mode")
-	}
 	// Note: Not using t.Parallel() because inProcessMutex serializes execution anyway
 	tmpDir := setupCLITestDB(t)
 	out := runBDInProcess(t, tmpDir, "create", "Reopen test", "-p", "1", "--json")
@@ -701,10 +1206,6 @@ func runBDInProcessAllowError(t *testing.T, dir string, args ...string) (string,
 	inProcessMutex.Lock()
 	defer inProcessMutex.Unlock()
 
-	if len(args) > 0 && args[0] != "init" {
-		args = append([]string{"--no-daemon"}, args...)
-	}
-
 	oldStdout := os.Stdout
 	oldStderr := os.Stderr
 	oldDir, _ := os.Getwd()
@@ -718,12 +1219,13 @@ func runBDInProcessAllowError(t *testing.T, dir string, args ...string) (string,
 	rErr, wErr, _ := os.Pipe()
 	os.Stdout = wOut
 	os.Stderr = wErr
+	defer func() {
+		os.Stdout = oldStdout
+		os.Stderr = oldStderr
+	}()
 
 	rootCmd.SetArgs(args)
 	os.Args = append([]string{"bd"}, args...)
-
-	os.Setenv("BEADS_NO_DAEMON", "1")
-	defer os.Unsetenv("BEADS_NO_DAEMON")
 
 	cmdErr := rootCmd.Execute()
 
@@ -731,36 +1233,18 @@ func runBDInProcessAllowError(t *testing.T, dir string, args ...string) (string,
 		store.Close()
 		store = nil
 	}
-	if daemonClient != nil {
-		daemonClient.Close()
-		daemonClient = nil
-	}
-
 	dbPath = ""
 	actor = ""
 	jsonOutput = false
-	noDaemon = false
-	noAutoFlush = false
-	noAutoImport = false
 	sandboxMode = false
-	noDb = false
-	autoFlushEnabled = true
-	storeActive = false
-	flushFailureCount = 0
-	lastFlushError = nil
-	if flushManager != nil {
-		_ = flushManager.Shutdown()
-		flushManager = nil
-	}
 	rootCtx = nil
 	rootCancel = nil
 
+	// Give SQLite time to release file locks before cleanup
 	time.Sleep(10 * time.Millisecond)
 
 	wOut.Close()
 	wErr.Close()
-	os.Stdout = oldStdout
-	os.Stderr = oldStderr
 	os.Chdir(oldDir)
 	os.Args = oldArgs
 	rootCmd.SetArgs(nil)
@@ -774,8 +1258,8 @@ func runBDInProcessAllowError(t *testing.T, dir string, args ...string) (string,
 
 // TestCLI_CreateDryRun tests the --dry-run flag for bd create command (bd-nib2)
 func TestCLI_CreateDryRun(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping slow CLI test in short mode")
+	if testDoltServerPort == 0 {
+		t.Skip("skipping: Dolt test container not available")
 	}
 
 	t.Run("BasicDryRunPreview", func(t *testing.T) {
@@ -904,14 +1388,12 @@ func TestCLI_CreateDryRun(t *testing.T) {
 	})
 
 	t.Run("DryRunWithFileReturnsError", func(t *testing.T) {
-		// This test must use exec.Command because FatalError calls os.Exit(1)
-		// which would kill the test process if run in-process
 		tmpDir := createTempDirWithCleanup(t)
 
 		// Initialize the database first
 		initCmd := exec.Command(testBD, "init", "--prefix", "test", "--quiet")
 		initCmd.Dir = tmpDir
-		initCmd.Env = append(os.Environ(), "BEADS_NO_DAEMON=1")
+		initCmd.Env = os.Environ()
 		if out, err := initCmd.CombinedOutput(); err != nil {
 			t.Fatalf("init failed: %v\n%s", err, out)
 		}
@@ -921,9 +1403,9 @@ func TestCLI_CreateDryRun(t *testing.T) {
 		os.WriteFile(mdFile, []byte("# Test Issue\n\nDescription here"), 0644)
 
 		// Run create with --dry-run and --file (should error)
-		cmd := exec.Command(testBD, "--no-daemon", "create", "--file", mdFile, "--dry-run")
+		cmd := exec.Command(testBD, "create", "--file", mdFile, "--dry-run")
 		cmd.Dir = tmpDir
-		cmd.Env = append(os.Environ(), "BEADS_NO_DAEMON=1")
+		cmd.Env = os.Environ()
 		out, err := cmd.CombinedOutput()
 
 		if err == nil {
@@ -972,19 +1454,83 @@ func TestCLI_CreateDryRun(t *testing.T) {
 	})
 }
 
+// TestCLI_CommentsListMisplacedSyntax ensures "bd comments list" gets a helpful error (GH#3542).
+func TestCLI_CommentsListMisplacedSyntax(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := setupCLITestDB(t)
+	stdout, stderr, err := runBDInProcessAllowError(t, tmpDir, "comments", "list")
+	if err == nil {
+		t.Fatalf("expected non-zero exit, got stdout=%q stderr=%q", stdout, stderr)
+	}
+	combined := stdout + stderr
+	if !strings.Contains(combined, "bd comments") || !strings.Contains(combined, "<issue-id>") {
+		t.Fatalf("expected hint with bd comments and issue-id placeholder, got stdout=%q stderr=%q", stdout, stderr)
+	}
+}
+
+// TestCLI_CommentsSwappedAddRejectedBeforeStoreOpen is a regression test for
+// GH#4642's should-fix: the swapped-order rejection (`bd comments <id> add
+// <text>`) must fire from commentsCmd's Args validator, before
+// PersistentPreRunE ever opens a store or runs a migration, and before
+// RunE's usesProxiedServer() dispatch — not from a check inside RunE that
+// only the local-store branch reaches. Using a directory with no .beads/ at
+// all proves the store was never touched: the old RunE-only check needed an
+// already-initialized store (PersistentPreRunE would have failed first with
+// "no beads database found"), so this would fail with the wrong error before
+// the fix.
+func TestCLI_CommentsSwappedAddRejectedBeforeStoreOpen(t *testing.T) {
+	noBeadsCwd := t.TempDir()
+	if _, err := os.Stat(filepath.Join(noBeadsCwd, ".beads")); err == nil {
+		t.Fatalf("test setup: %s unexpectedly has a .beads dir", noBeadsCwd)
+	}
+
+	stdout, stderr, err := runBDInProcessAllowError(t, noBeadsCwd, "comments", "bd-123", "add", "should not be stored")
+	if err == nil {
+		t.Fatalf("expected non-zero exit for swapped-order add, got success:\nstdout: %s", stdout)
+	}
+	combined := stdout + stderr
+	if strings.Contains(combined, "no beads database found") {
+		t.Fatalf("Args validation did not run before store open: got the pre-fix error.\nOutput:\n%s", combined)
+	}
+	if !strings.Contains(combined, "bd comments add") {
+		t.Errorf("expected hint pointing to `bd comments add`, got:\n%s", combined)
+	}
+}
+
+// TestCLI_CommentsSwappedAddRejectedInProxiedServerMode is the proxied-server
+// counterpart: forcing proxiedServerMode simulates the dispatch that GH#4642's
+// merge-base drift routes around a RunE-only check (main added
+// runCommentsProxiedServer after this fix branched, consuming only args[0]
+// and ignoring trailing `add <text>`). Because validateCommentsArgs runs in
+// Args — before RunE ever branches on usesProxiedServer() — the rejection
+// fires identically regardless of backend, without needing a real proxied
+// server.
+func TestCLI_CommentsSwappedAddRejectedInProxiedServerMode(t *testing.T) {
+	origProxied := proxiedServerMode
+	t.Cleanup(func() { proxiedServerMode = origProxied })
+	proxiedServerMode = true
+
+	tmpDir := setupCLITestDB(t)
+	stdout, stderr, err := runBDInProcessAllowError(t, tmpDir, "comments", "bd-123", "add", "should not be stored")
+	if err == nil {
+		t.Fatalf("expected non-zero exit for swapped-order add in proxied-server mode, got success:\nstdout: %s", stdout)
+	}
+	combined := stdout + stderr
+	if strings.Contains(combined, "not supported in proxied-server mode") {
+		t.Fatalf("Args validation did not run before the proxied dispatch: got RunE's proxied-mode stub error instead.\nOutput:\n%s", combined)
+	}
+	if !strings.Contains(combined, "bd comments add") {
+		t.Errorf("expected hint pointing to `bd comments add`, got:\n%s", combined)
+	}
+}
+
 // TestCLI_CommentsAddShortID tests that 'comments add' accepts short IDs (issue #1070)
 // Most bd commands accept short IDs (e.g., "5wbm") but comments add previously required
 // full IDs (e.g., "mike.vibe-coding-5wbm"). This test ensures short IDs work.
 //
-// Note: This test runs with --no-daemon (direct mode) where short IDs already work
-// because the code calls utils.ResolvePartialID(). The actual bug (GitHub #1070) is
-// in daemon mode where the ID isn't resolved before being sent to the RPC server.
-// The fix should add daemonClient.ResolveID() before daemonClient.AddComment(),
-// following the pattern in update.go and label.go.
+// Note: Short IDs work because the code calls utils.ResolvePartialID().
 func TestCLI_CommentsAddShortID(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping slow CLI test in short mode")
-	}
 
 	t.Run("ShortIDWithCommentsAdd", func(t *testing.T) {
 		tmpDir := setupCLITestDB(t)
@@ -1097,3 +1643,458 @@ func TestCLI_CommentsAddShortID(t *testing.T) {
 	})
 }
 
+// TestCLI_CommentListMisplacedSyntax is a regression test for the singular
+// "comment" shorthand silently mis-resolving a subcommand-like typo as an
+// issue id. "bd comment list <text>" (meant as an attempt to list comments,
+// using the singular noun by mistake) used to parse as id="list",
+// text=[<text>...] with no validation on the id — since no issue is
+// literally named "list", ResolvePartialID's substring/prefix fallback
+// would silently match it against whatever existing bead or wisp id
+// happened to contain "list" and post the comment there instead of
+// erroring. This asserts both halves of the fix: the command is rejected
+// with a helpful hint (mirroring TestCLI_CommentsListMisplacedSyntax for
+// the plural sibling), AND — the part that actually matters for this
+// specific bug — no comment silently landed on an unrelated real issue.
+func TestCLI_CommentListMisplacedSyntax(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := setupCLITestDB(t)
+
+	out := runBDInProcess(t, tmpDir, "create", "Bystander issue", "-p", "1", "--json")
+	jsonStart := strings.Index(out, "{")
+	if jsonStart < 0 {
+		t.Fatalf("No JSON found in create output: %s", out)
+	}
+	var issue map[string]interface{}
+	if err := json.Unmarshal([]byte(out[jsonStart:]), &issue); err != nil {
+		t.Fatalf("Failed to parse create JSON: %v\nOutput: %s", err, out)
+	}
+	fullID := issue["id"].(string)
+
+	stdout, stderr, err := runBDInProcessAllowError(t, tmpDir, "comment", "list", "accidental stray text")
+	if err == nil {
+		t.Fatalf("expected non-zero exit, got stdout=%q stderr=%q", stdout, stderr)
+	}
+	combined := stdout + stderr
+	if !strings.Contains(combined, "bd comments") || !strings.Contains(combined, "<issue-id>") {
+		t.Fatalf("expected hint pointing at bd comments <issue-id>, got stdout=%q stderr=%q", stdout, stderr)
+	}
+
+	// The regression check: the bystander issue must have received NO
+	// comment. Pre-fix, this could silently succeed and land a comment on
+	// whatever bead's id happened to contain "list" as a substring — this
+	// DB has exactly one issue, so any stray write would show up here.
+	commentsOut := runBDInProcess(t, tmpDir, "comments", fullID, "--json")
+	trimmed := strings.TrimSpace(commentsOut)
+	if trimmed != "[]" && trimmed != "null" {
+		t.Fatalf("expected no comments on bystander issue %s after rejected 'comment list', got: %s", fullID, commentsOut)
+	}
+}
+
+// TestCLI_CommentAddMisplacedSyntax mirrors TestCLI_CommentListMisplacedSyntax
+// for the symmetric "add" typo — a caller who confuses the singular shorthand
+// with the plural's "bd comments add <id> <text>" form might type
+// "bd comment add <id> <text>", which the same unguarded id-resolution bug
+// would parse as id="add", text=[<id>, <text>...].
+func TestCLI_CommentAddMisplacedSyntax(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := setupCLITestDB(t)
+
+	out := runBDInProcess(t, tmpDir, "create", "Bystander issue for add-typo", "-p", "1", "--json")
+	jsonStart := strings.Index(out, "{")
+	if jsonStart < 0 {
+		t.Fatalf("No JSON found in create output: %s", out)
+	}
+	var issue map[string]interface{}
+	if err := json.Unmarshal([]byte(out[jsonStart:]), &issue); err != nil {
+		t.Fatalf("Failed to parse create JSON: %v\nOutput: %s", err, out)
+	}
+	fullID := issue["id"].(string)
+
+	stdout, stderr, err := runBDInProcessAllowError(t, tmpDir, "comment", "add", fullID, "accidental stray text")
+	if err == nil {
+		t.Fatalf("expected non-zero exit, got stdout=%q stderr=%q", stdout, stderr)
+	}
+	combined := stdout + stderr
+	if !strings.Contains(combined, "bd comments add") {
+		t.Fatalf("expected hint pointing at bd comments add <issue-id>, got stdout=%q stderr=%q", stdout, stderr)
+	}
+
+	commentsOut := runBDInProcess(t, tmpDir, "comments", fullID, "--json")
+	trimmed := strings.TrimSpace(commentsOut)
+	if trimmed != "[]" && trimmed != "null" {
+		t.Fatalf("expected no comments on bystander issue %s after rejected 'comment add', got: %s", fullID, commentsOut)
+	}
+}
+
+// TestCLI_CommentMisplacedSyntaxRejectedBeforeStoreOpen proves the guard
+// fires from commentCmd's Args validator, before PersistentPreRunE ever
+// opens a store, mirroring
+// TestCLI_CommentsSwappedAddRejectedBeforeStoreOpen for the plural sibling.
+// Using a directory with no .beads/ at all proves the store was never
+// touched: a RunE-only check would have failed first with "no beads
+// database found".
+func TestCLI_CommentMisplacedSyntaxRejectedBeforeStoreOpen(t *testing.T) {
+	noBeadsCwd := t.TempDir()
+	if _, err := os.Stat(filepath.Join(noBeadsCwd, ".beads")); err == nil {
+		t.Fatalf("test setup: %s unexpectedly has a .beads dir", noBeadsCwd)
+	}
+
+	stdout, stderr, err := runBDInProcessAllowError(t, noBeadsCwd, "comment", "list", "should not be stored")
+	if err == nil {
+		t.Fatalf("expected non-zero exit for misplaced 'comment list', got success:\nstdout: %s", stdout)
+	}
+	combined := stdout + stderr
+	if strings.Contains(combined, "no beads database found") {
+		t.Fatalf("Args validation did not run before store open: got the pre-fix error.\nOutput:\n%s", combined)
+	}
+	if !strings.Contains(combined, "bd comments") {
+		t.Errorf("expected hint pointing to `bd comments`, got:\n%s", combined)
+	}
+}
+
+// TestCLI_CommentMisplacedSyntaxRejectedInProxiedServerMode is the
+// proxied-server counterpart, mirroring
+// TestCLI_CommentsSwappedAddRejectedInProxiedServerMode: because
+// validateCommentArgs runs in Args — before RunE ever branches on
+// usesProxiedServer() — the rejection fires identically regardless of
+// backend, without needing a real proxied server.
+func TestCLI_CommentMisplacedSyntaxRejectedInProxiedServerMode(t *testing.T) {
+	origProxied := proxiedServerMode
+	t.Cleanup(func() { proxiedServerMode = origProxied })
+	proxiedServerMode = true
+
+	tmpDir := setupCLITestDB(t)
+	stdout, stderr, err := runBDInProcessAllowError(t, tmpDir, "comment", "list", "should not be stored")
+	if err == nil {
+		t.Fatalf("expected non-zero exit for misplaced 'comment list' in proxied-server mode, got success:\nstdout: %s", stdout)
+	}
+	combined := stdout + stderr
+	if !strings.Contains(combined, "bd comments") {
+		t.Errorf("expected hint pointing to `bd comments`, got:\n%s", combined)
+	}
+}
+
+// TestCLI_CommentTextStartingWithReservedWordStillWorks confirms the fix is
+// scoped to the id positional argument only: a real id followed by comment
+// TEXT that happens to start with "list" or "add" must still work exactly
+// as before, since args[0] (the id slot) is what's checked, never the text.
+func TestCLI_CommentTextStartingWithReservedWordStillWorks(t *testing.T) {
+	t.Parallel()
+
+	tmpDir := setupCLITestDB(t)
+
+	out := runBDInProcess(t, tmpDir, "create", "Issue for reserved-word-text test", "-p", "1", "--json")
+	jsonStart := strings.Index(out, "{")
+	if jsonStart < 0 {
+		t.Fatalf("No JSON found in create output: %s", out)
+	}
+	var issue map[string]interface{}
+	if err := json.Unmarshal([]byte(out[jsonStart:]), &issue); err != nil {
+		t.Fatalf("Failed to parse create JSON: %v\nOutput: %s", err, out)
+	}
+	fullID := issue["id"].(string)
+
+	stdout, stderr, err := runBDInProcessAllowError(t, tmpDir, "comment", fullID, "list", "of", "things", "to", "do")
+	if err != nil {
+		t.Fatalf("comment with text starting in 'list' unexpectedly failed: %v\nstdout: %s\nstderr: %s", err, stdout, stderr)
+	}
+	if !strings.Contains(stdout, "Comment added") {
+		t.Errorf("Expected 'Comment added' in output, got: %s", stdout)
+	}
+
+	commentsOut := runBDInProcess(t, tmpDir, "comments", fullID, "--json")
+	if !strings.Contains(commentsOut, "list of things to do") {
+		t.Fatalf("expected comment text to be stored verbatim, got: %s", commentsOut)
+	}
+}
+
+// TestCLI_CreateRejectsFlagLikeTitles verifies that positional arguments starting
+// with - or -- are rejected as likely misinterpreted flags (bd-2c0).
+func TestCLI_CreateRejectsFlagLikeTitles(t *testing.T) {
+	if testDoltServerPort == 0 {
+		t.Skip("skipping: Dolt test container not available")
+	}
+
+	tests := []struct {
+		name  string
+		title string
+	}{
+		{"DoubleDashHelp", "--help"},
+		{"DoubleDashVersion", "--version"},
+		{"SingleDashFlag", "-p"},
+		{"DoubleDashArbitrary", "--foo-bar"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpDir := createTempDirWithCleanup(t)
+
+			// Initialize the database
+			initCmd := exec.Command(testBD, "init", "--prefix", "test", "--quiet")
+			initCmd.Dir = tmpDir
+			initCmd.Env = os.Environ()
+			if out, err := initCmd.CombinedOutput(); err != nil {
+				t.Fatalf("init failed: %v\n%s", err, out)
+			}
+
+			// Attempt to create with a flag-like positional title
+			cmd := exec.Command(testBD, "create", tc.title)
+			cmd.Dir = tmpDir
+			cmd.Env = os.Environ()
+			out, err := cmd.CombinedOutput()
+
+			if err == nil {
+				t.Errorf("Expected error for flag-like title %q, but got none.\nOutput: %s", tc.title, out)
+			}
+
+			if !strings.Contains(string(out), "looks like a flag") {
+				t.Errorf("Expected 'looks like a flag' error for %q, got: %s", tc.title, out)
+			}
+		})
+	}
+
+	// Verify that --title flag with dash-prefixed value is still allowed
+	t.Run("TitleFlagAllowsDashes", func(t *testing.T) {
+		tmpDir := setupCLITestDB(t)
+
+		out := runBDInProcess(t, tmpDir, "create", "--title", "--unusual-title", "-p", "1", "--json")
+		if !strings.Contains(out, "--unusual-title") {
+			t.Errorf("Expected title '--unusual-title' in output, got: %s", out)
+		}
+	})
+}
+
+// TestCLI_CreateRejectsEmptyTitle verifies that a whitespace-only title is
+// refused rather than silently creating a title-less bead (GH#4771). Such a
+// bead is functionally invisible in title-based views.
+func TestCLI_CreateRejectsEmptyTitle(t *testing.T) {
+	cases := []struct {
+		name string
+		args []string
+	}{
+		{"FlagSpaces", []string{"create", "--title", "   ", "-p", "2"}},
+		{"FlagTab", []string{"create", "--title", "\t", "-p", "2"}},
+		{"PositionalSpaces", []string{"create", "   ", "-p", "2"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tmpDir := setupCLITestDB(t)
+			stdout, stderr, err := runBDInProcessAllowError(t, tmpDir, tc.args...)
+			if err == nil {
+				t.Fatalf("expected error for whitespace-only title, got success\nstdout: %s", stdout)
+			}
+			combined := stdout + stderr
+			if !strings.Contains(combined, "title cannot be empty") {
+				t.Errorf("expected 'title cannot be empty' error, got: %s", combined)
+			}
+		})
+	}
+}
+
+// TestCLI_CreateRejectsEmptyTitle_ProxiedServerMode is a proxied-server
+// regression for GH#4771. Before this fix, the whitespace-only guard lived
+// only in create's local-store RunE branch: gatherCreateInput/
+// runCreateProxiedServer (the path taken when usesProxiedServer() is true)
+// never re-checked, so proxied-mode create still minted a blank-titled bead.
+// The fix moved the check into resolveTitle, invoked from createCmd's Args
+// validator — which runs for every invocation regardless of backend, before
+// RunE ever branches on usesProxiedServer(). Setting proxiedServerMode here
+// exercises that dispatch without needing a real proxied server: Args
+// validation must reject before gatherCreateInput/runCreateProxiedServer (or
+// any store open) ever runs.
+func TestCLI_CreateRejectsEmptyTitle_ProxiedServerMode(t *testing.T) {
+	origProxied := proxiedServerMode
+	t.Cleanup(func() { proxiedServerMode = origProxied })
+	proxiedServerMode = true
+
+	// createCmd is a shared package-level *cobra.Command, so a --title value
+	// set by an earlier in-process test invocation (e.g. TestCLI_CreateRejectsEmptyTitle's
+	// own FlagTab case) survives on the FlagSet across rootCmd.Execute() calls.
+	// Reset it explicitly so this test's outcome doesn't depend on suite
+	// ordering — a pre-existing gap, not something this test should also fall
+	// victim to.
+	titleFlag := createCmd.Flags().Lookup("title")
+	origTitleValue := titleFlag.Value.String()
+	origTitleChanged := titleFlag.Changed
+	t.Cleanup(func() {
+		_ = titleFlag.Value.Set(origTitleValue)
+		titleFlag.Changed = origTitleChanged
+	})
+	_ = titleFlag.Value.Set("")
+	titleFlag.Changed = false
+
+	tmpDir := setupCLITestDB(t)
+	stdout, stderr, err := runBDInProcessAllowError(t, tmpDir, "create", "   ", "-p", "2")
+	if err == nil {
+		t.Fatalf("expected error for whitespace-only title in proxied-server mode, got success\nstdout: %s", stdout)
+	}
+	combined := stdout + stderr
+	if !strings.Contains(combined, "title cannot be empty") {
+		t.Errorf("expected 'title cannot be empty' error, got: %s", combined)
+	}
+}
+
+// TestCLI_CreateNoHistory tests that the --no-history CLI flag is wired through
+// to the created issue (GH#2619). A storage-layer test already covers the DB
+// semantics; this test verifies the CLI flag is actually parsed and passed.
+func TestCLI_CreateNoHistory(t *testing.T) {
+
+	t.Run("NoHistoryFlagSetOnCreatedIssue", func(t *testing.T) {
+		tmpDir := setupCLITestDB(t)
+		out := runBDInProcess(t, tmpDir, "create", "No-history agent bead", "-p", "2", "--no-history", "--json")
+
+		var result map[string]interface{}
+		if err := json.Unmarshal([]byte(out), &result); err != nil {
+			t.Fatalf("Failed to parse JSON: %v\nOutput: %s", err, out)
+		}
+		if result["no_history"] != true {
+			t.Errorf("Expected no_history=true on created issue, got: %v", result["no_history"])
+		}
+		// Must NOT be ephemeral (mutually exclusive)
+		if result["ephemeral"] == true {
+			t.Errorf("no-history issue must not be ephemeral, but ephemeral=true")
+		}
+	})
+
+	t.Run("NoHistoryPersistedAfterShow", func(t *testing.T) {
+		tmpDir := setupCLITestDB(t)
+		out := runBDInProcess(t, tmpDir, "create", "No-history bead for show test", "-p", "2", "--no-history", "--json")
+
+		var created map[string]interface{}
+		if err := json.Unmarshal([]byte(out), &created); err != nil {
+			t.Fatalf("Failed to parse create output: %v\nOutput: %s", err, out)
+		}
+		id := created["id"].(string)
+
+		showOut := runBDInProcess(t, tmpDir, "show", id, "--json")
+		var issues []map[string]interface{}
+		if err := json.Unmarshal([]byte(showOut), &issues); err != nil {
+			t.Fatalf("Failed to parse show output: %v\nOutput: %s", err, showOut)
+		}
+		if len(issues) == 0 {
+			t.Fatalf("show returned no issues for id %s", id)
+		}
+		if issues[0]["no_history"] != true {
+			t.Errorf("Expected no_history=true after show, got: %v", issues[0]["no_history"])
+		}
+	})
+
+	t.Run("EphemeralAndNoHistoryMutuallyExclusive", func(t *testing.T) {
+		tmpDir := setupCLITestDB(t)
+		_, stderr, err := runBDInProcessAllowError(t, tmpDir, "create", "Should fail", "--ephemeral", "--no-history")
+		if err == nil {
+			t.Error("Expected error when combining --ephemeral and --no-history, got none")
+		}
+		if !strings.Contains(stderr, "mutually exclusive") {
+			t.Errorf("Expected 'mutually exclusive' in stderr, got: %s", stderr)
+		}
+	})
+}
+
+// TestCLI_WispListTypeFilter tests that bd mol wisp list --type filters correctly.
+func TestCLI_WispListTypeFilter(t *testing.T) {
+
+	tmpDir := setupCLITestDB(t)
+
+	// Create two ephemeral wisps of different built-in types
+	runBDInProcess(t, tmpDir, "create", "Bug wisp", "--ephemeral", "--type", "bug", "-p", "2")
+	runBDInProcess(t, tmpDir, "create", "Task wisp", "--ephemeral", "--type", "task", "-p", "2")
+
+	// --type bug should return only the bug wisp
+	out := runBDInProcess(t, tmpDir, "mol", "wisp", "list", "--type", "bug", "--json")
+	var result map[string]interface{}
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		t.Fatalf("Failed to parse JSON: %v\nOutput: %s", err, out)
+	}
+	wisps, ok := result["wisps"].([]interface{})
+	if !ok {
+		t.Fatalf("Expected 'wisps' array in JSON output, got: %v", result)
+	}
+	if len(wisps) != 1 {
+		t.Errorf("Expected 1 wisp with type=bug, got %d: %v", len(wisps), wisps)
+	}
+	if len(wisps) == 1 {
+		w := wisps[0].(map[string]interface{})
+		if w["type"] != "bug" {
+			t.Errorf("Expected wisp type=bug, got: %v", w["type"])
+		}
+	}
+
+	// --type task should return only the task wisp
+	out = runBDInProcess(t, tmpDir, "mol", "wisp", "list", "--type", "task", "--json")
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		t.Fatalf("Failed to parse JSON: %v\nOutput: %s", err, out)
+	}
+	wisps, ok = result["wisps"].([]interface{})
+	if !ok {
+		t.Fatalf("Expected 'wisps' array, got: %v", result)
+	}
+	if len(wisps) != 1 {
+		t.Errorf("Expected 1 wisp with type=task, got %d", len(wisps))
+	}
+	if len(wisps) == 1 {
+		w := wisps[0].(map[string]interface{})
+		if w["type"] != "task" {
+			t.Errorf("Expected wisp type=task, got: %v", w["type"])
+		}
+	}
+
+	// No --type filter returns both
+	out = runBDInProcess(t, tmpDir, "mol", "wisp", "list", "--json")
+	if err := json.Unmarshal([]byte(out), &result); err != nil {
+		t.Fatalf("Failed to parse JSON: %v\nOutput: %s", err, out)
+	}
+	wisps = result["wisps"].([]interface{})
+	if len(wisps) != 2 {
+		t.Errorf("Expected 2 wisps without type filter, got %d", len(wisps))
+	}
+}
+
+// TestCLI_WispGCExcludeType tests that bd mol wisp gc --exclude-type skips
+// wisps of the excluded type during garbage collection.
+func TestCLI_WispGCExcludeType(t *testing.T) {
+
+	tmpDir := setupCLITestDB(t)
+
+	// Create two ephemeral wisps of different built-in types.
+	// Use --age=0s so that ALL wisps (regardless of actual age) are treated
+	// as abandoned GC candidates.
+	bugOut := runBDInProcess(t, tmpDir, "create", "Bug wisp to keep", "--ephemeral", "--type", "bug", "-p", "2", "--json")
+	taskOut := runBDInProcess(t, tmpDir, "create", "Task wisp to gc", "--ephemeral", "--type", "task", "-p", "2", "--json")
+
+	var bugCreated, taskCreated map[string]interface{}
+	if err := json.Unmarshal([]byte(bugOut), &bugCreated); err != nil {
+		t.Fatalf("Failed to parse bug create output: %v\nOutput: %s", err, bugOut)
+	}
+	if err := json.Unmarshal([]byte(taskOut), &taskCreated); err != nil {
+		t.Fatalf("Failed to parse task create output: %v\nOutput: %s", err, taskOut)
+	}
+	bugID := bugCreated["id"].(string)
+	taskID := taskCreated["id"].(string)
+
+	// Dry-run GC with --exclude-type bug, --age=0s (treats all wisps as abandoned).
+	// The WispGCResult dry-run JSON uses cleaned_ids to list what would be deleted.
+	gcOut := runBDInProcess(t, tmpDir, "mol", "wisp", "gc", "--exclude-type", "bug", "--age", "0s", "--dry-run", "--json")
+	var gcResult map[string]interface{}
+	if err := json.Unmarshal([]byte(gcOut), &gcResult); err != nil {
+		t.Fatalf("Failed to parse gc JSON: %v\nOutput: %s", err, gcOut)
+	}
+
+	// cleaned_ids holds the IDs that would be deleted (dry_run=true).
+	cleanedRaw, _ := gcResult["cleaned_ids"].([]interface{})
+	cleanedIDs := make(map[string]bool, len(cleanedRaw))
+	for _, v := range cleanedRaw {
+		if id, ok := v.(string); ok {
+			cleanedIDs[id] = true
+		}
+	}
+
+	if !cleanedIDs[taskID] {
+		t.Errorf("Expected task wisp %s in GC candidates (not excluded), got cleaned_ids: %v", taskID, cleanedRaw)
+	}
+	if cleanedIDs[bugID] {
+		t.Errorf("Bug wisp %s should be excluded from GC via --exclude-type bug, but appeared in cleaned_ids", bugID)
+	}
+}

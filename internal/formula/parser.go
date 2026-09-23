@@ -2,6 +2,7 @@ package formula
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,7 +10,16 @@ import (
 	"strings"
 
 	"github.com/BurntSushi/toml"
+	"github.com/steveyegge/beads/internal/beads"
+	"github.com/steveyegge/beads/internal/git"
 )
+
+// ErrVarValidation wraps a variable validation failure so callers with a
+// fallback resolution path (e.g. "is this actually a proto/issue ID rather
+// than a formula name?") can distinguish "not a formula" from "is a formula,
+// but the provided variables are invalid" and surface the latter directly
+// with errors.Is, instead of silently falling through to a worse error.
+var ErrVarValidation = errors.New("variable validation failed")
 
 // Formula file extensions. TOML is preferred, JSON is legacy fallback.
 const (
@@ -39,11 +49,12 @@ type Parser struct {
 
 // NewParser creates a new formula parser.
 // searchPaths are directories to search for formulas when resolving extends.
-// Default paths are: .beads/formulas, ~/.beads/formulas, $GT_ROOT/.beads/formulas
+// Default paths are the active beads project's formulas dir, then user-level,
+// then GT_ROOT if configured.
 func NewParser(searchPaths ...string) *Parser {
 	paths := searchPaths
 	if len(paths) == 0 {
-		paths = defaultSearchPaths()
+		paths = DefaultSearchPaths()
 	}
 	return &Parser{
 		searchPaths:    paths,
@@ -53,23 +64,52 @@ func NewParser(searchPaths ...string) *Parser {
 	}
 }
 
-// defaultSearchPaths returns the default formula search paths.
-func defaultSearchPaths() []string {
+// DefaultSearchPaths returns the default formula search paths.
+//
+// The project-level path prefers the resolved beads directory so worktrees with
+// shared/main-repo .beads state search the same formula registry as the rest of
+// the command surface. If no beads project is resolved, fall back to cwd/.beads
+// so formula registries can still be used before a project is initialized.
+func DefaultSearchPaths() []string {
 	var paths []string
 
-	// Project-level formulas
+	addPath := func(path string) {
+		if path == "" {
+			return
+		}
+		for _, existing := range paths {
+			if existing == path {
+				return
+			}
+		}
+		paths = append(paths, path)
+	}
+
+	// Project-level formulas via resolved beads directory.
+	if beadsDir := beads.FindBeadsDir(); beadsDir != "" {
+		addPath(filepath.Join(beadsDir, "formulas"))
+	}
+
+	// Checkout-local formulas should remain discoverable even when the active
+	// beads database resolves to a parent/shared .beads directory. This lets a
+	// repo ship workflow formulas under .beads/formulas without requiring every
+	// maintainer to copy them into ~/.beads.
 	if cwd, err := os.Getwd(); err == nil {
-		paths = append(paths, filepath.Join(cwd, ".beads", "formulas"))
+		checkoutRoot := cwd
+		if repoRoot := git.GetRepoRoot(); repoRoot != "" {
+			checkoutRoot = repoRoot
+		}
+		addPath(filepath.Join(checkoutRoot, ".beads", "formulas"))
 	}
 
 	// User-level formulas
 	if home, err := os.UserHomeDir(); err == nil {
-		paths = append(paths, filepath.Join(home, ".beads", "formulas"))
+		addPath(filepath.Join(home, ".beads", "formulas"))
 	}
 
 	// Orchestrator formulas (via GT_ROOT)
 	if gtRoot := os.Getenv("GT_ROOT"); gtRoot != "" {
-		paths = append(paths, filepath.Join(gtRoot, ".beads", "formulas"))
+		addPath(filepath.Join(gtRoot, ".beads", "formulas"))
 	}
 
 	return paths
@@ -222,7 +262,11 @@ func (p *Parser) Resolve(formula *Formula) (*Formula, error) {
 	for name, varDef := range formula.Vars {
 		merged.Vars[name] = varDef
 	}
-	merged.Steps = append(merged.Steps, formula.Steps...)
+
+	// Merge child steps: override parent steps by ID (preserving position),
+	// append new child steps at the end.
+	merged.Steps = mergeSteps(merged.Steps, formula.Steps)
+
 	merged.Compose = mergeComposeRules(merged.Compose, formula.Compose)
 
 	// Use child description if set
@@ -263,6 +307,34 @@ func (p *Parser) loadFormula(name string) (*Formula, error) {
 // This is the public API for loading formulas used by expansion operators.
 func (p *Parser) LoadByName(name string) (*Formula, error) {
 	return p.loadFormula(name)
+}
+
+// mergeSteps merges child steps into parent steps.
+// Child steps with the same ID as a parent step replace the parent step
+// in-place (preserving position). Child steps with new IDs are appended.
+func mergeSteps(parent, child []*Step) []*Step {
+	// Index parent steps by ID for quick lookup
+	parentIdx := make(map[string]int, len(parent))
+	for i, s := range parent {
+		parentIdx[s.ID] = i
+	}
+
+	// Copy parent steps (will be modified in-place for overrides)
+	result := make([]*Step, len(parent))
+	copy(result, parent)
+
+	// Apply child steps
+	for _, cs := range child {
+		if idx, exists := parentIdx[cs.ID]; exists {
+			// Override: replace parent step at same position
+			result[idx] = cs
+		} else {
+			// New step: append at end
+			result = append(result, cs)
+		}
+	}
+
+	return result
 }
 
 // mergeComposeRules merges two compose rule sets.
@@ -335,6 +407,13 @@ func ExtractVariables(formula *Formula) []string {
 		extract(step.Description)
 		extract(step.Assignee)
 		extract(step.Condition)
+		if step.Gate != nil {
+			extract(step.Gate.Type)
+			extract(step.Gate.ID)
+			extract(step.Gate.AwaitID)
+			extract(step.Gate.Timeout)
+			extract(step.Gate.Repo)
+		}
 		for _, child := range step.Children {
 			extractFromStep(child)
 		}
@@ -373,46 +452,96 @@ func ValidateVars(formula *Formula, values map[string]string) error {
 			continue
 		}
 
-		// Use default if not provided
-		if !provided && def.Default != "" {
-			val = def.Default
-		}
-
-		// Skip further validation if no value
-		if val == "" {
-			continue
-		}
-
-		// Check enum constraint
-		if len(def.Enum) > 0 {
-			found := false
-			for _, allowed := range def.Enum {
-				if val == allowed {
-					found = true
-					break
-				}
-			}
-			if !found {
-				errs = append(errs, fmt.Sprintf("variable %q: value %q not in allowed values %v", name, val, def.Enum))
-			}
-		}
-
-		// Check pattern constraint
-		if def.Pattern != "" {
-			re, err := regexp.Compile(def.Pattern)
-			if err != nil {
-				errs = append(errs, fmt.Sprintf("variable %q: invalid pattern %q: %v", name, def.Pattern, err))
-			} else if !re.MatchString(val) {
-				errs = append(errs, fmt.Sprintf("variable %q: value %q does not match pattern %q", name, val, def.Pattern))
-			}
-		}
+		errs = append(errs, validateVarValue(name, def, val, provided)...)
 	}
 
 	if len(errs) > 0 {
-		return fmt.Errorf("variable validation failed:\n  - %s", strings.Join(errs, "\n  - "))
+		return fmt.Errorf("%w:\n  - %s", ErrVarValidation, strings.Join(errs, "\n  - "))
 	}
 
 	return nil
+}
+
+// ValidateProvidedVars checks enum/pattern/required-empty constraints only
+// for variables that are present in values; it does not flag variables that
+// are entirely absent. Callers that already surface a more specific
+// missing-variable message (e.g. bd mol pour/wisp's hint path) should keep
+// using that path for absent vars — this exists so those same callers still
+// catch malformed *provided* values, which a presence-only check misses
+// (mybd-u2r6).
+func ValidateProvidedVars(formula *Formula, values map[string]string) error {
+	var errs []string
+
+	for name, def := range formula.Vars {
+		val, provided := values[name]
+		if !provided {
+			continue
+		}
+
+		errs = append(errs, validateVarValue(name, def, val, provided)...)
+	}
+
+	if len(errs) > 0 {
+		return fmt.Errorf("%w:\n  - %s", ErrVarValidation, strings.Join(errs, "\n  - "))
+	}
+
+	return nil
+}
+
+// validateVarValue applies the required-empty, enum, and pattern checks for
+// a single variable given its (possibly defaulted) value. It assumes any
+// "required and not provided at all" check has already been handled by the
+// caller, since that case is presented differently by ValidateVars vs.
+// ValidateProvidedVars.
+func validateVarValue(name string, def *VarDef, val string, provided bool) []string {
+	var errs []string
+
+	// A variable with no default is effectively required: the command paths
+	// (extractRequiredVariables) demand a value for it, so a provided-but-empty
+	// value is the same unset-shell-variable trap as for required=true.
+	if (def.Required || def.Default == nil) && provided && val == "" {
+		errs = append(errs, fmt.Sprintf("variable %q is required and cannot be empty", name))
+		return errs
+	}
+
+	// Use default if not provided
+	if !provided && def.Default != nil {
+		val = *def.Default
+	}
+
+	// Skip further validation only when the var was genuinely not
+	// provided (absent from the map). A value that was explicitly
+	// provided as "" must still be checked against enum/pattern
+	// constraints rather than silently passing.
+	if !provided && val == "" {
+		return errs
+	}
+
+	// Check enum constraint
+	if len(def.Enum) > 0 {
+		found := false
+		for _, allowed := range def.Enum {
+			if val == allowed {
+				found = true
+				break
+			}
+		}
+		if !found {
+			errs = append(errs, fmt.Sprintf("variable %q: value %q not in allowed values %v", name, val, def.Enum))
+		}
+	}
+
+	// Check pattern constraint
+	if def.Pattern != "" {
+		re, err := regexp.Compile(def.Pattern)
+		if err != nil {
+			errs = append(errs, fmt.Sprintf("variable %q: invalid pattern %q: %v", name, def.Pattern, err))
+		} else if !re.MatchString(val) {
+			errs = append(errs, fmt.Sprintf("variable %q: value %q does not match pattern %q", name, val, def.Pattern))
+		}
+	}
+
+	return errs
 }
 
 // ApplyDefaults returns a new map with default values filled in.
@@ -426,8 +555,8 @@ func ApplyDefaults(formula *Formula, values map[string]string) map[string]string
 
 	// Apply defaults for missing values
 	for name, def := range formula.Vars {
-		if _, exists := result[name]; !exists && def.Default != "" {
-			result[name] = def.Default
+		if _, exists := result[name]; !exists && def.Default != nil {
+			result[name] = *def.Default
 		}
 	}
 

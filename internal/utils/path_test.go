@@ -74,92 +74,6 @@ func TestCanonicalizePath(t *testing.T) {
 	}
 }
 
-// TestFindJSONLInDir tests that FindJSONLInDir correctly prefers issues.jsonl
-// and avoids deletions.jsonl and merge artifacts (bd-tqo fix)
-func TestFindJSONLInDir(t *testing.T) {
-	tests := []struct {
-		name     string
-		files    []string
-		expected string
-	}{
-		{
-			name:     "only issues.jsonl",
-			files:    []string{"issues.jsonl"},
-			expected: "issues.jsonl",
-		},
-		{
-			name:     "issues.jsonl and deletions.jsonl - prefers issues",
-			files:    []string{"deletions.jsonl", "issues.jsonl"},
-			expected: "issues.jsonl",
-		},
-		{
-			name:     "issues.jsonl with merge artifacts - prefers issues",
-			files:    []string{"beads.base.jsonl", "beads.left.jsonl", "beads.right.jsonl", "issues.jsonl"},
-			expected: "issues.jsonl",
-		},
-		{
-			name:     "beads.jsonl as legacy fallback",
-			files:    []string{"beads.jsonl"},
-			expected: "beads.jsonl",
-		},
-		{
-			name:     "issues.jsonl preferred over beads.jsonl",
-			files:    []string{"beads.jsonl", "issues.jsonl"},
-			expected: "issues.jsonl",
-		},
-		{
-			name:     "only deletions.jsonl - returns default issues.jsonl",
-			files:    []string{"deletions.jsonl"},
-			expected: "issues.jsonl",
-		},
-		{
-			name:     "only interactions.jsonl - returns default issues.jsonl",
-			files:    []string{"interactions.jsonl"},
-			expected: "issues.jsonl",
-		},
-		{
-			name:     "interactions.jsonl with issues.jsonl - prefers issues",
-			files:    []string{"interactions.jsonl", "issues.jsonl"},
-			expected: "issues.jsonl",
-		},
-		{
-			name:     "only merge artifacts - returns default issues.jsonl",
-			files:    []string{"beads.base.jsonl", "beads.left.jsonl", "beads.right.jsonl"},
-			expected: "issues.jsonl",
-		},
-		{
-			name:     "no files - returns default issues.jsonl",
-			files:    []string{},
-			expected: "issues.jsonl",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			tmpDir, err := os.MkdirTemp("", "bd-findjsonl-test-*")
-			if err != nil {
-				t.Fatal(err)
-			}
-			defer os.RemoveAll(tmpDir)
-
-			// Create test files
-			for _, file := range tt.files {
-				path := filepath.Join(tmpDir, file)
-				if err := os.WriteFile(path, []byte("{}"), 0644); err != nil {
-					t.Fatal(err)
-				}
-			}
-
-			result := FindJSONLInDir(tmpDir)
-			got := filepath.Base(result)
-
-			if got != tt.expected {
-				t.Errorf("FindJSONLInDir() = %q, want %q", got, tt.expected)
-			}
-		})
-	}
-}
-
 func TestCanonicalizePathSymlink(t *testing.T) {
 	// Create a temporary directory
 	tmpDir := t.TempDir()
@@ -243,23 +157,6 @@ func TestResolveForWrite(t *testing.T) {
 			t.Errorf("got %q, want %q", got, newFile)
 		}
 	})
-}
-
-func TestFindMoleculesJSONLInDir(t *testing.T) {
-	root := t.TempDir()
-	molecules := filepath.Join(root, "molecules.jsonl")
-	if err := os.WriteFile(molecules, []byte("[]"), 0o644); err != nil {
-		t.Fatalf("failed to create molecules.jsonl: %v", err)
-	}
-
-	if got := FindMoleculesJSONLInDir(root); got != molecules {
-		t.Fatalf("expected %q, got %q", molecules, got)
-	}
-
-	otherDir := t.TempDir()
-	if got := FindMoleculesJSONLInDir(otherDir); got != "" {
-		t.Fatalf("expected empty path when file missing, got %q", got)
-	}
 }
 
 func TestNormalizePathForComparison(t *testing.T) {
@@ -353,6 +250,107 @@ func TestCanonicalizePathCase(t *testing.T) {
 	// The result should have the correct case "TestCase", not "testcase"
 	if !strings.HasSuffix(result, "TestCase") {
 		t.Errorf("CanonicalizePath(%q) = %q, want path ending in 'TestCase'", wrongCasePath, result)
+	}
+}
+
+func TestCanonicalizeIfRelative(t *testing.T) {
+	absInput := filepath.Join(t.TempDir(), "test", "path")
+	tests := []struct {
+		name     string
+		input    string
+		validate func(t *testing.T, result string)
+	}{
+		{
+			name:  "empty string returns empty",
+			input: "",
+			validate: func(t *testing.T, result string) {
+				if result != "" {
+					t.Errorf("expected empty string, got %q", result)
+				}
+			},
+		},
+		{
+			name:  "absolute path returns unchanged",
+			input: absInput,
+			validate: func(t *testing.T, result string) {
+				if result != absInput {
+					t.Errorf("expected %q, got %q", absInput, result)
+				}
+			},
+		},
+		{
+			name:  "relative path returns canonicalized absolute",
+			input: ".",
+			validate: func(t *testing.T, result string) {
+				if !filepath.IsAbs(result) {
+					t.Errorf("expected absolute path, got %q", result)
+				}
+				cwd, err := os.Getwd()
+				if err != nil {
+					t.Fatalf("failed to get cwd: %v", err)
+				}
+				// Result should be related to cwd
+				canonicalCwd := CanonicalizePath(cwd)
+				if result != canonicalCwd {
+					t.Errorf("expected %q, got %q", canonicalCwd, result)
+				}
+			},
+		},
+		{
+			name:  "relative subdirectory path",
+			input: "subdir/file.txt",
+			validate: func(t *testing.T, result string) {
+				if !filepath.IsAbs(result) {
+					t.Errorf("expected absolute path, got %q", result)
+				}
+				if !strings.HasSuffix(result, "subdir/file.txt") && !strings.HasSuffix(result, "subdir\\file.txt") {
+					t.Errorf("expected path to end with subdir/file.txt, got %q", result)
+				}
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := CanonicalizeIfRelative(tt.input)
+			tt.validate(t, result)
+		})
+	}
+}
+
+func TestCanonicalizeIfRelativeTilde(t *testing.T) {
+	// Test tilde expansion - CanonicalizeIfRelative does NOT expand tilde
+	// because ~ is not detected as relative by filepath.IsAbs()
+	// This documents the current behavior - tilde paths need separate handling
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Skip("could not get home directory")
+	}
+
+	// ~/path is technically not absolute, but filepath.IsAbs treats it as relative
+	tildeInput := "~/testpath"
+	result := CanonicalizeIfRelative(tildeInput)
+
+	// The function should canonicalize it since ~ is not absolute
+	// But CanonicalizePath doesn't expand tilde, so we get cwd + ~/testpath
+	// This documents the expected behavior - tilde expansion must happen before
+	// calling CanonicalizeIfRelative
+	if result == tildeInput {
+		t.Logf("tilde path returned unchanged - tilde expansion happens elsewhere")
+	} else if strings.Contains(result, home) {
+		t.Logf("tilde was expanded to home directory")
+	}
+	// Either behavior is acceptable - this test documents it
+
+	// Verify absolute tilde-expanded paths work correctly
+	absoluteWithHome := filepath.Join(home, "testpath")
+	result = CanonicalizeIfRelative(absoluteWithHome)
+	if result != absoluteWithHome {
+		// May differ on macOS due to /var -> /private/var symlink resolution
+		// Just verify it's still absolute and contains the expected path
+		if !filepath.IsAbs(result) {
+			t.Errorf("expected absolute path, got %q", result)
+		}
 	}
 }
 

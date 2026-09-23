@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -67,32 +68,42 @@ func TestGitRevParse(t *testing.T) {
 	}
 }
 
+func TestGitCmdInDirSuppressesHooksViaGitConfig(t *testing.T) {
+	cmd := gitCmdInDir(t.Context(), "/tmp/example", "status", "--porcelain")
+	if cmd.Dir != "/tmp/example" {
+		t.Fatalf("cmd.Dir = %q, want /tmp/example", cmd.Dir)
+	}
+	wantArgs := []string{"-c", "core.hooksPath=", "status", "--porcelain"}
+	if len(cmd.Args) != len(wantArgs)+1 {
+		t.Fatalf("cmd.Args = %#v, want git plus %#v", cmd.Args, wantArgs)
+	}
+	for i, want := range wantArgs {
+		if got := cmd.Args[i+1]; got != want {
+			t.Fatalf("cmd.Args[%d] = %q, want %q; full args: %#v", i+1, got, want, cmd.Args)
+		}
+	}
+	for _, env := range cmd.Env {
+		if env == "GIT_HOOKS_PATH=" {
+			t.Fatal("cmd.Env contains dead GIT_HOOKS_PATH hook suppression")
+		}
+		if env == "GIT_TEMPLATE_DIR=" {
+			return
+		}
+	}
+	t.Fatal("cmd.Env missing GIT_TEMPLATE_DIR suppression")
+}
+
 // TestResolveWorktreePathByName verifies that resolveWorktreePath can find
 // worktrees by name (basename) when they're in subdirectories like .worktrees/
 func TestResolveWorktreePathByName(t *testing.T) {
 	// Create a temp directory for the main repo
-	mainDir := t.TempDir()
-
-	// Initialize git repo
-	cmd := exec.Command("git", "init", "--initial-branch=main")
-	cmd.Dir = mainDir
-	if output, err := cmd.CombinedOutput(); err != nil {
-		t.Fatalf("Failed to init git repo: %v\n%s", err, output)
-	}
-
-	// Configure git user
-	cmd = exec.Command("git", "config", "user.email", "test@test.com")
-	cmd.Dir = mainDir
-	_ = cmd.Run()
-	cmd = exec.Command("git", "config", "user.name", "Test User")
-	cmd.Dir = mainDir
-	_ = cmd.Run()
+	mainDir := newGitRepo(t)
 
 	// Create initial commit (required for worktrees)
 	if err := os.WriteFile(filepath.Join(mainDir, "README.md"), []byte("# Test\n"), 0644); err != nil {
 		t.Fatalf("Failed to create test file: %v", err)
 	}
-	cmd = exec.Command("git", "add", ".")
+	cmd := exec.Command("git", "add", ".")
 	cmd.Dir = mainDir
 	_ = cmd.Run()
 	cmd = exec.Command("git", "commit", "-m", "Initial commit")
@@ -121,9 +132,11 @@ func TestResolveWorktreePathByName(t *testing.T) {
 		_ = cmd.Run()
 	}()
 
+	ctx := context.Background()
+
 	t.Run("resolves by name when worktree is in subdirectory", func(t *testing.T) {
 		// This should find the worktree by consulting git's registry
-		resolved, err := resolveWorktreePath(mainDir, "test-wt")
+		resolved, err := resolveWorktreePath(ctx, mainDir, "test-wt")
 		if err != nil {
 			t.Errorf("resolveWorktreePath(repoRoot, \"test-wt\") failed: %v", err)
 			return
@@ -138,7 +151,7 @@ func TestResolveWorktreePathByName(t *testing.T) {
 
 	t.Run("resolves by relative path", func(t *testing.T) {
 		// This should work via the existing relative-to-repo-root logic
-		resolved, err := resolveWorktreePath(mainDir, ".worktrees/test-wt")
+		resolved, err := resolveWorktreePath(ctx, mainDir, ".worktrees/test-wt")
 		if err != nil {
 			t.Errorf("resolveWorktreePath(repoRoot, \".worktrees/test-wt\") failed: %v", err)
 			return
@@ -149,7 +162,7 @@ func TestResolveWorktreePathByName(t *testing.T) {
 	})
 
 	t.Run("resolves by absolute path", func(t *testing.T) {
-		resolved, err := resolveWorktreePath(mainDir, worktreePath)
+		resolved, err := resolveWorktreePath(ctx, mainDir, worktreePath)
 		if err != nil {
 			t.Errorf("resolveWorktreePath(repoRoot, absolutePath) failed: %v", err)
 			return
@@ -160,7 +173,7 @@ func TestResolveWorktreePathByName(t *testing.T) {
 	})
 
 	t.Run("returns error for non-existent worktree", func(t *testing.T) {
-		_, err := resolveWorktreePath(mainDir, "non-existent")
+		_, err := resolveWorktreePath(ctx, mainDir, "non-existent")
 		if err == nil {
 			t.Error("resolveWorktreePath should return error for non-existent worktree")
 		}

@@ -39,8 +39,8 @@ func TestAtomicWriteFile(t *testing.T) {
 	}
 
 	mode := info.Mode()
-	if !skipPermissionChecks && mode.Perm() != 0600 {
-		t.Errorf("file permissions mismatch: got %o, want %o", mode.Perm(), 0600)
+	if !skipPermissionChecks && mode.Perm() != 0644 {
+		t.Errorf("file permissions mismatch: got %o, want %o", mode.Perm(), 0644)
 	}
 
 	// Test overwriting existing file
@@ -67,7 +67,28 @@ func TestAtomicWriteFile(t *testing.T) {
 	}
 }
 
-func TestAtomicWriteFile_PreservesSymlink(t *testing.T) {
+func TestAtomicWriteFile_ExplicitPermissions(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("skipping permission test on Windows")
+	}
+	tmpDir := t.TempDir()
+	testFile := filepath.Join(tmpDir, "restricted.txt")
+
+	err := atomicWriteFile(testFile, []byte("secret"), 0600)
+	if err != nil {
+		t.Fatalf("atomicWriteFile with explicit perm failed: %v", err)
+	}
+
+	info, err := os.Stat(testFile)
+	if err != nil {
+		t.Fatalf("failed to stat file: %v", err)
+	}
+	if info.Mode().Perm() != 0600 {
+		t.Errorf("file permissions mismatch: got %o, want %o", info.Mode().Perm(), 0600)
+	}
+}
+
+func TestAtomicWriteFile_RefusesSymlink(t *testing.T) {
 	tmpDir := t.TempDir()
 
 	// Create target file
@@ -82,9 +103,8 @@ func TestAtomicWriteFile_PreservesSymlink(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Write via symlink
-	if err := atomicWriteFile(link, []byte("updated")); err != nil {
-		t.Fatalf("atomicWriteFile failed: %v", err)
+	if err := atomicWriteFile(link, []byte("updated")); err == nil {
+		t.Fatal("expected atomicWriteFile to refuse symlink")
 	}
 
 	// Verify symlink still exists
@@ -96,7 +116,40 @@ func TestAtomicWriteFile_PreservesSymlink(t *testing.T) {
 		t.Error("symlink was replaced with regular file")
 	}
 
-	// Verify target was updated
+	data, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatalf("failed to read target: %v", err)
+	}
+	if string(data) != "original" {
+		t.Errorf("target content = %q, want %q", string(data), "original")
+	}
+}
+
+func TestAtomicWriteFileFollowingSymlink_PreservesSymlink(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	target := filepath.Join(tmpDir, "target.txt")
+	if err := os.WriteFile(target, []byte("original"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	link := filepath.Join(tmpDir, "link.txt")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := atomicWriteFileFollowingSymlink(link, []byte("updated")); err != nil {
+		t.Fatalf("atomicWriteFileFollowingSymlink failed: %v", err)
+	}
+
+	info, err := os.Lstat(link)
+	if err != nil {
+		t.Fatalf("failed to lstat link: %v", err)
+	}
+	if info.Mode()&os.ModeSymlink == 0 {
+		t.Error("symlink was replaced with regular file")
+	}
+
 	data, err := os.ReadFile(target)
 	if err != nil {
 		t.Fatalf("failed to read target: %v", err)

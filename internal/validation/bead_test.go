@@ -36,12 +36,12 @@ func TestParsePriority(t *testing.T) {
 		{" P1 ", 1},
 
 		// Invalid cases (returns -1)
-		{"5", -1},      // Out of range
-		{"-1", -1},     // Negative
-		{"P5", -1},     // Out of range with prefix
-		{"abc", -1},    // Not a number
-		{"P", -1},      // Just the prefix
-		{"PP1", -1},    // Double prefix
+		{"5", -1},   // Out of range
+		{"-1", -1},  // Negative
+		{"P5", -1},  // Out of range with prefix
+		{"abc", -1}, // Not a number
+		{"P", -1},   // Just the prefix
+		{"PP1", -1}, // Double prefix
 	}
 
 	for _, tt := range tests {
@@ -97,11 +97,11 @@ func TestValidateIDFormat(t *testing.T) {
 		// Hyphenated prefix support
 		// These test cases verify that ValidateIDFormat correctly extracts
 		// prefixes containing hyphens (e.g., "bead-me-up" not just "bead")
-		{"bead-me-up-3e9", "bead-me-up", false},           // 3-char hash suffix
-		{"bead-me-up-3e9.1", "bead-me-up", false},         // hierarchical child
-		{"bead-me-up-3e9.1.2", "bead-me-up", false},       // deeply nested child
-		{"web-app-a3f8e9", "web-app", false},              // 6-char hash suffix
-		{"my-cool-project-1a2b", "my-cool-project", false}, // 4-char hash suffix
+		{"bead-me-up-3e9", "bead-me-up", false},                       // 3-char hash suffix
+		{"bead-me-up-3e9.1", "bead-me-up", false},                     // hierarchical child
+		{"bead-me-up-3e9.1.2", "bead-me-up", false},                   // deeply nested child
+		{"web-app-a3f8e9", "web-app", false},                          // 6-char hash suffix
+		{"my-cool-project-1a2b", "my-cool-project", false},            // 4-char hash suffix
 		{"document-intelligence-0sa", "document-intelligence", false}, // 3-char hash
 	}
 
@@ -125,12 +125,12 @@ func TestValidateIDFormat(t *testing.T) {
 // not "bead". This test simulates the create.go flow at lines 352-391.
 func TestValidateIDFormat_ParentChildFlow(t *testing.T) {
 	tests := []struct {
-		name         string
-		parentID     string
-		childSuffix  string
-		dbPrefix     string
-		wantPrefix   string
-		shouldMatch  bool
+		name        string
+		parentID    string
+		childSuffix string
+		dbPrefix    string
+		wantPrefix  string
+		shouldMatch bool
 	}{
 		{
 			name:        "simple prefix - child creation works",
@@ -185,7 +185,7 @@ func TestValidateIDFormat_ParentChildFlow(t *testing.T) {
 
 			// Simulate the prefix validation from create.go:389
 			// This is where the "prefix mismatch" error occurs
-			err = ValidatePrefix(extractedPrefix, tt.dbPrefix, false)
+			err = validatePrefix(extractedPrefix, tt.dbPrefix, false)
 			prefixMatches := (err == nil)
 
 			if prefixMatches != tt.shouldMatch {
@@ -205,25 +205,26 @@ func TestValidateIDFormat_ParentChildFlow(t *testing.T) {
 
 func TestParseIssueType(t *testing.T) {
 	tests := []struct {
-		name         string
-		input        string
-		wantType     types.IssueType
-		wantError    bool
+		name          string
+		input         string
+		wantType      types.IssueType
+		wantError     bool
 		errorContains string
 	}{
-		// Valid issue types
+		// Core work types (always valid)
 		{"bug type", "bug", types.TypeBug, false, ""},
 		{"feature type", "feature", types.TypeFeature, false, ""},
 		{"task type", "task", types.TypeTask, false, ""},
 		{"epic type", "epic", types.TypeEpic, false, ""},
 		{"chore type", "chore", types.TypeChore, false, ""},
-		{"merge-request type", "merge-request", types.TypeMergeRequest, false, ""},
+		// Molecule is now a core type (used by swarm create)
 		{"molecule type", "molecule", types.TypeMolecule, false, ""},
+		// Gate is a core type (used by bd gate, formula gates — GH#3213)
 		{"gate type", "gate", types.TypeGate, false, ""},
-		{"event type", "event", types.TypeEvent, false, ""},
+		// Remaining orchestrator types require types.custom configuration
+		{"merge-request type", "merge-request", types.TypeTask, true, "invalid issue type"},
+		{"event type", "event", types.TypeTask, true, "invalid issue type"},
 		{"message type", "message", types.TypeMessage, false, ""},
-		// Gas Town types (agent, role, rig, convoy, slot) have been removed
-		// They now require custom type configuration,
 
 		// Case sensitivity (function is case-sensitive)
 		{"uppercase bug", "BUG", types.TypeTask, true, "invalid issue type"},
@@ -244,20 +245,20 @@ func TestParseIssueType(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			got, err := ParseIssueType(tt.input)
-			
+
 			// Check error conditions
 			if (err != nil) != tt.wantError {
 				t.Errorf("ParseIssueType(%q) error = %v, wantError %v", tt.input, err, tt.wantError)
 				return
 			}
-			
+
 			if err != nil && tt.errorContains != "" {
 				if !strings.Contains(err.Error(), tt.errorContains) {
 					t.Errorf("ParseIssueType(%q) error message = %q, should contain %q", tt.input, err.Error(), tt.errorContains)
 				}
 				return
 			}
-			
+
 			// Check return value
 			if got != tt.wantType {
 				t.Errorf("ParseIssueType(%q) = %v, want %v", tt.input, got, tt.wantType)
@@ -282,9 +283,9 @@ func TestValidatePrefix(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := ValidatePrefix(tt.requestedPrefix, tt.dbPrefix, tt.force)
+			err := validatePrefix(tt.requestedPrefix, tt.dbPrefix, tt.force)
 			if (err != nil) != tt.wantError {
-				t.Errorf("ValidatePrefix() error = %v, wantError %v", err, tt.wantError)
+				t.Errorf("validatePrefix() error = %v, wantError %v", err, tt.wantError)
 			}
 		})
 	}
@@ -299,13 +300,13 @@ func TestValidatePrefixWithAllowed(t *testing.T) {
 		force           bool
 		wantError       bool
 	}{
-		// Basic cases (same as ValidatePrefix)
+		// Basic cases (same as validatePrefix)
 		{"matching prefixes", "bd", "bd", "", false, false},
 		{"empty db prefix", "bd", "", "", false, false},
 		{"mismatched with force", "foo", "bd", "", true, false},
 		{"mismatched without force", "foo", "bd", "", false, true},
 
-		// Multi-prefix cases (Gas Town use case)
+		// Multi-prefix cases (multi-rig use case)
 		{"allowed prefix gt", "gt", "hq", "gt,hmc", false, false},
 		{"allowed prefix hmc", "hmc", "hq", "gt,hmc", false, false},
 		{"primary prefix still works", "hq", "hq", "gt,hmc", false, false},
@@ -315,91 +316,76 @@ func TestValidatePrefixWithAllowed(t *testing.T) {
 		{"allowed with spaces", "gt", "hq", "gt, hmc, foo", false, false},
 		{"empty allowed list", "gt", "hq", "", false, true},
 		{"single allowed prefix", "gt", "hq", "gt", false, false},
+
+		// GH#1135: prefix-of-allowed cases
+		// When ExtractIssuePrefix returns "hq" from "hq-cv-test", but "hq-cv" is allowed
+		{"GH#1135 prefix-of-allowed hq->hq-cv", "hq", "djdefi-ops", "djdefi-ops,hq-cv", false, false},
+		{"GH#1135 prefix-of-allowed with multiple", "hq", "djdefi-ops", "hq-cv,hq-other,foo", false, false},
+		{"GH#1135 exact match still works", "hq-cv", "djdefi-ops", "hq-cv", false, false},
+		{"GH#1135 no false positive for unrelated prefix", "bar", "djdefi-ops", "hq-cv", false, true},
+		{"GH#1135 no false positive for partial overlap", "hq", "djdefi-ops", "hqx-cv", false, true},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := ValidatePrefixWithAllowed(tt.requestedPrefix, tt.dbPrefix, tt.allowedPrefixes, tt.force)
+			err := validatePrefixWithAllowed(tt.requestedPrefix, tt.dbPrefix, tt.allowedPrefixes, tt.force)
 			if (err != nil) != tt.wantError {
-				t.Errorf("ValidatePrefixWithAllowed() error = %v, wantError %v", err, tt.wantError)
+				t.Errorf("validatePrefixWithAllowed() error = %v, wantError %v", err, tt.wantError)
 			}
 		})
 	}
 }
 
-func TestValidateAgentID(t *testing.T) {
+// TestValidateIDPrefixAllowed tests the new function that validates IDs using
+// "starts with" matching to handle multi-hyphen prefixes correctly (GH#1135).
+func TestValidateIDPrefixAllowed(t *testing.T) {
 	tests := []struct {
-		name          string
-		id            string
-		wantError     bool
-		errorContains string
+		name            string
+		id              string
+		dbPrefix        string
+		allowedPrefixes string
+		force           bool
+		wantError       bool
 	}{
-		// Town-level agents (no rig)
-		{"valid mayor", "gt-mayor", false, ""},
-		{"valid deacon", "gt-deacon", false, ""},
+		// Basic cases
+		{"matching prefix", "bd-abc123", "bd", "", false, false},
+		{"empty db prefix", "bd-abc123", "", "", false, false},
+		{"mismatched with force", "foo-abc123", "bd", "", true, false},
+		{"mismatched without force", "foo-abc123", "bd", "", false, true},
 
-		// Per-rig agents (canonical format: gt-<rig>-<role>)
-		{"valid witness gastown", "gt-gastown-witness", false, ""},
-		{"valid refinery beads", "gt-beads-refinery", false, ""},
+		// Multi-hyphen prefix cases (GH#1135 - the main bug)
+		{"hq-cv prefix with word suffix", "hq-cv-test", "djdefi-ops", "hq,hq-cv", false, false},
+		{"hq-cv prefix with hash suffix", "hq-cv-abc123", "djdefi-ops", "hq,hq-cv", false, false},
+		{"djdefi-ops with word suffix", "djdefi-ops-test", "djdefi-ops", "", false, false},
 
-		// Named agents (canonical format: gt-<rig>-<role>-<name>)
-		{"valid polecat", "gt-gastown-polecat-nux", false, ""},
-		{"valid crew", "gt-beads-crew-dave", false, ""},
-		{"valid polecat with complex name", "gt-gastown-polecat-war-boy-1", false, ""},
+		// Allowed prefixes list
+		{"allowed prefix gt", "gt-abc123", "hq", "gt,hmc", false, false},
+		{"allowed prefix hmc", "hmc-abc123", "hq", "gt,hmc", false, false},
+		{"primary prefix still works", "hq-abc123", "hq", "gt,hmc", false, false},
+		{"prefix not in allowed list", "foo-abc123", "hq", "gt,hmc", false, true},
 
-		// Valid: alternative prefixes (beads uses bd-)
-		{"valid bd-mayor", "bd-mayor", false, ""},
-		{"valid bd-beads-polecat-pearl", "bd-beads-polecat-pearl", false, ""},
-		{"valid bd-beads-witness", "bd-beads-witness", false, ""},
+		// Edge cases
+		{"allowed with spaces", "gt-abc123", "hq", "gt, hmc, foo", false, false},
+		{"allowed with trailing dash", "gt-abc123", "hq", "gt-, hmc-", false, false},
+		{"empty allowed list", "gt-abc123", "hq", "", false, true},
+		{"single allowed prefix", "gt-abc123", "hq", "gt", false, false},
 
-		// Valid: hyphenated rig names (GH#854)
-		{"hyphenated rig witness", "ob-my-project-witness", false, ""},
-		{"hyphenated rig refinery", "gt-foo-bar-refinery", false, ""},
-		{"hyphenated rig crew", "bd-my-cool-project-crew-fang", false, ""},
-		{"hyphenated rig polecat", "gt-some-long-rig-name-polecat-nux", false, ""},
-		{"hyphenated rig and name", "gt-my-rig-polecat-war-boy", false, ""},
-		{"multi-hyphen rig crew", "ob-a-b-c-d-crew-dave", false, ""},
+		// DB prefix with trailing hyphen (GH#4208)
+		{"db prefix trailing hyphen", "v2-abc123", "v2-", "", false, false},
+		{"db prefix trailing hyphen with allowed", "v2-abc123", "v2-", "v2-", false, false},
+		{"db prefix only hyphen", "abc123", "-", "", false, false},
 
-		// Invalid: no prefix (missing hyphen)
-		{"no prefix", "mayor", true, "must have a prefix followed by '-'"},
-
-		// Invalid: empty
-		{"empty id", "", true, "agent ID is required"},
-
-		// Invalid: unknown role in position 2
-		{"unknown role", "gt-gastown-admin", true, "invalid agent format"},
-
-		// Invalid: town-level with rig (put role first)
-		{"mayor with rig suffix", "gt-gastown-mayor", true, "cannot have rig/name suffixes"},
-		{"deacon with rig suffix", "gt-beads-deacon", true, "cannot have rig/name suffixes"},
-
-		// Invalid: per-rig role without rig
-		{"witness alone", "gt-witness", true, "requires rig"},
-		{"refinery alone", "gt-refinery", true, "requires rig"},
-
-		// Invalid: named agent without name
-		{"crew no name", "gt-beads-crew", true, "requires name"},
-		{"polecat no name", "gt-gastown-polecat", true, "requires name"},
-
-		// Invalid: witness/refinery with extra parts
-		{"witness with name", "gt-gastown-witness-extra", true, "cannot have name suffix"},
-		{"refinery with name", "gt-beads-refinery-extra", true, "cannot have name suffix"},
-
-		// Invalid: empty components
-		{"empty after prefix", "gt-", true, "must include content after prefix"},
+		// Multi-hyphen allowed prefixes
+		{"multi-hyphen in allowed list", "my-cool-prefix-abc123", "hq", "my-cool-prefix,other", false, false},
+		{"partial match should fail", "hq-cv-extra-test", "hq", "hq-cv-extra", false, false},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			err := ValidateAgentID(tt.id)
+			err := ValidateIDPrefixAllowed(tt.id, tt.dbPrefix, tt.allowedPrefixes, tt.force)
 			if (err != nil) != tt.wantError {
-				t.Errorf("ValidateAgentID(%q) error = %v, wantError %v", tt.id, err, tt.wantError)
-				return
-			}
-			if err != nil && tt.errorContains != "" {
-				if !strings.Contains(err.Error(), tt.errorContains) {
-					t.Errorf("ValidateAgentID(%q) error = %q, should contain %q", tt.id, err.Error(), tt.errorContains)
-				}
+				t.Errorf("ValidateIDPrefixAllowed(%q, %q, %q) error = %v, wantError %v",
+					tt.id, tt.dbPrefix, tt.allowedPrefixes, err, tt.wantError)
 			}
 		})
 	}

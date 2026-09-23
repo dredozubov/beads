@@ -1,192 +1,191 @@
 package main
 
 import (
-	"bufio"
-	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
 
 	"github.com/spf13/cobra"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 )
 
+var restoreApply bool
+
 var restoreCmd = &cobra.Command{
-	Use:     "restore <issue-id>",
-	GroupID: "sync",
-	Short:   "Restore full history of a compacted issue from git",
-	Long: `Restore full history of a compacted issue from git version control.
+	Use:           "restore <issue-id>",
+	GroupID:       "sync",
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	Short:         "Restore the pre-compaction content of a compacted issue",
+	Long: `Restore the pre-compaction content of a compacted issue.
 
-When an issue is compacted, the git commit hash is saved. This command:
-1. Reads the compacted_at_commit from the database
-2. Checks out that commit temporarily
-3. Reads the full issue from JSONL at that point in history
-4. Displays the full issue history (description, events, etc.)
-5. Returns to the current git state
+When an issue is compacted, its description/design/notes/acceptance criteria
+are summarized and the originals are archived to a compaction snapshot. This
+command recovers that original content.
 
-This is read-only and does not modify the database or git state.`,
+By default it is read-only: it displays the archived content without modifying
+the database. Pass --apply to write the original content back into the issue
+and step its compaction level back down.
+
+If no archived snapshot exists (e.g. the issue was compacted by an older bd
+before snapshot archiving), restore falls back to a best-effort reconstruction
+from Dolt version history, which can only be displayed, not applied.`,
 	Args: cobra.ExactArgs(1),
-	Run: func(cmd *cobra.Command, args []string) {
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if usesProxiedServer() {
+			return HandleErrorRespectJSON("restore is not supported in proxied-server mode")
+		}
 		issueID := args[0]
 		ctx := rootCtx
-
-		// Check if we're in a git repository
-		if !isGitRepo() {
-			fmt.Fprintf(os.Stderr, "Error: not in a git repository\n")
-			fmt.Fprintf(os.Stderr, "Hint: restore requires git to access historical versions\n")
-			os.Exit(1)
-		}
 
 		// Get the issue
 		issue, err := store.GetIssue(ctx, issueID)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: issue %s not found: %v\n", issueID, err)
-			os.Exit(1)
+			if errors.Is(err, storage.ErrNotFound) {
+				fmt.Fprintf(os.Stderr, "Error: issue '%s' not found\n", issueID)
+			} else {
+				fmt.Fprintf(os.Stderr, "Error: issue '%s' not found: %v\n", issueID, err)
+			}
+			return SilentExit()
 		}
 
 		// Check if issue is compacted
-		if issue.CompactedAtCommit == nil || *issue.CompactedAtCommit == "" {
-			fmt.Fprintf(os.Stderr, "Error: issue %s is not compacted (no git commit saved)\n", issueID)
-			fmt.Fprintf(os.Stderr, "Hint: only compacted issues can be restored from git history\n")
-			os.Exit(1)
+		if issue.CompactionLevel == 0 {
+			fmt.Fprintf(os.Stderr, "Error: issue %s is not compacted\n", issueID)
+			fmt.Fprintf(os.Stderr, "Hint: only compacted issues need restoration\n")
+			return SilentExit()
 		}
 
-		commitHash := *issue.CompactedAtCommit
-
-		// Find JSONL path
-		jsonlPath := findJSONLPath()
-		if jsonlPath == "" {
-			fmt.Fprintf(os.Stderr, "Error: not in a bd workspace (no .beads directory found)\n")
-			os.Exit(1)
-		}
-
-		// Get current git HEAD for restoration
-		currentHead, err := getCurrentGitHead()
+		// Prefer the archived snapshot: it is the authoritative pre-compaction
+		// copy and the only source that can be safely written back.
+		snap, err := store.GetCompactionSnapshot(ctx, issueID)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: cannot determine current git HEAD: %v\n", err)
-			os.Exit(1)
+			return HandleError("failed to read compaction snapshot: %v", err)
 		}
 
-		// Check for uncommitted changes
-		hasChanges, err := gitHasUncommittedChanges()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error checking git status: %v\n", err)
-			os.Exit(1)
-		}
-		if hasChanges {
-			fmt.Fprintf(os.Stderr, "Error: you have uncommitted changes\n")
-			fmt.Fprintf(os.Stderr, "Hint: commit or stash changes before running restore\n")
-			os.Exit(1)
-		}
-
-		// Checkout the historical commit
-		if err := gitCheckout(commitHash); err != nil {
-			fmt.Fprintf(os.Stderr, "Error checking out commit %s: %v\n", commitHash, err)
-			os.Exit(1)
-		}
-
-		// Ensure we return to current state
-		defer func() {
-			if err := gitCheckout(currentHead); err != nil {
-				fmt.Fprintf(os.Stderr, "Warning: failed to return to %s: %v\n", currentHead, err)
+		if restoreApply {
+			if snap == nil {
+				fmt.Fprintf(os.Stderr, "Error: no archived snapshot for %s; cannot safely restore content\n", issueID)
+				fmt.Fprintf(os.Stderr, "Hint: this issue was compacted before snapshot archiving existed.\n")
+				fmt.Fprintf(os.Stderr, "      Run 'bd restore %s' (without --apply) to view the best-effort\n", issueID)
+				fmt.Fprintf(os.Stderr, "      version reconstructed from Dolt history.\n")
+				return SilentExit()
 			}
-		}()
+			applied, err := store.RestoreFromSnapshot(ctx, issueID)
+			if err != nil {
+				return HandleError("failed to restore issue: %v", err)
+			}
+			if applied == nil {
+				return HandleError("no archived snapshot for %s", issueID)
+			}
+			restored, err := store.GetIssue(ctx, issueID)
+			if err != nil {
+				return HandleError("restored, but failed to re-read issue: %v", err)
+			}
+			if jsonOutput {
+				if err := outputJSON(restored); err != nil {
+					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				}
+				return nil
+			}
+			fmt.Printf("%s Restored %s from archived snapshot (compaction level %d → %d)\n",
+				ui.RenderPass("✓"), issueID, issue.CompactionLevel, restored.CompactionLevel)
+			return nil
+		}
 
-		// Read the issue from JSONL at this commit
-		historicalIssue, err := readIssueFromJSONL(jsonlPath, issueID)
+		// Read-only display path. Prefer the archived snapshot; fall back to the
+		// Dolt-history heuristic when no snapshot exists.
+		if snap != nil {
+			view := snapshotView(issue, snap)
+			if jsonOutput {
+				if err := outputJSON(view); err != nil {
+					fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+				}
+			} else {
+				displayRestoredIssue(view, "archived snapshot")
+				fmt.Printf("%s\n", ui.RenderMuted("Run 'bd restore "+issueID+" --apply' to write this content back."))
+			}
+			return nil
+		}
+
+		// Query Dolt history for the pre-compaction version
+		history, err := store.History(ctx, issueID)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error reading issue from historical JSONL: %v\n", err)
-			os.Exit(1)
+			return HandleError("failed to query history: %v", err)
 		}
 
-		if historicalIssue == nil {
-			fmt.Fprintf(os.Stderr, "Error: issue %s not found in JSONL at commit %s\n", issueID, commitHash)
-			os.Exit(1)
+		if len(history) == 0 {
+			fmt.Fprintf(os.Stderr, "Error: no history found for issue %s\n", issueID)
+			fmt.Fprintf(os.Stderr, "Hint: issue may have been compacted before Dolt history was available\n")
+			return SilentExit()
 		}
 
-		// Display the restored issue
-		displayRestoredIssue(historicalIssue, commitHash)
+		// Find the pre-compaction version: the history entry with the most content.
+		// History is ordered by commit_date DESC, so we scan all entries.
+		var best *storage.HistoryEntry
+		bestSize := 0
+		for _, entry := range history {
+			size := issueContentSize(entry.Issue)
+			if size > bestSize {
+				bestSize = size
+				best = entry
+			}
+		}
+
+		if best == nil || bestSize <= issueContentSize(issue) {
+			fmt.Fprintf(os.Stderr, "Error: no pre-compaction version found in Dolt history\n")
+			fmt.Fprintf(os.Stderr, "Hint: issue may have been compacted before Dolt history was available\n")
+			return SilentExit()
+		}
+
+		if jsonOutput {
+			if err := outputJSON(best.Issue); err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			}
+		} else {
+			hashDisplay := best.CommitHash
+			if len(hashDisplay) > 8 {
+				hashDisplay = hashDisplay[:8]
+			}
+			displayRestoredIssue(best.Issue, "Dolt commit "+hashDisplay)
+		}
+		return nil
 	},
+}
+
+// snapshotView returns a copy of the current issue with its text content
+// overlaid by the archived pre-compaction snapshot, for read-only display.
+func snapshotView(issue *types.Issue, snap *types.IssueSnapshot) *types.Issue {
+	view := *issue
+	if snap.Title != "" {
+		view.Title = snap.Title
+	}
+	view.Description = snap.Description
+	view.Design = snap.Design
+	view.Notes = snap.Notes
+	view.AcceptanceCriteria = snap.AcceptanceCriteria
+	return &view
+}
+
+// issueContentSize returns the total text content size of an issue.
+func issueContentSize(issue *types.Issue) int {
+	return len(issue.Description) + len(issue.Design) + len(issue.AcceptanceCriteria) + len(issue.Notes)
 }
 
 func init() {
 	restoreCmd.Flags().BoolVar(&jsonOutput, "json", false, "Output restore results in JSON format")
+	restoreCmd.Flags().BoolVar(&restoreApply, "apply", false, "Write the restored content back into the issue (default: display only)")
 	rootCmd.AddCommand(restoreCmd)
 }
 
-// getCurrentGitHead returns the current HEAD reference (branch or commit)
-func getCurrentGitHead() (string, error) {
-	// Try to get symbolic ref (branch name) first
-	cmd := exec.Command("git", "symbolic-ref", "--short", "HEAD")
-	if output, err := cmd.Output(); err == nil {
-		return strings.TrimSpace(string(output)), nil
-	}
-
-	// If not on a branch, get commit hash
-	cmd = exec.Command("git", "rev-parse", "HEAD")
-	output, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("failed to get HEAD: %w", err)
-	}
-	return strings.TrimSpace(string(output)), nil
-}
-
-// gitHasUncommittedChanges checks for any uncommitted changes
-func gitHasUncommittedChanges() (bool, error) {
-	cmd := exec.Command("git", "status", "--porcelain")
-	output, err := cmd.Output()
-	if err != nil {
-		return false, fmt.Errorf("git status failed: %w", err)
-	}
-	return len(strings.TrimSpace(string(output))) > 0, nil
-}
-
-// gitCheckout checks out a specific commit or branch
-func gitCheckout(ref string) error {
-	cmd := exec.Command("git", "checkout", ref)
-	output, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("git checkout failed: %w\n%s", err, output)
-	}
-	return nil
-}
-
-// readIssueFromJSONL reads a specific issue from JSONL file
-func readIssueFromJSONL(jsonlPath, issueID string) (*types.Issue, error) {
-	// #nosec G304 - controlled path from config
-	file, err := os.Open(jsonlPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open JSONL: %w", err)
-	}
-	defer func() { _ = file.Close() }()
-
-	scanner := bufio.NewScanner(file)
-	// Increase buffer size for large issues
-	buf := make([]byte, 0, 64*1024)
-	scanner.Buffer(buf, 10*1024*1024) // 10MB max
-
-	for scanner.Scan() {
-		var issue types.Issue
-		if err := json.Unmarshal(scanner.Bytes(), &issue); err != nil {
-			continue // Skip malformed lines
-		}
-		if issue.ID == issueID {
-			return &issue, nil
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("error reading JSONL: %w", err)
-	}
-
-	return nil, nil // Not found
-}
-
-// displayRestoredIssue displays the restored issue in a readable format
-func displayRestoredIssue(issue *types.Issue, commitHash string) {
-	fmt.Printf("\n%s %s (restored from git commit %s)\n", ui.RenderAccent("📜"), ui.RenderBold(issue.ID), ui.RenderWarn(commitHash[:8]))
+// displayRestoredIssue displays the restored issue in a readable format.
+// provenance describes where the content came from (e.g. "archived snapshot"
+// or "Dolt commit abc12345").
+func displayRestoredIssue(issue *types.Issue, provenance string) {
+	fmt.Printf("\n%s %s (restored from %s)\n", ui.RenderAccent("📜"), ui.RenderBold(issue.ID), ui.RenderWarn(provenance))
 	fmt.Printf("%s\n\n", ui.RenderBold(issue.Title))
 
 	if issue.Description != "" {

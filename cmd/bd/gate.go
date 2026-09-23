@@ -3,7 +3,6 @@ package main
 import (
 	"bytes"
 	"context"
-	"database/sql"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -11,13 +10,9 @@ import (
 	"strings"
 	"time"
 
-	_ "github.com/ncruces/go-sqlite3/driver"
-	_ "github.com/ncruces/go-sqlite3/embed"
 	"github.com/spf13/cobra"
-	"github.com/steveyegge/beads/internal/beads"
-	"github.com/steveyegge/beads/internal/configfile"
-	"github.com/steveyegge/beads/internal/routing"
-	"github.com/steveyegge/beads/internal/rpc"
+	"github.com/steveyegge/beads/internal/metrics"
+	"github.com/steveyegge/beads/internal/storage"
 	"github.com/steveyegge/beads/internal/types"
 	"github.com/steveyegge/beads/internal/ui"
 )
@@ -37,9 +32,11 @@ Gate types:
   timer   - Expires after timeout (Phase 2)
   gh:run  - Waits for GitHub workflow (Phase 3)
   gh:pr   - Waits for PR merge (Phase 3)
-  bead    - Waits for cross-rig bead to close (Phase 4)
+  bead    - Waits for another bead to close (Phase 4)
 
-For bead gates, await_id format is <rig>:<bead-id> (e.g., "gastown:gt-abc123").
+For bead gates, await_id may be a bead ID in this rig's database (e.g.,
+"bd-abc123") or the historical cross-rig form <rig>:<bead-id>. Cross-rig
+targets resolve through the bead ID's prefix route in routes.jsonl.
 
 Examples:
   bd gate list           # Show all open gates
@@ -51,74 +48,99 @@ Examples:
 
 // gateListCmd lists gate issues
 var gateListCmd = &cobra.Command{
-	Use:   "list",
+	Use:   "list [issue-id]",
 	Short: "List gate issues",
-	Long: `List all gate issues in the current beads database.
+	Long: `List gate issues.
+
+With no argument, lists all gate issues in the current beads database.
+With an [issue-id] argument, lists ONLY the gates that block that issue
+(its own dependency gates) — not every gate in the database.
 
 By default, shows only open gates. Use --all to include closed gates.`,
-	Run: func(cmd *cobra.Command, args []string) {
+	Args:          cobra.MaximumNArgs(1),
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		evt := metrics.NewCommandEvent("gate-list")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
+
+		if usesProxiedServer() {
+			return runGateListProxiedServer(cmd, rootCtx, args)
+		}
+
 		allFlag, _ := cmd.Flags().GetBool("all")
 		limit, _ := cmd.Flags().GetInt("limit")
 
-		// Build filter for gate type issues
-		gateType := types.TypeGate
+		ctx := rootCtx
+
+		// Bead-scoped: list only the gates that block this specific issue
+		// (its dependency gates), never the whole database. Without this an
+		// issue-id argument was silently ignored and the DB-wide list was
+		// returned, which could lead a caller to act on unrelated gates.
+		if len(args) == 1 {
+			target, err := store.GetIssue(ctx, args[0])
+			if err != nil {
+				return HandleErrorRespectJSON("issue not found: %s", args[0])
+			}
+			deps, err := store.GetDependencies(ctx, target.ID)
+			if err != nil {
+				return HandleErrorRespectJSON("%v", err)
+			}
+			gates := filterIssueGates(deps, allFlag, limit)
+			if jsonOutput {
+				return outputJSON(gates)
+			}
+			displayGates(gates, allFlag)
+			return nil
+		}
+
+		gateType := types.IssueType("gate")
 		filter := types.IssueFilter{
 			IssueType: &gateType,
 			Limit:     limit,
 		}
 
-		// By default, exclude closed gates
 		if !allFlag {
 			filter.ExcludeStatus = []types.Status{types.StatusClosed}
 		}
 
-		ctx := rootCtx
-
-		// If daemon is running, use RPC
-		if daemonClient != nil {
-			listArgs := &rpc.ListArgs{
-				IssueType: "gate",
-				Limit:     limit,
-			}
-			if !allFlag {
-				listArgs.ExcludeStatus = []string{"closed"}
-			}
-
-			resp, err := daemonClient.List(listArgs)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
-
-			var issues []*types.Issue
-			if err := json.Unmarshal(resp.Data, &issues); err != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing response: %v\n", err)
-				os.Exit(1)
-			}
-
-			if jsonOutput {
-				outputJSON(issues)
-				return
-			}
-
-			displayGates(issues, allFlag)
-			return
-		}
-
-		// Direct mode
 		issues, err := store.SearchIssues(ctx, "", filter)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
+			return HandleErrorRespectJSON("%v", err)
 		}
 
 		if jsonOutput {
-			outputJSON(issues)
-			return
+			return outputJSON(issues)
 		}
 
 		displayGates(issues, allFlag)
+		return nil
 	},
+}
+
+// filterIssueGates selects the gate-type issues from an issue's dependency set,
+// honoring the same open/closed and limit semantics as the DB-wide list path.
+// Pulled out as a pure helper so the bead-scoping logic is unit-testable without
+// a live store.
+func filterIssueGates(deps []*types.Issue, all bool, limit int) []*types.Issue {
+	var gates []*types.Issue
+	for _, d := range deps {
+		if d == nil || d.IssueType != types.IssueType("gate") {
+			continue
+		}
+		if !all && d.Status == types.StatusClosed {
+			continue
+		}
+		gates = append(gates, d)
+		if limit > 0 && len(gates) >= limit {
+			break
+		}
+	}
+	return gates
 }
 
 // displayGates formats and displays gate issues, separating open and closed gates
@@ -203,90 +225,230 @@ var gateAddWaiterCmd = &cobra.Command{
 	Short: "Add a waiter to a gate",
 	Long: `Register an agent as a waiter on a gate bead.
 
-When the gate closes, the waiter will receive a wake notification via 'gt gate wake'.
-The waiter is typically the polecat's address (e.g., "gastown/polecats/Toast").
+When the gate closes, the waiter will receive a wake notification via 'bd gate wake'.
+The waiter is typically the worker's address (e.g., "my-project/workers/agent-1").
 
-This is used by 'gt done --phase-complete' to register for gate wake notifications.`,
-	Args: cobra.ExactArgs(2),
-	Run: func(cmd *cobra.Command, args []string) {
+This is used by 'bd done --phase-complete' to register for gate wake notifications.`,
+	Args:          cobra.ExactArgs(2),
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if usesProxiedServer() {
+			return runGateAddWaiterProxiedServer(cmd, rootCtx, args)
+		}
 		CheckReadonly("gate add-waiter")
+
+		evt := metrics.NewCommandEvent("gate-add-waiter")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
 
 		gateID := args[0]
 		waiter := args[1]
 		ctx := rootCtx
 
-		// Get the gate issue
 		var issue *types.Issue
 		var err error
 
-		if daemonClient != nil {
-			resp, rerr := daemonClient.Show(&rpc.ShowArgs{ID: gateID})
-			if rerr != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", rerr)
-				os.Exit(1)
-			}
-			if !resp.Success {
-				fmt.Fprintf(os.Stderr, "Error: %s\n", resp.Error)
-				os.Exit(1)
-			}
-			var details types.IssueDetails
-			if uerr := json.Unmarshal(resp.Data, &details); uerr != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing response: %v\n", uerr)
-				os.Exit(1)
-			}
-			issue = &details.Issue
-		} else {
-			issue, err = store.GetIssue(ctx, gateID)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: gate not found: %s\n", gateID)
-				os.Exit(1)
-			}
+		issue, err = store.GetIssue(ctx, gateID)
+		if err != nil {
+			return HandleError("gate not found: %s", gateID)
 		}
 
-		if issue.IssueType != types.TypeGate {
-			fmt.Fprintf(os.Stderr, "Error: %s is not a gate issue (type=%s)\n", gateID, issue.IssueType)
-			os.Exit(1)
+		if issue.IssueType != "gate" {
+			return HandleError("%s is not a gate issue (type=%s)", gateID, issue.IssueType)
 		}
 
-		// Check if waiter is already registered
 		for _, w := range issue.Waiters {
 			if w == waiter {
-				fmt.Printf("Waiter already registered on gate %s\n", gateID)
-				return
+				renderGateWaiterAlready(gateID)
+				return nil
 			}
 		}
 
-		// Add waiter to the waiters list
 		newWaiters := append(issue.Waiters, waiter)
 
-		// Update the gate
-		if daemonClient != nil {
-			updateArgs := &rpc.UpdateArgs{
-				ID:      gateID,
-				Waiters: newWaiters,
-			}
-			resp, uerr := daemonClient.Update(updateArgs)
-			if uerr != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", uerr)
-				os.Exit(1)
-			}
-			if !resp.Success {
-				fmt.Fprintf(os.Stderr, "Error: %s\n", resp.Error)
-				os.Exit(1)
-			}
-		} else {
-			updates := map[string]interface{}{
-				"waiters": newWaiters,
-			}
-			if err := store.UpdateIssue(ctx, gateID, updates, actor); err != nil {
-				fmt.Fprintf(os.Stderr, "Error updating gate: %v\n", err)
-				os.Exit(1)
-			}
-			markDirtyAndScheduleFlush()
+		updates := map[string]interface{}{
+			"waiters": newWaiters,
+		}
+		if err := store.UpdateIssue(ctx, gateID, updates, actor); err != nil {
+			return HandleError("updating gate: %v", err)
 		}
 
-		fmt.Printf("%s Added waiter to gate %s: %s\n", ui.RenderPass("✓"), gateID, waiter)
+		commandDidWrite.Store(true)
+
+		renderGateWaiterAdded(gateID, waiter)
+		return nil
 	},
+}
+
+// renderGateWaiterAlready and renderGateWaiterAdded are shared by the direct
+// and proxied-server routes so `bd gate add-waiter` prints identically on both.
+func renderGateWaiterAlready(gateID string) {
+	fmt.Printf("Waiter already registered on gate %s\n", gateID)
+}
+
+func renderGateWaiterAdded(gateID, waiter string) {
+	fmt.Printf("%s Added waiter to gate %s: %s\n", ui.RenderPass("✓"), gateID, waiter)
+}
+
+// gateCreateCmd creates an ad-hoc gate issue that blocks another issue
+var gateCreateCmd = &cobra.Command{
+	Use:   "create",
+	Short: "Create a gate that blocks an issue",
+	Long: `Create an ad-hoc gate issue that blocks another issue until resolved.
+
+The blocked issue will not appear in 'bd ready' until the gate is resolved
+via 'bd gate resolve'.
+
+Gate types:
+  human   - Requires manual 'bd gate resolve' (default)
+  timer   - Auto-resolves after --timeout duration
+  gh:run  - Waits for GitHub Actions workflow
+  gh:pr   - Waits for PR merge
+
+Examples:
+  bd gate create --blocks bd-abc
+  bd gate create --type=human --blocks bd-abc --reason="Need design review"
+  bd gate create --type=timer --blocks bd-abc --timeout=2h
+  bd gate create --type=gh:pr --blocks bd-abc --await-id=42
+  bd gate create --blocks bd-abc --title="Gate: awaiting owner sign-off"`,
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if usesProxiedServer() {
+			return runGateCreateProxiedServer(cmd, rootCtx)
+		}
+		CheckReadonly("gate create")
+
+		evt := metrics.NewCommandEvent("gate-create")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
+
+		in, err := gatherGateCreateInput(cmd)
+		if err != nil {
+			return HandleErrorRespectJSON("%v", err)
+		}
+
+		ctx := rootCtx
+
+		targetIssue, err := store.GetIssue(ctx, in.blocksID)
+		if err != nil {
+			return HandleErrorRespectJSON("issue not found: %s", in.blocksID)
+		}
+
+		gate := buildGateIssue(in, targetIssue.ID)
+		metadata, metaErr := repoMetadataForGate(in.gateType, targetIssue)
+		if metaErr != nil {
+			return HandleErrorRespectJSON("invalid GitHub repository metadata on %s: %v", targetIssue.ID, metaErr)
+		}
+		gate.Metadata = metadata
+
+		if err := store.CreateIssue(ctx, gate, actor); err != nil {
+			return HandleErrorRespectJSON("creating gate: %v", err)
+		}
+
+		dep := &types.Dependency{
+			IssueID:     targetIssue.ID,
+			DependsOnID: gate.ID,
+			Type:        types.DepBlocks,
+		}
+		if err := store.AddDependency(ctx, dep, actor); err != nil {
+			return HandleErrorRespectJSON("adding blocking dependency: %v", err)
+		}
+
+		commitMsg := fmt.Sprintf("bd: create gate %s blocking %s", gate.ID, targetIssue.ID)
+		if err := store.Commit(ctx, commitMsg); err != nil && !isDoltNothingToCommit(err) {
+			return HandleErrorRespectJSON("failed to commit: %v", err)
+		}
+
+		if jsonOutput {
+			return outputJSON(gate)
+		}
+
+		renderGateCreated(gate, targetIssue, in)
+		return nil
+	},
+}
+
+// gateCreateInput carries `bd gate create`'s parsed flags. Both routes gather
+// it through gatherGateCreateInput so they cannot drift on flag semantics.
+type gateCreateInput struct {
+	blocksID  string
+	gateType  string
+	reason    string
+	awaitID   string
+	titleFlag string
+	timeout   time.Duration
+}
+
+func gatherGateCreateInput(cmd *cobra.Command) (gateCreateInput, error) {
+	in := gateCreateInput{}
+	in.blocksID, _ = cmd.Flags().GetString("blocks")
+	in.gateType, _ = cmd.Flags().GetString("type")
+	in.reason, _ = cmd.Flags().GetString("reason")
+	in.awaitID, _ = cmd.Flags().GetString("await-id")
+	in.titleFlag, _ = cmd.Flags().GetString("title")
+	timeoutStr, _ := cmd.Flags().GetString("timeout")
+	if timeoutStr != "" {
+		parsed, err := time.ParseDuration(timeoutStr)
+		if err != nil {
+			return in, fmt.Errorf("invalid timeout: %v", err)
+		}
+		in.timeout = parsed
+	}
+	return in, nil
+}
+
+// buildGateIssue constructs the ad-hoc gate issue exactly the way the direct
+// route always has; the proxied route reuses it for the same reason the
+// renderers are shared.
+func buildGateIssue(in gateCreateInput, targetID string) *types.Issue {
+	title := fmt.Sprintf("Gate: %s", in.gateType)
+	if in.awaitID != "" {
+		title = fmt.Sprintf("Gate: %s %s", in.gateType, in.awaitID)
+	}
+	if in.titleFlag != "" {
+		title = in.titleFlag
+	}
+
+	desc := fmt.Sprintf("Ad-hoc gate blocking %s", targetID)
+	if in.reason != "" {
+		desc = fmt.Sprintf("%s\n\nReason: %s", desc, in.reason)
+	}
+
+	return &types.Issue{
+		Title:       title,
+		Description: desc,
+		Status:      types.StatusOpen,
+		Priority:    2,
+		IssueType:   types.IssueType("gate"),
+		AwaitType:   in.gateType,
+		AwaitID:     in.awaitID,
+		Timeout:     in.timeout,
+		CreatedBy:   getActorWithGit(),
+		Owner:       getOwner(),
+	}
+}
+
+// renderGateCreated is shared by the direct and proxied-server routes; the
+// first line's "Created gate <id>" is parsed by downstream scripts, so both
+// routes must print it identically.
+func renderGateCreated(gate, targetIssue *types.Issue, in gateCreateInput) {
+	fmt.Printf("%s Created gate %s (type: %s)\n", ui.RenderPass("✓"), ui.RenderID(gate.ID), in.gateType)
+	fmt.Printf("  Blocks: %s (%s)\n", targetIssue.ID, targetIssue.Title)
+	if in.reason != "" {
+		fmt.Printf("  Reason: %s\n", in.reason)
+	}
+	if in.timeout > 0 {
+		fmt.Printf("  Timeout: %s\n", in.timeout)
+	}
+	fmt.Printf("\nResolve with: bd gate resolve %s\n", gate.ID)
 }
 
 // gateShowCmd shows a gate issue
@@ -296,74 +458,71 @@ var gateShowCmd = &cobra.Command{
 	Long: `Display details of a gate issue including its waiters.
 
 This is similar to 'bd show' but validates that the issue is a gate.`,
-	Args: cobra.ExactArgs(1),
-	Run: func(cmd *cobra.Command, args []string) {
+	Args:          cobra.ExactArgs(1),
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if usesProxiedServer() {
+			return runGateShowProxiedServer(cmd, rootCtx, args)
+		}
+		evt := metrics.NewCommandEvent("gate-show")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
+
 		gateID := args[0]
 		ctx := rootCtx
 
-		// Get the gate issue
 		var issue *types.Issue
 		var err error
 
-		if daemonClient != nil {
-			resp, rerr := daemonClient.Show(&rpc.ShowArgs{ID: gateID})
-			if rerr != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", rerr)
-				os.Exit(1)
-			}
-			if !resp.Success {
-				fmt.Fprintf(os.Stderr, "Error: %s\n", resp.Error)
-				os.Exit(1)
-			}
-			var details types.IssueDetails
-			if uerr := json.Unmarshal(resp.Data, &details); uerr != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing response: %v\n", uerr)
-				os.Exit(1)
-			}
-			issue = &details.Issue
-		} else {
-			issue, err = store.GetIssue(ctx, gateID)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: gate not found: %s\n", gateID)
-				os.Exit(1)
-			}
+		issue, err = store.GetIssue(ctx, gateID)
+		if err != nil {
+			return HandleErrorRespectJSON("gate not found: %s", gateID)
 		}
 
-		if issue.IssueType != types.TypeGate {
-			fmt.Fprintf(os.Stderr, "Error: %s is not a gate issue (type=%s)\n", gateID, issue.IssueType)
-			os.Exit(1)
+		if issue.IssueType != "gate" {
+			return HandleErrorRespectJSON("%s is not a gate issue (type=%s)", gateID, issue.IssueType)
 		}
 
 		if jsonOutput {
-			outputJSON(issue)
-			return
+			return outputJSON(issue)
 		}
 
-		// Display gate details
-		statusSym := "○"
-		if issue.Status == types.StatusClosed {
-			statusSym = "●"
-		}
-
-		fmt.Printf("%s %s - %s\n", statusSym, ui.RenderID(issue.ID), issue.Title)
-		fmt.Printf("  Status: %s\n", issue.Status)
-		fmt.Printf("  Await Type: %s\n", issue.AwaitType)
-		if issue.AwaitID != "" {
-			fmt.Printf("  Await ID: %s\n", issue.AwaitID)
-		}
-		if issue.Timeout > 0 {
-			fmt.Printf("  Timeout: %s\n", issue.Timeout)
-		}
-		if len(issue.Waiters) > 0 {
-			fmt.Printf("  Waiters:\n")
-			for _, w := range issue.Waiters {
-				fmt.Printf("    - %s\n", w)
-			}
-		}
-		if issue.Description != "" {
-			fmt.Printf("  Description: %s\n", issue.Description)
-		}
+		renderGateShow(issue)
+		return nil
 	},
+}
+
+// renderGateShow is shared by the direct and proxied-server routes; downstream
+// scripts grep this plain-text output for markers, so both routes must print
+// it identically.
+func renderGateShow(issue *types.Issue) {
+	statusSym := "○"
+	if issue.Status == types.StatusClosed {
+		statusSym = "●"
+	}
+
+	fmt.Printf("%s %s - %s\n", statusSym, ui.RenderID(issue.ID), issue.Title)
+	fmt.Printf("  Status: %s\n", issue.Status)
+	fmt.Printf("  Await Type: %s\n", issue.AwaitType)
+	if issue.AwaitID != "" {
+		fmt.Printf("  Await ID: %s\n", issue.AwaitID)
+	}
+	if issue.Timeout > 0 {
+		fmt.Printf("  Timeout: %s\n", issue.Timeout)
+	}
+	if len(issue.Waiters) > 0 {
+		fmt.Printf("  Waiters:\n")
+		for _, w := range issue.Waiters {
+			fmt.Printf("    - %s\n", w)
+		}
+	}
+	if issue.Description != "" {
+		fmt.Printf("  Description: %s\n", issue.Description)
+	}
 }
 
 // gateResolveCmd manually closes a gate
@@ -374,75 +533,56 @@ var gateResolveCmd = &cobra.Command{
 
 This is equivalent to 'bd close <gate-id>' but with a more explicit name.
 Use --reason to provide context for why the gate was resolved.`,
-	Args: cobra.ExactArgs(1),
-	Run: func(cmd *cobra.Command, args []string) {
+	Args:          cobra.ExactArgs(1),
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if usesProxiedServer() {
+			return runGateResolveProxiedServer(cmd, rootCtx, args)
+		}
 		CheckReadonly("gate resolve")
+
+		evt := metrics.NewCommandEvent("gate-resolve")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
 
 		gateID := args[0]
 		reason, _ := cmd.Flags().GetString("reason")
 
-		// Verify it's a gate issue
 		ctx := rootCtx
 		var issue *types.Issue
 		var err error
 
-		if daemonClient != nil {
-			resp, rerr := daemonClient.Show(&rpc.ShowArgs{ID: gateID})
-			if rerr != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", rerr)
-				os.Exit(1)
-			}
-			if !resp.Success {
-				fmt.Fprintf(os.Stderr, "Error: %s\n", resp.Error)
-				os.Exit(1)
-			}
-			var details types.IssueDetails
-			if uerr := json.Unmarshal(resp.Data, &details); uerr != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing response: %v\n", uerr)
-				os.Exit(1)
-			}
-			issue = &details.Issue
-		} else {
-			issue, err = store.GetIssue(ctx, gateID)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: gate not found: %s\n", gateID)
-				os.Exit(1)
-			}
+		issue, err = store.GetIssue(ctx, gateID)
+		if err != nil {
+			return HandleError("gate not found: %s", gateID)
 		}
 
-		if issue.IssueType != types.TypeGate {
-			fmt.Fprintf(os.Stderr, "Error: %s is not a gate issue (type=%s)\n", gateID, issue.IssueType)
-			os.Exit(1)
+		if issue.IssueType != "gate" {
+			return HandleError("%s is not a gate issue (type=%s)", gateID, issue.IssueType)
 		}
 
-		// Close the gate
-		if daemonClient != nil {
-			closeArgs := &rpc.CloseArgs{
-				ID:     gateID,
-				Reason: reason,
-			}
-			resp, cerr := daemonClient.CloseIssue(closeArgs)
-			if cerr != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", cerr)
-				os.Exit(1)
-			}
-			if !resp.Success {
-				fmt.Fprintf(os.Stderr, "Error: %s\n", resp.Error)
-				os.Exit(1)
-			}
-		} else {
-			if err := store.CloseIssue(ctx, gateID, reason, actor, ""); err != nil {
-				fmt.Fprintf(os.Stderr, "Error closing gate: %v\n", err)
-				os.Exit(1)
-			}
-			markDirtyAndScheduleFlush()
+		if err := store.CloseIssue(ctx, gateID, reason, actor, ""); err != nil {
+			return HandleError("closing gate: %v", err)
 		}
 
-		fmt.Printf("%s Gate resolved: %s\n", ui.RenderPass("✓"), gateID)
-		if reason != "" {
-			fmt.Printf("  Reason: %s\n", reason)
-		}
+		commandDidWrite.Store(true)
+
+		renderGateResolved(gateID, reason)
+		return nil
 	},
+}
+
+// renderGateResolved is shared by the direct and proxied-server routes so
+// `bd gate resolve` prints identically on both.
+func renderGateResolved(gateID, reason string) {
+	fmt.Printf("%s Gate resolved: %s\n", ui.RenderPass("✓"), gateID)
+	if reason != "" {
+		fmt.Printf("  Reason: %s\n", reason)
+	}
 }
 
 // gateCheckCmd evaluates gates and closes those that are resolved
@@ -463,7 +603,7 @@ Gate types:
 
 GitHub gates use the 'gh' CLI to query status:
   - gh:run checks 'gh run view <id> --json status,conclusion'
-  - gh:pr checks 'gh pr view <id> --json state,merged'
+  - gh:pr checks 'gh pr view <id> --json state,title'
 
 A gate is resolved when:
   - gh:run: status=completed AND conclusion=success
@@ -473,7 +613,7 @@ A gate is resolved when:
 
 A gate is escalated when:
   - gh:run: status=completed AND conclusion in (failure, canceled)
-  - gh:pr: state=CLOSED AND merged=false
+  - gh:pr: state=CLOSED
 
 Examples:
   bd gate check              # Check all gates
@@ -483,16 +623,27 @@ Examples:
   bd gate check --type=bead  # Check only cross-rig bead gates
   bd gate check --dry-run    # Show what would happen without changes
   bd gate check --escalate   # Escalate expired/failed gates`,
-	Run: func(cmd *cobra.Command, args []string) {
+	SilenceUsage:  true,
+	SilenceErrors: true,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		if usesProxiedServer() {
+			return runGateCheckProxiedServer(cmd, rootCtx)
+		}
 		CheckReadonly("gate check")
+
+		evt := metrics.NewCommandEvent("gate-check")
+		defer func() {
+			if c := metrics.Global(); c != nil {
+				c.CloseEventAndAdd(evt)
+			}
+		}()
 
 		gateTypeFilter, _ := cmd.Flags().GetString("type")
 		dryRun, _ := cmd.Flags().GetBool("dry-run")
 		escalateFlag, _ := cmd.Flags().GetBool("escalate")
 		limit, _ := cmd.Flags().GetInt("limit")
 
-		// Get open gates
-		gateType := types.TypeGate
+		gateType := types.IssueType("gate")
 		filter := types.IssueFilter{
 			IssueType:     &gateType,
 			ExcludeStatus: []types.Status{types.StatusClosed},
@@ -500,147 +651,145 @@ Examples:
 		}
 
 		ctx := rootCtx
-		var gates []*types.Issue
-		var err error
 
-		if daemonClient != nil {
-			listArgs := &rpc.ListArgs{
-				IssueType:     "gate",
-				ExcludeStatus: []string{"closed"},
-				Limit:         limit,
-			}
-			resp, rerr := daemonClient.List(listArgs)
-			if rerr != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", rerr)
-				os.Exit(1)
-			}
-			if uerr := json.Unmarshal(resp.Data, &gates); uerr != nil {
-				fmt.Fprintf(os.Stderr, "Error parsing response: %v\n", uerr)
-				os.Exit(1)
-			}
-		} else {
-			gates, err = store.SearchIssues(ctx, "", filter)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
-			}
+		gates, err := store.SearchIssues(ctx, "", filter)
+		if err != nil {
+			return HandleErrorRespectJSON("%v", err)
 		}
 
-		// Filter by type if specified
-		var filteredGates []*types.Issue
-		for _, gate := range gates {
-			if shouldCheckGate(gate, gateTypeFilter) {
-				filteredGates = append(filteredGates, gate)
-			}
-		}
-
+		filteredGates := filterCheckableGates(gates, gateTypeFilter)
 		if len(filteredGates) == 0 {
-			if gateTypeFilter != "" {
-				fmt.Printf("No open gates of type '%s' found.\n", gateTypeFilter)
-			} else {
-				fmt.Println("No open gates found.")
-			}
-			return
+			printNoOpenGates(gateTypeFilter)
+			return nil
 		}
 
-		// Results tracking
-		type checkResult struct {
-			gate      *types.Issue
-			resolved  bool
-			escalated bool
-			reason    string
-			err       error
-		}
-		results := make([]checkResult, 0, len(filteredGates))
-
-		// Check each gate
-		now := time.Now()
-		for _, gate := range filteredGates {
-			result := checkResult{gate: gate}
-
-			switch {
-			case strings.HasPrefix(gate.AwaitType, "gh:run"):
-				result.resolved, result.escalated, result.reason, result.err = checkGHRun(gate)
-			case strings.HasPrefix(gate.AwaitType, "gh:pr"):
-				result.resolved, result.escalated, result.reason, result.err = checkGHPR(gate)
-			case gate.AwaitType == "timer":
-				result.resolved, result.escalated, result.reason, result.err = checkTimer(gate, now)
-			case gate.AwaitType == "bead":
-				result.resolved, result.reason = checkBeadGate(ctx, gate.AwaitID)
-			default:
-				// Skip unsupported gate types (human gates need manual resolution)
-				continue
-			}
-
-			results = append(results, result)
-		}
-
-		// Process results
-		resolvedCount := 0
-		escalatedCount := 0
-		errorCount := 0
-
-		for _, r := range results {
-			if r.err != nil {
-				errorCount++
-				fmt.Fprintf(os.Stderr, "%s %s: error checking - %v\n",
-					ui.RenderFail("✗"), r.gate.ID, r.err)
-				continue
-			}
-
-			if r.resolved {
-				resolvedCount++
-				if dryRun {
-					fmt.Printf("%s %s: would resolve - %s\n",
-						ui.RenderPass("✓"), r.gate.ID, r.reason)
-				} else {
-					// Close the gate
-					closeErr := closeGate(ctx, r.gate.ID, r.reason)
-					if closeErr != nil {
-						fmt.Fprintf(os.Stderr, "%s %s: error closing - %v\n",
-							ui.RenderFail("✗"), r.gate.ID, closeErr)
-						errorCount++
-					} else {
-						fmt.Printf("%s %s: resolved - %s\n",
-							ui.RenderPass("✓"), r.gate.ID, r.reason)
-					}
-				}
-			} else if r.escalated {
-				escalatedCount++
-				if dryRun {
-					fmt.Printf("%s %s: would escalate - %s\n",
-						ui.RenderWarn("⚠"), r.gate.ID, r.reason)
-				} else {
-					fmt.Printf("%s %s: ESCALATE - %s\n",
-						ui.RenderWarn("⚠"), r.gate.ID, r.reason)
-					// Actually escalate if flag is set
-					if escalateFlag {
-						escalateGate(r.gate, r.reason)
-					}
-				}
-			} else {
-				// Still pending
-				fmt.Printf("%s %s: pending - %s\n",
-					ui.RenderAccent("○"), r.gate.ID, r.reason)
+		var persistAwaitID func(gateID, runID string) error
+		if !dryRun {
+			persistAwaitID = func(gateID, runID string) error {
+				return updateGateAwaitIDFunc(nil, gateID, runID)
 			}
 		}
 
-		// Summary
-		fmt.Println()
-		fmt.Printf("Checked %d gates: %d resolved, %d escalated, %d errors\n",
-			len(results), resolvedCount, escalatedCount, errorCount)
+		results := evaluateGates(ctx, filteredGates, time.Now(), routedBeadGateGetter{localStore: store}, persistAwaitID)
 
-		if jsonOutput {
-			summary := map[string]interface{}{
-				"checked":   len(results),
-				"resolved":  resolvedCount,
-				"escalated": escalatedCount,
-				"errors":    errorCount,
-				"dry_run":   dryRun,
-			}
-			outputJSON(summary)
-		}
+		resolvedCount, escalatedCount, errorCount := applyGateCheckResults(
+			results, dryRun, escalateFlag,
+			func(gate *types.Issue, reason string) error {
+				return closeGate(ctx, gate.ID, reason)
+			},
+		)
+
+		return printGateCheckSummary(len(results), resolvedCount, escalatedCount, errorCount, dryRun)
 	},
+}
+
+type gateCheckResult struct {
+	gate      *types.Issue
+	resolved  bool
+	escalated bool
+	reason    string
+	err       error
+}
+
+func filterCheckableGates(gates []*types.Issue, typeFilter string) []*types.Issue {
+	var out []*types.Issue
+	for _, gate := range gates {
+		if shouldCheckGate(gate, typeFilter) {
+			out = append(out, gate)
+		}
+	}
+	return out
+}
+
+func printNoOpenGates(typeFilter string) {
+	if typeFilter != "" {
+		fmt.Printf("No open gates of type '%s' found.\n", typeFilter)
+	} else {
+		fmt.Println("No open gates found.")
+	}
+}
+
+func evaluateGates(ctx context.Context, gates []*types.Issue, now time.Time, getter issueGetter, persistAwaitID func(gateID, runID string) error) []gateCheckResult {
+	results := make([]gateCheckResult, 0, len(gates))
+	for _, gate := range gates {
+		r := gateCheckResult{gate: gate}
+		switch {
+		case strings.HasPrefix(gate.AwaitType, "gh:run"):
+			r.resolved, r.escalated, r.reason, r.err = checkGHRun(gate, persistAwaitID)
+		case strings.HasPrefix(gate.AwaitType, "gh:pr"):
+			r.resolved, r.escalated, r.reason, r.err = checkGHPR(gate)
+		case gate.AwaitType == "timer":
+			r.resolved, r.escalated, r.reason, r.err = checkTimer(gate, now)
+		case gate.AwaitType == "bead":
+			r.resolved, r.reason = checkBeadGate(ctx, getter, gate.AwaitID)
+		default:
+			continue
+		}
+		results = append(results, r)
+	}
+	return results
+}
+
+func applyGateCheckResults(results []gateCheckResult, dryRun, escalate bool, closeResolved func(gate *types.Issue, reason string) error) (resolvedCount, escalatedCount, errorCount int) {
+	for _, r := range results {
+		if r.err != nil {
+			errorCount++
+			fmt.Fprintf(os.Stderr, "%s %s: error checking - %v\n",
+				ui.RenderFail("✗"), r.gate.ID, r.err)
+			continue
+		}
+
+		switch {
+		case r.resolved:
+			resolvedCount++
+			if dryRun {
+				fmt.Printf("%s %s: would resolve - %s\n",
+					ui.RenderPass("✓"), r.gate.ID, r.reason)
+				continue
+			}
+			if closeErr := closeResolved(r.gate, r.reason); closeErr != nil {
+				fmt.Fprintf(os.Stderr, "%s %s: error closing - %v\n",
+					ui.RenderFail("✗"), r.gate.ID, closeErr)
+				errorCount++
+			} else {
+				fmt.Printf("%s %s: resolved - %s\n",
+					ui.RenderPass("✓"), r.gate.ID, r.reason)
+			}
+		case r.escalated:
+			escalatedCount++
+			if dryRun {
+				fmt.Printf("%s %s: would escalate - %s\n",
+					ui.RenderWarn("⚠"), r.gate.ID, r.reason)
+				continue
+			}
+			fmt.Printf("%s %s: ESCALATE - %s\n",
+				ui.RenderWarn("⚠"), r.gate.ID, r.reason)
+			if escalate {
+				escalateGate(r.gate, r.reason)
+			}
+		default:
+			fmt.Printf("%s %s: pending - %s\n",
+				ui.RenderAccent("○"), r.gate.ID, r.reason)
+		}
+	}
+	return resolvedCount, escalatedCount, errorCount
+}
+
+func printGateCheckSummary(checked, resolvedCount, escalatedCount, errorCount int, dryRun bool) error {
+	fmt.Println()
+	fmt.Printf("Checked %d gates: %d resolved, %d escalated, %d errors\n",
+		checked, resolvedCount, escalatedCount, errorCount)
+
+	if jsonOutput {
+		return outputJSON(map[string]interface{}{
+			"checked":   checked,
+			"resolved":  resolvedCount,
+			"escalated": escalatedCount,
+			"errors":    errorCount,
+			"dry_run":   dryRun,
+		})
+	}
+	return nil
 }
 
 // shouldCheckGate returns true if the gate matches the type filter
@@ -663,10 +812,26 @@ type ghRunStatus struct {
 
 // ghPRStatus holds the JSON response from 'gh pr view'
 type ghPRStatus struct {
-	State  string `json:"state"`
-	Merged bool   `json:"merged"`
-	Title  string `json:"title"`
+	State string `json:"state"`
+	Title string `json:"title"`
 }
+
+type ghCommandRunner func(args ...string) (stdout, stderr []byte, err error)
+
+func runGHCommand(args ...string) (stdout, stderr []byte, err error) {
+	cmd := exec.Command("gh", args...) // #nosec G204 -- callers pass validated values as an argument vector, without a shell
+	var stdoutBuffer, stderrBuffer bytes.Buffer
+	cmd.Stdout = &stdoutBuffer
+	cmd.Stderr = &stderrBuffer
+	err = cmd.Run()
+	return stdoutBuffer.Bytes(), stderrBuffer.Bytes(), err
+}
+
+var (
+	discoverRunIDByWorkflowNameFunc = discoverRunIDByWorkflowName
+	updateGateAwaitIDFunc           = updateGateAwaitID
+	checkGHRunStatusFunc            = checkGHRunStatus
+)
 
 // isNumericID returns true if the string contains only digits (a GitHub run ID)
 func isNumericID(s string) bool {
@@ -681,25 +846,123 @@ func isNumericID(s string) bool {
 	return true
 }
 
+// githubRepoFromIssue returns a validated [HOST/]OWNER/REPO value from metadata.repo.
+// A missing repo key, or metadata without a repo key at all, means the current
+// Git repository should be used. An explicit `"repo":null` or a non-string
+// repo value is rejected as malformed rather than silently falling back to
+// the current repository - the docs promise malformed values are rejected,
+// and a silent fallback here is the dangerous direction (it can point a
+// cross-repo check at the wrong repository instead of failing loudly).
+func githubRepoFromIssue(issue *types.Issue) (string, error) {
+	if issue == nil || len(issue.Metadata) == 0 || string(issue.Metadata) == "null" {
+		return "", nil
+	}
+
+	var raw map[string]json.RawMessage
+	if err := json.Unmarshal(issue.Metadata, &raw); err != nil {
+		return "", fmt.Errorf("metadata must be a JSON object: %w", err)
+	}
+	repoRaw, hasRepo := raw["repo"]
+	if !hasRepo {
+		return "", nil
+	}
+
+	var repoValue interface{}
+	if err := json.Unmarshal(repoRaw, &repoValue); err != nil {
+		return "", fmt.Errorf("metadata.repo: %w", err)
+	}
+	if repoValue == nil {
+		return "", fmt.Errorf("metadata.repo must not be null")
+	}
+	repo, ok := repoValue.(string)
+	if !ok {
+		return "", fmt.Errorf("metadata.repo must be a string, got %T", repoValue)
+	}
+	if repo == "" {
+		return "", nil
+	}
+
+	parts := strings.Split(repo, "/")
+	if len(parts) != 2 && len(parts) != 3 {
+		return "", fmt.Errorf("repo %q must use OWNER/REPO or HOST/OWNER/REPO", repo)
+	}
+	for _, part := range parts {
+		if part == "" {
+			return "", fmt.Errorf("repo %q contains an empty path component", repo)
+		}
+		for _, char := range part {
+			if (char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
+				(char >= '0' && char <= '9') || char == '-' || char == '_' || char == '.' {
+				continue
+			}
+			return "", fmt.Errorf("repo %q contains invalid character %q", repo, char)
+		}
+	}
+
+	return repo, nil
+}
+
+// isGitHubGateType returns true for gate types whose condition is checked
+// against a GitHub repository (gh:run, gh:pr, and any future gh:* type).
+func isGitHubGateType(gateType string) bool {
+	return strings.HasPrefix(gateType, "gh:")
+}
+
+// repoMetadataForGate computes the metadata to store on a new ad-hoc gate,
+// inheriting a validated GitHub repo selector from the blocked issue.
+//
+// This is restricted to gh:* gate types (SF4): "repo" is legal, unrelated
+// metadata on any issue (the metadata contract allows arbitrary JSON), so
+// running GitHub-repo validation for human/timer gates would fail ordinary
+// gate creation whenever the blocked issue happened to carry a non-GitHub-
+// shaped "repo" key. Only gh:run/gh:pr gates need the value at check time,
+// so only they inherit and validate it here.
+func repoMetadataForGate(gateType string, targetIssue *types.Issue) (json.RawMessage, error) {
+	if !isGitHubGateType(gateType) {
+		return nil, nil
+	}
+	repo, err := githubRepoFromIssue(targetIssue)
+	if err != nil {
+		return nil, err
+	}
+	if repo == "" {
+		return nil, nil
+	}
+	metadata, err := json.Marshal(map[string]string{"repo": repo})
+	if err != nil {
+		return nil, err
+	}
+	return metadata, nil
+}
+
 // queryGitHubRunsForWorkflow queries recent runs for a specific workflow using gh CLI.
 // Returns runs sorted newest-first (GitHub API default).
 func queryGitHubRunsForWorkflow(workflow string, limit int) ([]GHWorkflowRun, error) {
+	return queryGitHubRunsForWorkflowInRepo(workflow, limit, "")
+}
+
+func queryGitHubRunsForWorkflowInRepo(workflow string, limit int, repo string) ([]GHWorkflowRun, error) {
 	if _, err := exec.LookPath("gh"); err != nil {
 		return nil, fmt.Errorf("gh CLI not found: install from https://cli.github.com")
 	}
+	return queryGitHubRunsForWorkflowInRepoWithRunner(workflow, limit, repo, runGHCommand)
+}
 
+func queryGitHubRunsForWorkflowInRepoWithRunner(workflow string, limit int, repo string, runGH ghCommandRunner) ([]GHWorkflowRun, error) {
 	args := []string{
 		"run", "list",
 		"--workflow", workflow,
 		"--json", "databaseId,name,status,conclusion,createdAt,workflowName",
 		"--limit", fmt.Sprintf("%d", limit),
 	}
+	if repo != "" {
+		args = append(args, "--repo", repo)
+	}
 
-	cmd := exec.Command("gh", args...)
-	output, err := cmd.Output()
+	output, stderr, err := runGH(args...)
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			return nil, fmt.Errorf("gh run list --workflow=%s failed: %s", workflow, string(exitErr.Stderr))
+		if len(stderr) > 0 {
+			return nil, fmt.Errorf("gh run list --workflow=%s failed: %s", workflow, string(stderr))
 		}
 		return nil, fmt.Errorf("gh run list: %w", err)
 	}
@@ -715,8 +978,22 @@ func queryGitHubRunsForWorkflow(workflow string, limit int) ([]GHWorkflowRun, er
 // discoverRunIDByWorkflowName queries GitHub for the most recent run of a workflow.
 // Returns (runID, error). This is ZFC-compliant: "most recent run" is deterministic.
 func discoverRunIDByWorkflowName(workflowHint string) (string, error) {
+	return discoverRunIDByWorkflowNameInRepo(workflowHint, "")
+}
+
+func discoverRunIDByWorkflowNameInRepo(workflowHint, repo string) (string, error) {
+	return discoverRunIDByWorkflowNameInRepoWithRunner(workflowHint, repo, runGHCommand)
+}
+
+// discoverRunIDByWorkflowNameInRepoWithRunner is the runner-injectable form of
+// discoverRunIDByWorkflowNameInRepo. checkGHRunWithRunner's cross-repo branch
+// must call this (not discoverRunIDByWorkflowNameInRepo directly) so the same
+// injected ghCommandRunner seam used everywhere else in the gh:run/gh:pr
+// checks also covers cross-repo discovery, keeping that path unit-testable
+// without a live `gh` CLI (standards note on the SF1 review).
+func discoverRunIDByWorkflowNameInRepoWithRunner(workflowHint, repo string, runGH ghCommandRunner) (string, error) {
 	// Query GitHub directly for this workflow (efficient, avoids limit issues)
-	runs, err := queryGitHubRunsForWorkflow(workflowHint, 5)
+	runs, err := queryGitHubRunsForWorkflowInRepoWithRunner(workflowHint, 5, repo, runGH)
 	if err != nil {
 		return "", fmt.Errorf("failed to query workflow runs: %w", err)
 	}
@@ -730,50 +1007,82 @@ func discoverRunIDByWorkflowName(workflowHint string) (string, error) {
 	return fmt.Sprintf("%d", runs[0].DatabaseID), nil
 }
 
-// checkGHRun checks a GitHub Actions workflow run gate
-func checkGHRun(gate *types.Issue) (resolved, escalated bool, reason string, err error) {
+// checkGHRun checks a GitHub Actions workflow run gate.
+// When persistAwaitID is nil, workflow-name discovery stays in-memory only.
+func checkGHRun(gate *types.Issue, persistAwaitID func(gateID, runID string) error) (resolved, escalated bool, reason string, err error) {
+	return checkGHRunWithRunner(gate, persistAwaitID, runGHCommand)
+}
+
+func checkGHRunWithRunner(gate *types.Issue, persistAwaitID func(gateID, runID string) error, runGH ghCommandRunner) (resolved, escalated bool, reason string, err error) {
 	if gate.AwaitID == "" {
 		return false, false, "no run ID specified - set await_id or use workflow name hint", nil
 	}
 
 	runID := gate.AwaitID
+	repo, repoErr := githubRepoFromIssue(gate)
+	if repoErr != nil {
+		return false, false, "", repoErr
+	}
 
 	// If await_id is a workflow name hint (non-numeric), auto-discover the run ID
 	if !isNumericID(gate.AwaitID) {
-		discoveredID, discoverErr := discoverRunIDByWorkflowName(gate.AwaitID)
+		var discoveredID string
+		var discoverErr error
+		if repo == "" {
+			discoveredID, discoverErr = discoverRunIDByWorkflowNameFunc(gate.AwaitID)
+		} else {
+			discoveredID, discoverErr = discoverRunIDByWorkflowNameInRepoWithRunner(gate.AwaitID, repo, runGH)
+		}
 		if discoverErr != nil {
 			return false, false, fmt.Sprintf("workflow hint '%s': %v", gate.AwaitID, discoverErr), nil
 		}
 
-		// Update the gate with the discovered run ID
-		if updateErr := updateGateAwaitID(nil, gate.ID, discoveredID); updateErr != nil {
-			return false, false, "", fmt.Errorf("failed to update gate with discovered run ID: %w", updateErr)
+		if persistAwaitID != nil {
+			// Non-dry-run flows persist the numeric run ID for future checks.
+			if updateErr := persistAwaitID(gate.ID, discoveredID); updateErr != nil {
+				return false, false, "", fmt.Errorf("failed to update gate with discovered run ID: %w", updateErr)
+			}
 		}
 
 		runID = discoveredID
 	}
 
-	// Run: gh run view <id> --json status,conclusion,name
-	cmd := exec.Command("gh", "run", "view", runID, "--json", "status,conclusion,name") // #nosec G204 -- runID is a validated GitHub run ID
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	if repo == "" {
+		return checkGHRunStatusFunc(runID)
+	}
+	return checkGHRunStatusInRepoWithRunner(runID, repo, runGH)
+}
 
-	if runErr := cmd.Run(); runErr != nil {
+func checkGHRunStatus(runID string) (resolved, escalated bool, reason string, err error) {
+	return checkGHRunStatusInRepo(runID, "")
+}
+
+func checkGHRunStatusInRepo(runID, repo string) (resolved, escalated bool, reason string, err error) {
+	return checkGHRunStatusInRepoWithRunner(runID, repo, runGHCommand)
+}
+
+func checkGHRunStatusInRepoWithRunner(runID, repo string, runGH ghCommandRunner) (resolved, escalated bool, reason string, err error) {
+	// Run: gh run view <id> --json status,conclusion,name
+	args := []string{"run", "view", runID, "--json", "status,conclusion,name"}
+	if repo != "" {
+		args = append(args, "--repo", repo)
+	}
+	stdout, stderr, runErr := runGH(args...)
+	if runErr != nil {
 		// Check if gh CLI is not found
-		if strings.Contains(stderr.String(), "command not found") ||
+		if strings.Contains(string(stderr), "command not found") ||
 			strings.Contains(runErr.Error(), "executable file not found") {
 			return false, false, "", fmt.Errorf("gh CLI not installed")
 		}
 		// Check if run not found
-		if strings.Contains(stderr.String(), "not found") {
+		if strings.Contains(string(stderr), "not found") {
 			return false, true, "workflow run not found", nil
 		}
-		return false, false, "", fmt.Errorf("gh run view failed: %s", stderr.String())
+		return false, false, "", fmt.Errorf("gh run view failed: %s", string(stderr))
 	}
 
 	var status ghRunStatus
-	if parseErr := json.Unmarshal(stdout.Bytes(), &status); parseErr != nil {
+	if parseErr := json.Unmarshal(stdout, &status); parseErr != nil {
 		return false, false, "", fmt.Errorf("failed to parse gh output: %w", parseErr)
 	}
 
@@ -801,31 +1110,40 @@ func checkGHRun(gate *types.Issue) (resolved, escalated bool, reason string, err
 
 // checkGHPR checks a GitHub pull request gate
 func checkGHPR(gate *types.Issue) (resolved, escalated bool, reason string, err error) {
+	return checkGHPRWithRunner(gate, runGHCommand)
+}
+
+func checkGHPRWithRunner(gate *types.Issue, runGH ghCommandRunner) (resolved, escalated bool, reason string, err error) {
 	if gate.AwaitID == "" {
 		return false, false, "no PR number specified", nil
 	}
 
-	// Run: gh pr view <id> --json state,merged,title
-	cmd := exec.Command("gh", "pr", "view", gate.AwaitID, "--json", "state,merged,title") // #nosec G204 -- gate.AwaitID is a validated GitHub PR number
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	repo, repoErr := githubRepoFromIssue(gate)
+	if repoErr != nil {
+		return false, false, "", repoErr
+	}
 
-	if runErr := cmd.Run(); runErr != nil {
+	// Run: gh pr view <id> --json state,title [--repo <repo>]
+	args := []string{"pr", "view", gate.AwaitID, "--json", "state,title"}
+	if repo != "" {
+		args = append(args, "--repo", repo)
+	}
+	stdout, stderr, runErr := runGH(args...)
+	if runErr != nil {
 		// Check if gh CLI is not found
-		if strings.Contains(stderr.String(), "command not found") ||
+		if strings.Contains(string(stderr), "command not found") ||
 			strings.Contains(runErr.Error(), "executable file not found") {
 			return false, false, "", fmt.Errorf("gh CLI not installed")
 		}
 		// Check if PR not found
-		if strings.Contains(stderr.String(), "not found") || strings.Contains(stderr.String(), "Could not resolve") {
+		if strings.Contains(string(stderr), "not found") || strings.Contains(string(stderr), "Could not resolve") {
 			return false, true, "pull request not found", nil
 		}
-		return false, false, "", fmt.Errorf("gh pr view failed: %s", stderr.String())
+		return false, false, "", fmt.Errorf("gh pr view failed: %s", string(stderr))
 	}
 
 	var status ghPRStatus
-	if parseErr := json.Unmarshal(stdout.Bytes(), &status); parseErr != nil {
+	if parseErr := json.Unmarshal(stdout, &status); parseErr != nil {
 		return false, false, "", fmt.Errorf("failed to parse gh output: %w", parseErr)
 	}
 
@@ -834,9 +1152,6 @@ func checkGHPR(gate *types.Issue) (resolved, escalated bool, reason string, err 
 	case "MERGED":
 		return true, false, fmt.Sprintf("PR '%s' was merged", status.Title), nil
 	case "CLOSED":
-		if status.Merged {
-			return true, false, fmt.Sprintf("PR '%s' was merged", status.Title), nil
-		}
 		return false, true, fmt.Sprintf("PR '%s' was closed without merging", status.Title), nil
 	case "OPEN":
 		return false, false, fmt.Sprintf("PR '%s' is still open", status.Title), nil
@@ -862,89 +1177,72 @@ func checkTimer(gate *types.Issue, now time.Time) (resolved, escalated bool, rea
 	return false, false, fmt.Sprintf("expires in %s", remaining), nil
 }
 
-// checkBeadGate checks if a cross-rig bead gate is satisfied.
-// await_id format: <rig>:<bead-id> (e.g., "gastown:gt-abc123")
+// issueGetter is the one storage method checkBeadGate needs, split out so
+// tests can fake the lookup without standing up a Dolt store.
+type issueGetter interface {
+	GetIssue(ctx context.Context, id string) (*types.Issue, error)
+}
+
+// routedBeadGateGetter gives direct-mode gate checks the same local -> prefix
+// route -> contributor fallback used by other read commands. Routed stores are
+// opened read-only and closed before the result is returned.
+type routedBeadGateGetter struct {
+	localStore storage.DoltStorage
+}
+
+func (g routedBeadGateGetter) GetIssue(ctx context.Context, id string) (*types.Issue, error) {
+	if g.localStore == nil {
+		return nil, fmt.Errorf("no local store available")
+	}
+	result, err := getIssueWithRouting(ctx, g.localStore, id)
+	if err != nil {
+		return nil, err
+	}
+	defer result.Close()
+	return result.Issue, nil
+}
+
+// checkBeadGate checks if a bead gate is satisfied.
 // Returns (satisfied, reason).
-func checkBeadGate(ctx context.Context, awaitID string) (bool, string) {
-	// Parse await_id format: <rig>:<bead-id>
-	parts := strings.SplitN(awaitID, ":", 2)
-	if len(parts) != 2 {
-		return false, fmt.Sprintf("invalid await_id format: expected <rig>:<bead-id>, got %q", awaitID)
+//
+// A plain await_id names a bead in this rig. The historical
+// <rig>:<bead-id> form uses the bead ID as the routed lookup key; the rig
+// component is retained for compatibility while routes.jsonl remains keyed by
+// bead prefix. The supplied getter owns local-versus-routed lookup policy.
+func checkBeadGate(ctx context.Context, st issueGetter, awaitID string) (bool, string) {
+	if awaitID == "" {
+		return false, "bead gate has no await_id"
 	}
-
-	rigName := parts[0]
-	beadID := parts[1]
-
-	if rigName == "" || beadID == "" {
-		return false, "await_id missing rig name or bead ID"
-	}
-
-	// Resolve the target rig's beads directory
-	currentBeadsDir := beads.FindBeadsDir()
-	if currentBeadsDir == "" {
-		return false, "could not find current beads directory"
-	}
-	targetBeadsDir, _, err := routing.ResolveBeadsDirForRig(rigName, currentBeadsDir)
-	if err != nil {
-		return false, fmt.Sprintf("rig %q not found: %v", rigName, err)
-	}
-
-	// Load config to get database path
-	cfg, err := configfile.Load(targetBeadsDir)
-	if err != nil {
-		return false, fmt.Sprintf("failed to load config for rig %q: %v", rigName, err)
-	}
-
-	dbPath := cfg.DatabasePath(targetBeadsDir)
-
-	// Open the target database (read-only)
-	db, err := sql.Open("sqlite3", dbPath+"?mode=ro")
-	if err != nil {
-		return false, fmt.Sprintf("failed to open database for rig %q: %v", rigName, err)
-	}
-	defer func() { _ = db.Close() }()
-
-	// Check if the target bead exists and is closed
-	var status string
-	err = db.QueryRowContext(ctx, `
-		SELECT status FROM issues WHERE id = ?
-	`, beadID).Scan(&status)
-
-	if err != nil {
-		if err == sql.ErrNoRows {
-			return false, fmt.Sprintf("bead %s not found in rig %s", beadID, rigName)
+	targetID := awaitID
+	if strings.Contains(awaitID, ":") {
+		parts := strings.SplitN(awaitID, ":", 2)
+		if parts[0] == "" || parts[1] == "" {
+			return false, fmt.Sprintf("invalid cross-rig bead gate %q: expected <rig>:<bead-id>", awaitID)
 		}
-		return false, fmt.Sprintf("database query failed: %v", err)
+		targetID = parts[1]
 	}
-
-	if status == string(types.StatusClosed) {
-		return true, fmt.Sprintf("target bead %s is closed", beadID)
+	if st == nil {
+		return false, fmt.Sprintf("bead gate %q: no local store available", awaitID)
 	}
-
-	return false, fmt.Sprintf("target bead %s status is %q (waiting for closed)", beadID, status)
+	issue, err := st.GetIssue(ctx, targetID)
+	if err != nil {
+		return false, fmt.Sprintf("bead gate %q: %v", awaitID, err)
+	}
+	if issue == nil {
+		return false, fmt.Sprintf("bead gate %q: bead not found", awaitID)
+	}
+	if issue.Status == types.StatusClosed {
+		return true, fmt.Sprintf("bead %s closed", targetID)
+	}
+	return false, fmt.Sprintf("bead %s is %s", targetID, issue.Status)
 }
 
 // closeGate closes a gate issue with the given reason
 func closeGate(_ interface{}, gateID, reason string) error {
-	if daemonClient != nil {
-		closeArgs := &rpc.CloseArgs{
-			ID:     gateID,
-			Reason: reason,
-		}
-		resp, err := daemonClient.CloseIssue(closeArgs)
-		if err != nil {
-			return err
-		}
-		if !resp.Success {
-			return fmt.Errorf("%s", resp.Error)
-		}
-		return nil
-	}
-
 	if err := store.CloseIssue(rootCtx, gateID, reason, actor, ""); err != nil {
 		return err
 	}
-	markDirtyAndScheduleFlush()
+	commandDidWrite.Store(true)
 	return nil
 }
 
@@ -980,13 +1278,24 @@ func init() {
 	gateCheckCmd.Flags().BoolP("escalate", "e", false, "Escalate failed/expired gates")
 	gateCheckCmd.Flags().IntP("limit", "l", 100, "Limit results (default 100)")
 
+	// gate create flags
+	gateCreateCmd.Flags().String("blocks", "", "Issue ID to block (required)")
+	gateCreateCmd.Flags().StringP("type", "t", "human", "Gate type (human, timer, gh:run, gh:pr)")
+	gateCreateCmd.Flags().StringP("reason", "r", "", "Reason for the gate")
+	gateCreateCmd.Flags().String("await-id", "", "Condition identifier (run ID, PR number, etc.)")
+	gateCreateCmd.Flags().String("timeout", "", "Timeout duration (e.g., 2h, 30m)")
+	gateCreateCmd.Flags().String("title", "", "Custom gate title (default: \"Gate: <type>\")")
+	_ = gateCreateCmd.MarkFlagRequired("blocks")
+
 	// Issue ID completions
 	gateShowCmd.ValidArgsFunction = issueIDCompletion
 	gateResolveCmd.ValidArgsFunction = issueIDCompletion
 	gateAddWaiterCmd.ValidArgsFunction = issueIDCompletion
+	gateCreateCmd.ValidArgsFunction = issueIDCompletion
 
 	// Add subcommands
 	gateCmd.AddCommand(gateListCmd)
+	gateCmd.AddCommand(gateCreateCmd)
 	gateCmd.AddCommand(gateShowCmd)
 	gateCmd.AddCommand(gateResolveCmd)
 	gateCmd.AddCommand(gateCheckCmd)
