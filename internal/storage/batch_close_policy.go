@@ -17,6 +17,8 @@ type BatchClosePolicy struct {
 }
 
 // NewBatchClosePolicy copies the snapshot so later caller edits cannot alter it.
+// Include every externally blocked issue in the workspace, not just batch items:
+// FilterClaim also needs to exclude blocked candidates for the next claim.
 func NewBatchClosePolicy(blockers map[string][]string) BatchClosePolicy {
 	snapshot := make(map[string][]string, len(blockers))
 	for id, refs := range blockers {
