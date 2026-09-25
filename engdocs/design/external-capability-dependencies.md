@@ -67,6 +67,10 @@ instead of silently discarding the policy. The proxied UOW applies the same
 guards through its decorated issue use case. Neither path adds a public request
 field or persists foreign status locally.
 
+Every non-forced batch close, and every batch close with a next claim, scans all
+external blocking edges and resolves their foreign capabilities before the
+local transaction. This shares the lookup-cost concern tracked in GH#6156.
+
 ## Verification
 
 Regression tests cover unsatisfied and shipped capabilities, fail-closed
