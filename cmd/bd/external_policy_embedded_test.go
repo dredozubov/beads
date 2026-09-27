@@ -74,9 +74,11 @@ func exerciseExternalMutationPolicy(t *testing.T, local crossModeEnv) {
 		finished := local.create(t, "Finished work")
 		next := local.create(t, "Eligible next work", "--priority", "1")
 		stdout, stderr, code := local.run(t, "close", blocked, finished, "--claim-next")
-		// Partial success keeps the CLI's existing zero exit status and reports
-		// each refused item separately on stderr.
-		if code != 0 || !strings.Contains(stderr, "external:remote:payments") {
+		// Partial success reports each refused item separately on stderr and,
+		// since #6648, exits 1 with a count of the refusals. The eligible item
+		// and --claim-next still land; that is asserted below.
+		if code != 1 || !strings.Contains(stderr, "external:remote:payments") ||
+			!strings.Contains(stderr, "1 of 2 issues failed to close") {
 			t.Fatalf("mixed batch: exit %d\n%s\n%s", code, stdout, stderr)
 		}
 		assertOpen(t, blocked)
