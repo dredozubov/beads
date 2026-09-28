@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`notion.token` is kept out of the Dolt database**
+  ([#6676](https://github.com/gastownhall/beads/issues/6676)). It was missing
+  from the yaml-only key list that holds the other tracker secrets, so
+  `bd config set notion.token` — the command `bd notion status` recommends —
+  wrote it to the database, whose contents `bd dolt push` sends to the remote.
+  It is now written to `config.yaml` like `github.token`, `gitlab.token` and
+  the other tracker secrets, and refused on a git-tracked `config.yaml` with a
+  pointer to `NOTION_TOKEN`. A token an older bd already stored in the database
+  is still read, after `config.yaml` and before `NOTION_TOKEN`, so existing
+  setups keep authenticating. `bd config unset notion.token` removes both
+  copies — the `config.yaml` entry and any row an older bd left in the database
+  — and reports which of them it actually removed; that cleanup covers every
+  yaml-only secret key, not just this one. The database half is best effort and
+  says so: it is skipped only where reaching the row would mean creating a
+  database (the command never creates one), so it still runs for a server-mode
+  or proxied workspace whose database is simply not on local disk, and it is
+  attempted even when the `config.yaml` edit fails, so a workspace whose only
+  copy is the stored row still has a remover. `bd notion status` now reports the
+  auth source as `database_legacy` rather than `config_token` while the stored
+  row is the one authenticating, so an affected workspace can identify itself.
+  A token that was already pushed should still be rotated: deleting the row
+  locally does not unpublish it from remotes that already have a copy.
+
 - **`bd -C dir prime` now describes the target workspace instead of the launch
   directory** ([#5509](https://github.com/gastownhall/beads/issues/5509)). `-C`
   resolves `BEADS_DIR` but never changes directory, so prime's cwd-relative
@@ -25,6 +48,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   directory's. That makes the probe agree with the store actually being backed
   up, but it can flip auto-backup on or off for `-C` invocations whose launch
   directory and target differ in remote configuration.
+
+- **Generated git hooks accept uutils coreutils `timeout` as a deadline helper**
+  ([#5541](https://github.com/gastownhall/beads/issues/5541)). The managed hook
+  section probes `timeout` and `gtimeout` with `--version` and accepted only the
+  GNU coreutils banner, so a host whose `timeout` is uutils coreutils
+  (Ubuntu 25.10+, or a distribution configured with `uutils-coreutils` in place
+  of GNU) failed the probe and fell through. Where Perl was
+  installed the shim still got a deadline from the Perl `alarm` arm — which Git
+  for Windows Perl does not guarantee across `exec` — so the missing deadline
+  bit uutils hosts *without* Perl, which ran `bd hooks run` unbounded (with the
+  documented warning). The probe now also accepts the
+  `timeout (uutils coreutils) ` banner; native Windows `timeout.exe` stays
+  rejected ([#5503](https://github.com/gastownhall/beads/issues/5503)). The
+  widened probe ships in the generated hook section, which is rewritten only by
+  `bd hooks install` — hosts that already installed hooks must run it once to
+  pick up the fix.
 
 - **`bd close` now exits non-zero when any issue in a batch fails to close**
   ([#6648](https://github.com/gastownhall/beads/issues/6648)). A batch with one
@@ -59,6 +98,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   plain and its proxied transaction), `bd cook`, `bd mol squash`,
   `bd mol burn`, `bd duplicates --merge`, and the wisp writes — closes,
   updates, deletes and demote-to-wisp.
+
 
 - **`bd list --watch --format` is refused instead of silently dropping the
   format** ([#6277](https://github.com/gastownhall/beads/issues/6277)).
