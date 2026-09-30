@@ -26,9 +26,21 @@ type fakeStore struct {
 	blockerIDs []string
 	closed     []string
 	lifecycle  publicops.Lifecycle
+	batch      *fakeBatchCloser
 }
 
 func (f *fakeStore) IssueLifecycle() (publicops.Lifecycle, error) { return f.lifecycle, nil }
+
+// BatchCloser without BatchCloserWithPolicy models a backend that predates
+// storage.PolicyBatchCloserSource.
+func (f *fakeStore) BatchCloser() (publicops.BatchCloser, error) { return f.batch, nil }
+
+type fakeBatchCloser struct{ closed int }
+
+func (f *fakeBatchCloser) CloseBatch(_ context.Context, request publicops.CloseBatchRequest) (publicops.CloseBatchResult, error) {
+	f.closed++
+	return publicops.CloseBatchResult{Outcomes: make([]publicops.CloseOutcome, len(request.Items))}, nil
+}
 
 type fakeLifecycle struct {
 	publicops.Lifecycle
@@ -550,6 +562,58 @@ func TestIssueLifecycleClaimExternalPolicy(t *testing.T) {
 			}
 			if lifecycle.updated != wantCalls {
 				t.Fatalf("inner updates = %d, want %d", lifecycle.updated, wantCalls)
+			}
+		})
+	}
+}
+
+// A backend without policy support still closes a batch that no external
+// blocker touches. A blocked item or a next claim, which must exclude every
+// blocked candidate, still refuses rather than bypassing the policy.
+func TestBatchCloserScopesPolicyWithoutClaim(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		items           []string
+		claimNext       bool
+		wantUnsupported bool
+	}{
+		{"unrelated_blocker", []string{"be-free"}, false, false},
+		{"blocked_item", []string{"be-free", "be-consumer"}, false, true},
+		{"claim_next", []string{"be-free"}, true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			batch := &fakeBatchCloser{}
+			raw := &fakeStore{batch: batch, deps: map[string][]*types.Dependency{
+				"be-consumer": {externalDep("be-consumer", "external:remote:payments", types.DepBlocks)},
+			}}
+			foreign := &fakeStore{labels: map[string][]*types.Issue{
+				"provides:payments": {{ID: "remote-provider", Status: types.StatusOpen}},
+			}}
+			closer, err := testStore(raw, foreign, true).BatchCloser()
+			if err != nil {
+				t.Fatal(err)
+			}
+			request := publicops.CloseBatchRequest{Actor: "worker"}
+			for _, id := range tc.items {
+				request.Items = append(request.Items, publicops.BatchCloseItem{IssueID: id})
+			}
+			if tc.claimNext {
+				request.ClaimNext = &publicops.ReadyRequest{}
+			}
+			_, err = closer.CloseBatch(t.Context(), request)
+			var unsupported *storage.ErrUnsupported
+			if errors.As(err, &unsupported) != tc.wantUnsupported {
+				t.Fatalf("close batch error = %v, want unsupported=%v", err, tc.wantUnsupported)
+			}
+			if !tc.wantUnsupported && err != nil {
+				t.Fatal(err)
+			}
+			wantCalls := 1
+			if tc.wantUnsupported {
+				wantCalls = 0
+			}
+			if batch.closed != wantCalls {
+				t.Fatalf("inner batches = %d, want %d", batch.closed, wantCalls)
 			}
 		})
 	}

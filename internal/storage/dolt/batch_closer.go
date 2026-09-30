@@ -26,6 +26,9 @@ func NewBatchCloser(store *DoltStore) (issueops.BatchCloser, error) {
 
 // BatchCloserWithPolicy retains externally resolved blockers inside the batch.
 func (s *DoltStore) BatchCloserWithPolicy(policy storage.BatchClosePolicy) (issueops.BatchCloser, error) {
+	if s == nil {
+		return nil, &storage.ErrUnsupported{Op: "BatchCloserWithPolicy", Backend: "nil"}
+	}
 	return &batchCloser{store: s, policy: policy}, nil
 }
 

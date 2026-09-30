@@ -31,7 +31,17 @@ func (c *batchCloser) CloseBatch(ctx context.Context, request issueops.CloseBatc
 		if err != nil {
 			return issueops.CloseBatchResult{}, err
 		}
-		policy = storage.NewBatchClosePolicy(state.refsByIssue)
+		blockers := state.refsByIssue
+		if request.ClaimNext == nil {
+			// Only a claim reads blockers beyond the batch. Scoping the rest
+			// keeps an unrelated blocked issue from demanding policy support
+			// of a backend that lacks it.
+			blockers = make(map[string][]string, len(request.Items))
+			for _, item := range request.Items {
+				blockers[item.IssueID] = state.refsByIssue[item.IssueID]
+			}
+		}
+		policy = storage.NewBatchClosePolicy(blockers)
 	}
 	inner, err := storage.BatchCloserWithPolicy(c.policy.inner, policy)
 	if err != nil {

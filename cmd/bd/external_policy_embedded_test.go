@@ -51,16 +51,21 @@ func exerciseExternalMutationPolicy(t *testing.T, local crossModeEnv) {
 			t.Fatalf("refused mutation changed %s: status=%s assignee=%q", id, got.Status, got.Assignee)
 		}
 	}
-	refuse := func(t *testing.T, args ...string) {
+	refuse := func(t *testing.T, args ...string) string {
 		t.Helper()
 		stdout, stderr, code := local.run(t, args...)
 		if code == 0 || !strings.Contains(stderr, "external:remote:payments") {
 			t.Errorf("bd %v: expected external-blocker refusal, got exit %d\n%s\n%s", args, code, stdout, stderr)
 		}
+		return stderr
 	}
 
 	t.Run("claim_is_atomic", func(t *testing.T) {
-		refuse(t, "update", blocked, "--claim", "--notes", "must not be written")
+		// --force waives only the close policy, so a claim refusal must not
+		// suggest it.
+		if stderr := refuse(t, "update", blocked, "--claim", "--notes", "must not be written"); strings.Contains(stderr, "--force") {
+			t.Errorf("claim refusal suggests --force, which cannot waive it:\n%s", stderr)
+		}
 		assertOpen(t, blocked)
 		if got := local.show(t, blocked); got.Notes != "" {
 			t.Fatalf("refused claim wrote notes: %q", got.Notes)
