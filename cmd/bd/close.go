@@ -180,18 +180,12 @@ how stranded open grandchildren under a closed child are recovered.`,
 		// it, which is why a blocked descendant without --force stops its
 		// ancestors rather than orphaning them.
 		var cascadeExp *cascadeExpansion
-		// typedCount is the pre-expansion survivor count: the argument slots
-		// the cascade items are numbered after. A typed argument the
-		// preflight refused never became an item, so this — not
-		// len(resolvedIDs) — is where the discovered items' outcome slots
-		// begin, and the report loop below must read them there.
-		typedCount := len(plan.items)
 		if cascade {
 			cascadeExp, err = expandCloseCascadeForResults(ctx, plan, force)
 			if err != nil {
 				return HandleErrorRespectJSON("%v", err)
 			}
-			plan.items = orderCloseCascade(plan.items, cascadeExp)
+			plan.items = orderCloseCascade(plan.items, len(resolvedIDs), cascadeExp)
 		}
 		outcomeSlots := len(resolvedIDs) + cascadeExp.cascadeCount()
 		outcomes, claimedNext := closeDirectRun(opsCtx, closeDirectBatches(plan.items), outcomeSlots,
@@ -320,7 +314,7 @@ how stranded open grandchildren under a closed child are recovered.`,
 				failures = append(failures, closeIDFailure{ID: r.id, Error: r.refusal})
 			}
 			for j, ci := range cascadeExp.items {
-				res := outcomes[typedCount+j]
+				res := outcomes[len(resolvedIDs)+j]
 				if res == nil {
 					continue // never: every item slot gets an outcome
 				}
